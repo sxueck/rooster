@@ -1,0 +1,23 @@
+[package]
+name = "rooster-config"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+humantime-serde.workspace = true
+ipnet.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+yamlpatch.workspace = true
+yamlpath.workspace = true
+yaml_serde.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

@@ -1,0 +1,122 @@
+/* Styles for the imperative feedback hosts (ui/feedback.ts). */
+
+.rf-msg-wrap {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 4000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+  pointer-events: none;
+}
+.rf-msg {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  max-width: 460px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  font-size: 12.5px;
+  color: var(--ink);
+  opacity: 0;
+  transform: translateY(-4px);
+  transition: opacity 0.18s, transform 0.18s;
+}
+.rf-msg.rf-in {
+  opacity: 1;
+  transform: none;
+}
+.rf-msg.rf-out {
+  opacity: 0;
+}
+.rf-msg-ts {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  flex: none;
+}
+.rf-msg-success { border-left-color: var(--ok); }
+.rf-msg-error { border-left-color: var(--danger); }
+.rf-msg-warning { border-left-color: var(--warn); }
+.rf-msg-info { border-left-color: var(--info); }
+
+/* confirm dialog */
+.rf-dlg-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 3900;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 24, 28, 0.42);
+  opacity: 0;
+  transition: opacity 0.16s;
+}
+.rf-dlg-mask.rf-in { opacity: 1; }
+.rf-dlg-mask.rf-out { opacity: 0; }
+.rf-dlg {
+  width: 440px;
+  max-width: calc(100vw - 32px);
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: 0 18px 14px;
+}
+.rf-dlg-head {
+  padding: 10px 0 6px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 10px;
+}
+.rf-dlg-title {
+  font-size: 14.5px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.rf-dlg-body {
+  font-size: 13px;
+  color: var(--sub);
+  line-height: 1.6;
+  margin-bottom: 14px;
+}
+.rf-dlg-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* buttons used inside imperative dialogs (kept in sync with RButton) */
+.rf-btn {
+  font-family: var(--sans);
+  font-size: 12.5px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 3px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+}
+.rf-btn:hover { background: var(--tint); }
+.rf-btn-primary {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #fff;
+}
+.rf-btn-primary:hover { background: #000; }
+.rf-btn-danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+.rf-btn-danger:hover { filter: brightness(0.92); }
+.rf-btn-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--sub);
+}
+.rf-btn-ghost:hover { background: var(--tint); }

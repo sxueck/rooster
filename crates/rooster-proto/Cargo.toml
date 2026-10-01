@@ -1,0 +1,12 @@
+[package]
+name = "rooster-proto"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rmp-serde.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+[dev-dependencies]
+serde_json.workspace = true

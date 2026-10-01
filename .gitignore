@@ -1,0 +1,24 @@
+/target
+data/
+node_modules/
+dist/
+*.tmp
+crates/rooster-plugin-sdk/example-plugins/*/target/
+
+# Local runtime configuration
+/config.yaml
+/hub.yaml
+.env.local
+.env.*.local
+
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+
+# Logs and generated test artifacts
+*.log
+coverage/
+web/.vite/

@@ -1,0 +1,13 @@
+.git
+target
+data
+web/node_modules
+web/dist
+web/.vite
+crates/rooster-plugin-sdk/example-plugins/*/target
+# local runtime configuration (may contain credentials)
+config.yaml
+hub.yaml
+.env.local
+.env.*.local
+*.log

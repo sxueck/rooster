@@ -1,0 +1,176 @@
+/* ============================================================
+   Rooster ops console — design tokens & global styles
+   Visual language: hairline dividers, uppercase micro labels,
+   monospace data, dense flat panels. No shadows, no gradients.
+   ============================================================ */
+
+:root {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --panel-head: #fbfcfd;
+  --ink: #191d23;
+  --sub: #5b6470;
+  --faint: #8a919c;
+  --line: #e7eaee;
+  --line-strong: #d5dae0;
+  --tint: #f6f8fa;
+
+  --ok: #1a7f37;
+  --ok-tint: #e6f2ea;
+  --danger: #cf222e;
+  --danger-tint: #fbeaea;
+  --warn: #9a6700;
+  --warn-tint: #f7efdd;
+  --info: #0b6bcb;
+  --info-tint: #e7f0fa;
+  --link: #0b6bcb;
+
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'Cascadia Mono', 'JetBrains Mono', Menlo,
+    Consolas, 'Liberation Mono', monospace;
+
+  --radius: 4px;
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+body {
+  font-family: var(--sans);
+  font-size: 13.5px;
+  line-height: 1.55;
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+a {
+  color: var(--link);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+code,
+pre {
+  font-family: var(--mono);
+}
+p {
+  margin: 0 0 8px;
+}
+p:last-child {
+  margin-bottom: 0;
+}
+
+/* thin scrollbars, ops style */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------- text utilities ---------- */
+.mono {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+/* uppercase micro label — the ops signature */
+.micro {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.muted {
+  color: var(--faint);
+  font-size: 12px;
+}
+.sub {
+  color: var(--sub);
+}
+.t-ok { color: var(--ok); }
+.t-danger { color: var(--danger); }
+.t-warn { color: var(--warn); }
+.t-info { color: var(--info); }
+
+/* ---------- layout utilities ---------- */
+.page {
+  max-width: 1320px;
+  margin: 0 auto;
+  padding: 18px 22px 56px;
+}
+.page-wide {
+  max-width: 1620px;
+}
+.cols-2,
+.cols-3,
+.cols-4 {
+  display: grid;
+  gap: 14px;
+}
+.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 1100px) {
+  .cols-3, .cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.row-tight {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.mt { margin-top: 14px; }
+.mb { margin-bottom: 14px; }
+.spacer { margin-left: auto; }
+
+/* hairline helpers */
+.hair-b { border-bottom: 1px solid var(--line); }
+.hair-t { border-top: 1px solid var(--line); }
+
+/* pre block used across config/yaml views */
+.pre-block {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--tint);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow: auto;
+  max-height: 320px;
+  white-space: pre;
+}
