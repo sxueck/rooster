@@ -587,7 +587,7 @@ state.rollouts.push({
 }
 
 const trend24: OverviewResp['trend_24h'] = Array.from({ length: 24 }, (_, i) => ({
-  hour: `${String((new Date().getHours() - 23 + i + 48) % 24).padStart(2, '0')}:00`,
+  hour: Math.floor(Date.now() / 1000 / 3600) * 3600 - (23 - i) * 3600,
   count: 20 + rand(180),
 }))
 
@@ -808,7 +808,8 @@ route('DELETE', /^\/nodes\/([^/]+)$/, (m) => {
 // ---- node management passthrough ----
 route('GET', /^\/nodes\/([^/]+)\/management\/config$/, (m) => {
   const st = requireOnline(decodeURIComponent(m[1]))
-  return { hash: st.config.hash, raw: st.config.raw, effective: st.config.effective } satisfies NodeConfigResp
+  // 真 agent 的 effective 是合并后配置的 JSON 对象;mock 只展示 plugins 子树
+  return { hash: st.config.hash, raw: st.config.raw, effective: { plugins: st.wasm } } satisfies NodeConfigResp
 })
 route('PUT', /^\/nodes\/([^/]+)\/management\/config$/, (m, opts) => {
   const id = decodeURIComponent(m[1])
@@ -1145,7 +1146,12 @@ route('DELETE', /^\/wasm-plugins\/([^/]+)$/, (m) => {
 export async function handle<T>(path: string, opts: ReqOpts = {}): Promise<T> {
   await delay(60 + rand(140))
   const method = (opts.method ?? 'GET').toUpperCase()
-  const url = new URL('http://mock.local' + path)
+  let url: URL
+  try {
+    url = new URL('http://mock.local' + path)
+  } catch {
+    throw new ApiError(400, `invalid mock path: ${path}`)
+  }
   for (const r of routes) {
     if (r.method !== method) continue
     const m = r.re.exec(url.pathname)

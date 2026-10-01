@@ -117,21 +117,3 @@ export function eventSummary(ev: RoosterEvent): string {
   return k ? JSON.stringify(ev) : String(ev)
 }
 
-/** Extract one top-level YAML section (best effort, for display only). */
-export function extractYamlSection(yaml: string, key: string): string {
-  const re = new RegExp('^' + key + ':')
-  const out: string[] = []
-  let grab = false
-  for (const line of yaml.split('\n')) {
-    if (re.test(line)) {
-      grab = true
-      out.push(line)
-      continue
-    }
-    if (grab) {
-      if (/^\S/.test(line)) break
-      out.push(line)
-    }
-  }
-  return out.join('\n')
-}

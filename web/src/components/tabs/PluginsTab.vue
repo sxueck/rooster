@@ -14,7 +14,7 @@ import {
 import { getNodeConfig, getNodeWasm, putNodeWasm } from '../../api/client'
 import type { WasmPlugin } from '../../api/client'
 import SchemaForm from '../SchemaForm.vue'
-import { errMsg, extractYamlSection } from '../../utils/format'
+import { errMsg } from '../../utils/format'
 
 const props = defineProps<{ nodeId: string }>()
 const message = useMessage()
@@ -60,7 +60,9 @@ async function load() {
   try {
     plugins.value = (await getNodeWasm(props.nodeId)).plugins
     const cfg = await getNodeConfig(props.nodeId)
-    effectiveSection.value = extractYamlSection(cfg.effective, 'plugins')
+    // agent 的 effective 是 JSON 对象,取 plugins 子树展示(旧代码误当 YAML 文本 split 导致崩页)
+    const p = cfg.effective.plugins
+    effectiveSection.value = p === undefined ? '' : JSON.stringify(p, null, 2)
   } catch (e) {
     message.error(errMsg(e))
   }
@@ -115,7 +117,7 @@ onMounted(load)
       />
     </RPanel>
 
-    <RPanel title="effective 配置中的 plugins 段（只读）" kicker="EFFECTIVE YAML">
+    <RPanel title="effective 配置中的 plugins 段（只读）" kicker="EFFECTIVE JSON">
       <pre class="mono pre-block">{{ effectiveSection || '（无）' }}</pre>
     </RPanel>
 

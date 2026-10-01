@@ -1035,8 +1035,8 @@ async fn overview(State(state): State<Arc<HubState>>) -> Response {
     let nodes_online = nodes.iter().filter(|n| state.registry.is_online(&n.id)).count();
     let global_bans = state.store.list_global_bans().unwrap_or_default().len();
 
-    // 从近期事件环聚合 24h 数据(总览)。
-    let cutoff = now_secs().saturating_sub(24 * 3600);
+    // 从近期事件环聚合 24h 数据(总览)。cutoff 对齐整点,使 trend_24h 桶标签为整点时刻。
+    let cutoff = (now_secs() / 3600 * 3600).saturating_sub(24 * 3600);
     let mut bans_24h = 0u64;
     let mut ips: BTreeMap<String, u64> = BTreeMap::new();
     let mut rules: BTreeMap<String, u64> = BTreeMap::new();

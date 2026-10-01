@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { TrendPoint } from '../api/types'
+import { toDate } from '../utils/format'
+
+/** wire format is epoch seconds; render as local HH:mm */
+function hourLabel(ts: TrendPoint['hour']): string {
+  if (typeof ts !== 'number') return String(ts)
+  const d = toDate(ts)
+  return d ? d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }) : String(ts)
+}
 
 const props = defineProps<{ data: TrendPoint[] }>()
 const W = 760
@@ -37,7 +45,7 @@ const xlabels = computed(() =>
     .map(({ d, i }) => {
       const n = props.data.length || 1
       const iw = (W - PAD_L - 4) / n
-      return { x: +(PAD_L + i * iw + iw / 2).toFixed(1), text: d.hour }
+      return { x: +(PAD_L + i * iw + iw / 2).toFixed(1), text: hourLabel(d.hour) }
     }),
 )
 </script>
@@ -73,7 +81,7 @@ const xlabels = computed(() =>
       style="fill: var(--ok)"
       opacity="0.85"
     >
-      <title>{{ b.d.hour }} — {{ b.d.count }} 次</title>
+      <title>{{ hourLabel(b.d.hour) }} — {{ b.d.count }} 次</title>
     </rect>
     <text v-for="(l, i) in xlabels" :key="'x' + i" :x="l.x" :y="H - 8" text-anchor="middle" class="tick">
       {{ l.text }}

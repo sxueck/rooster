@@ -37,7 +37,8 @@ export interface CountryCount {
   count: number
 }
 export interface TrendPoint {
-  hour: string
+  /** bucket start, epoch seconds (hour-aligned) */
+  hour: number
   count: number
 }
 export interface OverviewResp {
@@ -82,7 +83,8 @@ export interface ConfirmInfo {
 export interface NodeConfigResp {
   hash: string
   raw: string
-  effective: string
+  /** agent 返回合并后配置的 JSON 对象(非 YAML 文本),敏感字段已脱敏 */
+  effective: Record<string, unknown>
 }
 export interface ConfigWriteResp {
   hash: string
