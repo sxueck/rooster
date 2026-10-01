@@ -64,6 +64,12 @@ docker(){
   printf '%s\n' "$*" >> "$COMMAND_LOG"
   case "$1" in ps) printf '%s' "${EXISTING_CONTAINER:-}";; esac
 }
+curl(){
+  printf '%s\n' "$*" >> "$COMMAND_LOG"
+  [ "${FAIL_COMPOSE_DOWNLOAD:-}" != yes ] || return 22
+  local url="$2" output="$4"
+  cp "$COMPOSE_ROOT/${url##*/}" "$output"
+}
 wait_hub(){ printf 'PROBE <%s> <%s> <%s> <%s>\n' "$@"; }
 '''
 
@@ -107,6 +113,7 @@ class DeployTests(unittest.TestCase):
         self.env = {
             "SANDBOX": str(self.dir / "system"),
             "COMMAND_LOG": str(self.dir / "commands.log"),
+            "COMPOSE_ROOT": str(ROOT),
         }
 
     def ok(self, result):
@@ -200,14 +207,15 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(path.read_text(), "old-deployment")
         self.assertNotIn("rm -f", Path(self.env["COMMAND_LOG"]).read_text())
 
-    def test_existing_config_is_not_overwritten_without_container(self):
+    def test_existing_config_is_retained_and_backed_up_during_overwrite(self):
         config = self.dir / "existing"
         config.mkdir()
         (config / "hub.yaml").write_text("old-deployment")
         result = bash(DOCKER + "\ndeploy_hub_docker", f"hub.example\n9443\ntest-only\n{config}\n", env=self.env)
-        self.assertNotEqual(result.returncode, 0)
+        self.ok(result)
         self.assertEqual((config / "hub.yaml").read_text(), "old-deployment")
-        self.assertFalse((config / "tls").exists())
+        backups = list(config.glob("install-backup.*"))
+        self.assertEqual((backups[0] / "hub.yaml").read_text(), "old-deployment")
 
     def test_docker_tls_uses_port_mapping_and_public_ca_mode(self):
         tls = self.certificates()
@@ -217,7 +225,15 @@ class DeployTests(unittest.TestCase):
         self.assertIn("PROBE <10443> <static> <hub.example> <>", output)
         self.assertIn("listen: 0.0.0.0:9443", (config / "hub.yaml").read_text())
         self.assertNotIn("  ca:", (config / "hub.yaml").read_text())
-        self.assertIn("-p 10443:9443", Path(self.env["COMMAND_LOG"]).read_text())
+        commands = Path(self.env["COMMAND_LOG"]).read_text()
+        self.assertIn("/main/compose.yaml", commands)
+        self.assertRegex(commands, r"compose --project-directory /\S+ config --quiet")
+        self.assertRegex(commands, r"compose --project-directory /\S+ pull")
+        self.assertIn(f"compose --project-directory {config} up -d", commands)
+        self.assertEqual((config / "compose.yaml").read_text(), (ROOT / "compose.yaml").read_text())
+        self.assertIn("ROOSTER_PORT=10443", (config / ".env").read_text())
+        self.assertIn("docker compose down", output)
+        self.assertNotIn("run -d", commands)
 
     def test_docker_custom_ca_is_copied_and_used_for_tls_probe(self):
         tls = self.certificates()
@@ -233,12 +249,55 @@ class DeployTests(unittest.TestCase):
         answers = f"hub.example\n10443\ntest-only\n{config}\n3\n8443\n"
         output = self.ok(bash(DOCKER + "\ndeploy_hub_docker", answers, env=self.env))
         self.assertIn("listen: 127.0.0.1:10443", (config / "hub.yaml").read_text())
+        self.assertIn('public-url: "https://hub.example:8443"', (config / "hub.yaml").read_text())
         self.assertIn("PROBE <10443> <plain>", output)
         self.assertIn("listen 8443 ssl;", output)
         self.assertIn("proxy_pass http://127.0.0.1:10443;", output)
         commands = Path(self.env["COMMAND_LOG"]).read_text()
-        self.assertIn("--network host", commands)
-        self.assertNotIn("-p 10443:9443", commands)
+        self.assertIn("/main/compose.host.yaml", commands)
+        self.assertEqual((config / "compose.yaml").read_text(), (ROOT / "compose.host.yaml").read_text())
+        self.assertIn("network_mode: host", (config / "compose.yaml").read_text())
+        self.assertNotIn("ports:", (config / "compose.yaml").read_text())
+
+    def test_failed_compose_download_keeps_existing_container(self):
+        config = self.dir / "failed-download"
+        answers = f"hub.example\n9443\ntest-only\n{config}\n2\n1\n"
+        result = bash(DOCKER + "\ndeploy_hub_docker", answers, env={
+            **self.env, "EXISTING_CONTAINER": "rooster-hub\n",
+            "FAIL_COMPOSE_DOWNLOAD": "yes",
+        })
+        self.assertNotEqual(result.returncode, 0)
+        commands = Path(self.env["COMMAND_LOG"]).read_text()
+        self.assertNotIn("rm -f", commands)
+        self.assertNotIn("up -d", commands)
+        self.assertFalse(config.exists())
+        retry = bash(DOCKER + "\ndeploy_hub_docker", answers, env={
+            **self.env, "EXISTING_CONTAINER": "rooster-hub\n",
+        })
+        self.ok(retry)
+
+    def test_existing_compose_files_are_backed_up_before_overwrite(self):
+        for filename in ("compose.yaml", ".env"):
+            with self.subTest(filename=filename):
+                config = self.dir / filename.replace(".", "_")
+                config.mkdir()
+                (config / filename).write_text("existing-settings")
+                result = bash(DOCKER + "\ndeploy_hub_docker", f"hub.example\n9443\ntest-only\n{config}\n1\n", env=self.env)
+                self.ok(result)
+                backups = list(config.glob("install-backup.*"))
+                self.assertEqual((backups[0] / filename).read_text(), "existing-settings")
+                self.assertNotEqual((config / filename).read_text(), "existing-settings")
+
+    def test_plain_overwrite_retains_backend_port_and_ca(self):
+        config = self.dir / "existing-plain"
+        config.mkdir()
+        old = 'listen: 127.0.0.1:10443\ntls:\n  mode: none\npublic-url: https://hub.example:8443\n'
+        (config / "hub.yaml").write_text(old)
+        answers = f"hub.example\n9443\ntest-only\n{config}\n8443\n"
+        output = self.ok(bash(DOCKER + "\ndeploy_hub_docker", answers, env=self.env))
+        self.assertIn("PROBE <10443> <plain>", output)
+        self.assertEqual((config / "hub.yaml").read_text(), old)
+        self.assertEqual((config / "compose.yaml").read_text(), (ROOT / "compose.host.yaml").read_text())
 
     def native_workspace(self):
         work = self.dir / "source"
@@ -261,7 +320,8 @@ class DeployTests(unittest.TestCase):
         self.assertEqual((system / "usr/share/rooster/web/dist/index.html").read_text(), "panel-from-build")
         self.assertEqual((system / "etc/rooster/tls/hub.key").stat().st_mode & 0o777, 0o600)
         self.assertIn("PROBE <10443> <static>", output)
-        self.assertIn("enable --now rooster-hub", Path(self.env["COMMAND_LOG"]).read_text())
+        self.assertIn("enable rooster-hub", Path(self.env["COMMAND_LOG"]).read_text())
+        self.assertIn("restart rooster-hub", Path(self.env["COMMAND_LOG"]).read_text())
 
     def test_native_nginx_uses_requested_ports_without_installing_tls(self):
         work = self.native_workspace()
@@ -280,11 +340,13 @@ class DeployTests(unittest.TestCase):
         work = self.native_workspace()
         config = Path(self.env["SANDBOX"]) / "etc/rooster/hub.yaml"
         config.parent.mkdir(parents=True)
-        config.write_text("old-deployment")
-        result = bash(NATIVE + "\ndeploy_hub_native", cwd=work, env=self.env)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(config.read_text(), "old-deployment")
-        self.assertFalse((work / "dependencies-installed").exists())
+        old = "listen: 127.0.0.1:10443\ntls:\n  mode: none\n"
+        config.write_text(old)
+        result = bash(NATIVE + "\ndeploy_hub_native", "hub.example\n10443\ntest-only\n3\n8443\n", cwd=work, env=self.env)
+        self.ok(result)
+        self.assertEqual(config.read_text(), old)
+        backups = list(config.parent.glob("install-backup.*"))
+        self.assertEqual((backups[0] / "hub.yaml").read_text(), old)
 
     def test_agent_unsigned_is_only_enabled_by_explicit_choice(self):
         mocks = r'''
@@ -297,10 +359,11 @@ as_root(){ "$@"; }
 '''
         for choice, unsigned in [(1, False), (2, True)]:
             with self.subTest(choice=choice):
-                answers = f"https://hub.example:9443\n1\ntest-token\n{choice}\n"
+                answers = f"https://hub.example:9443\n1\ntest-token\n{choice}\n{'a' * 64}\n"
                 output = self.ok(bash(mocks + "\ndeploy_agent_join", answers))
                 self.assertEqual("INSTALL_ARG <--allow-unsigned>" in output, unsigned)
-                self.assertIn("INSTALL_ARG <--insecure>", output)
+                self.assertIn("INSTALL_ARG <--ca-sha256>", output)
+                self.assertNotIn("INSTALL_ARG <--insecure>", output)
                 self.assertIn("INSTALL_ARG <test-token>", output)
 
     def test_printed_self_signed_curl_command_has_valid_flags(self):

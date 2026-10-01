@@ -509,6 +509,7 @@ mod tests {
             cfg: crate::config::HubConfig {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 data_dir: dir.clone(),
+                public_url: None,
                 tls: Default::default(),
                 secret_key: None,
                 cors_allowed_origins: vec![],

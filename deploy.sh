@@ -101,7 +101,7 @@ gen_tls() {
 
 write_hub_config() {
   local file="$1" secret="$2" mode="${3:-static}" port="${4:-9443}"
-  local panel="${5:-web/dist}" ca="${6:-yes}" s
+  local panel="${5:-web/dist}" ca="${6:-yes}" public="${7:-}" s
   # YAML double-quoted style: escape backslash and quote (printf, not heredoc,
   # so the secret never undergoes shell expansion)
   s=${secret//\\/\\\\}; s=${s//\"/\\\"}
@@ -121,6 +121,7 @@ write_hub_config() {
       printf '%s\n' '  key: /etc/rooster/tls/hub.key'
       if [ "$ca" = "yes" ]; then printf '%s\n' '  ca: /etc/rooster/tls/ca.crt'; fi
     fi
+    [ -z "$public" ] || printf 'public-url: "%s"\n' "$public"
     printf 'secret-key: "%s"\n' "$s"
     printf '%s\n' 'session-ttl: 12h'
     printf 'panel-dir: %s\n' "$panel"
@@ -152,14 +153,14 @@ wait_hub() {
 join_hint() {
   local host="$1" port="$2" selfsigned="$3"
   [[ "$host" = *:* ]] && host="[$host]"
-  local hub="https://$host:$port" flags="-fsSL" insecure=""
-  [ "$selfsigned" = "yes" ] && { flags="-kfsSL"; insecure=" --insecure"; }
+  local hub="https://$host:$port" ca_arg=""
+  [ "$selfsigned" != yes ] || ca_arg=" --ca-sha256 CA_SHA256_FROM_TRUSTED_PANEL"
   say ""
   say "$B>Add agent nodes$N"
   say "  1. open the panel -> ${B}节点 → 添加节点${N} -> copy the one-time token"
   say "  2. on the node run:"
-  say "     curl $flags $hub/install.sh -o /tmp/rooster-install.sh"
-  say "     sudo sh /tmp/rooster-install.sh --hub $hub --token TOKEN$insecure"
+  say "     curl -fsSL https://raw.githubusercontent.com/sxueck/rooster/main/enroll.sh -o /tmp/rooster-enroll.sh"
+  say "     sudo sh /tmp/rooster-enroll.sh --hub $hub --token TOKEN$ca_arg"
   say "  ${DIM}note: until you upload a signed release package, the hub can only serve its"
   say "  own unsigned binary — add --allow-unsigned for same-arch dev installs.${N}"
 }
@@ -187,8 +188,13 @@ nginx_hint() {
 }
 
 # ---------------- hub: docker ----------------
-deploy_hub_docker() {
+deploy_hub_docker() (
+  umask 077
+  local stage
+  stage="$(mktemp -d)"
+  trap 'rm -rf "$stage"' EXIT
   have docker || die "docker not found (https://docs.docker.com/engine/install/)"
+  docker compose version >/dev/null 2>&1 || die "docker compose plugin not found (https://docs.docker.com/compose/install/)"
   have openssl || die "openssl not found"
   have curl || die "curl not found"
 
@@ -197,23 +203,38 @@ deploy_hub_docker() {
   hosts="$(ask "public hostname(s)/IP(s) agents and the panel will use (comma-separated)" "${ip:-127.0.0.1}")"
   host="${hosts%%,*}"
   port="$(ask "listen port" 9443)"
+  [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) || die "invalid listen port"
   secret="$(ask_secret "panel admin password")"
   dir="$(ask "config directory (created if missing)" "$PWD/rooster-hub")"
   names="$(docker ps -a --format '{{.Names}}')"
   if grep -qx "$HUB_CONTAINER" <<< "$names"; then
-    say "${Y}A new configuration/CA requires existing nodes to update their trust anchor.${N}"
-    [ "$(choose "container '$HUB_CONTAINER' exists" "abort" "remove and recreate it with a new config")" = "abort" ] && die "aborted"
+    [ "$(choose "container '$HUB_CONTAINER' exists" "abort" "overwrite installation (back up and retain configuration/data)")" = "abort" ] && die "aborted"
     recreate=yes
   fi
-  [ ! -e "$dir/hub.yaml" ] && [ ! -e "$dir/tls" ] || die "existing hub config/TLS in $dir; refusing to overwrite it (reuse manually or choose a new directory)"
+  local existing=no
+  [ ! -f "$dir/hub.yaml" ] || existing=yes
+  if [ "$existing" = yes ]; then
+    cp -a "$dir/hub.yaml" "$stage/hub.yaml"
+    [ ! -d "$dir/tls" ] || cp -a "$dir/tls" "$stage/tls"
+    hubmode=static; selfsigned=yes
+    grep -Eq '^[[:space:]]*mode:[[:space:]]*none' "$stage/hub.yaml" && { hubmode=plain; selfsigned=nginx; }
+    pubport="$port"
+    if [ "$hubmode" = plain ]; then
+      port="$(awk '/^listen:/ {n=split($2,a,":"); print a[n]}' "$stage/hub.yaml")"
+      [[ "$port" =~ ^[0-9]{1,5}$ ]] || die "cannot read existing hub listen port"
+      pubport="$(ask "public HTTPS port at the TLS terminator" 443)"
+    elif [ ! -f "$stage/tls/ca.crt" ]; then
+      selfsigned=no
+    fi
+    say "${DIM}Retaining existing hub.yaml, admin password and TLS; prompt values do not replace them.${N}"
+  else
   selfsigned="$(choose "TLS certificate" \
-    "auto-generate self-signed (recommended, agents trust it via install.sh)" \
+    "auto-generate self-signed (agents verify the panel's CA fingerprint)" \
     "use my own cert/key (entered next)" \
     "upstream TLS termination (nginx etc.) — hub serves plain HTTP on loopback")"
 
-  mkdir -p "$dir/tls"
-  dir="$(cd "$dir" && pwd -P)"
-  tlsdir="$dir/tls"
+  mkdir -p "$stage/tls"
+  tlsdir="$stage/tls"
   hubmode="static"
   case "$selfsigned" in
     "use my own cert/key (entered next)")
@@ -238,23 +259,49 @@ deploy_hub_docker() {
   local bindport=9443 ca_config=no
   [ "$hubmode" = "plain" ] && bindport="$port"
   if [ -f "$tlsdir/ca.crt" ]; then ca="$tlsdir/ca.crt"; ca_config=yes; fi
-  write_hub_config "$dir/hub.yaml" "$secret" "$hubmode" "$bindport" web/dist "$ca_config"
-
+  local publichost="$host" publicport="$port"
+  [[ "$publichost" != *:* ]] || publichost="[$publichost]"
+  [ "$hubmode" != plain ] || publicport="$pubport"
+  write_hub_config "$stage/hub.yaml" "$secret" "$hubmode" "$bindport" web/dist "$ca_config" "https://$publichost:$publicport"
+  fi
+  tlsdir="$stage/tls"
+  [ ! -f "$tlsdir/ca.crt" ] || ca="$tlsdir/ca.crt"
+  local compose_file=compose.yaml
+  [ "$hubmode" = "plain" ] && compose_file=compose.host.yaml
+  say "${DIM}downloading $compose_file ...${N}"
+  if ! curl -fsSL "https://raw.githubusercontent.com/sxueck/rooster/main/$compose_file" -o "$stage/compose.yaml"; then
+    die "failed to download Compose file; existing container was not removed"
+  fi
+  printf 'COMPOSE_PROJECT_NAME=rooster-hub\nROOSTER_PORT=%s\n' "$port" > "$stage/.env"
+  docker compose --project-directory "$stage" config --quiet
   say "${DIM}pulling $IMAGE ...${N}"
-  docker pull "$IMAGE" >/dev/null
+  docker compose --project-directory "$stage" pull >/dev/null
+  mkdir -p "$dir"
+  dir="$(cd "$dir" && pwd -P)"
+  local backup file
+  backup="$(mktemp -d "$dir/install-backup.XXXXXXXX")"
+  for file in hub.yaml tls compose.yaml .env; do
+    [ ! -e "$dir/$file" ] || cp -a "$dir/$file" "$backup/"
+  done
+  for file in compose.yaml .env; do install -m600 "$stage/$file" "$dir/.$file.new"; mv -f "$dir/.$file.new" "$dir/$file"; done
+  if [ "$existing" = no ]; then
+    install -m600 "$stage/hub.yaml" "$dir/.hub.yaml.new"
+    mv -f "$dir/.hub.yaml.new" "$dir/hub.yaml"
+    cp -a "$stage/tls" "$dir/"
+  fi
+  tlsdir="$dir/tls"; ca=""
+  [ ! -f "$tlsdir/ca.crt" ] || ca="$tlsdir/ca.crt"
   if [ "$recreate" = "yes" ]; then docker rm -f "$HUB_CONTAINER" >/dev/null; fi
-  local -a netargs=(-p "$port:9443")
-  [ "$hubmode" = "plain" ] && netargs=(--network host)
-  docker run -d --name "$HUB_CONTAINER" --restart unless-stopped \
-    "${netargs[@]}" \
-    -v "$dir:/etc/rooster" \
-    -v rooster-hub-data:/var/lib/rooster-hub \
-    "$IMAGE" >/dev/null
+  docker compose --project-directory "$dir" up -d >/dev/null
 
   wait_hub "$port" "$hubmode" "$host" "$ca"
 
   say ""
-  say "$B>Hub deployed (Docker)$N"
+  say "$B>Hub deployed (Docker Compose)$N"
+  printf '  start:    cd %q && docker compose up -d\n' "$dir"
+  printf '  stop:     cd %q && docker compose down\n' "$dir"
+  printf '  upgrade:  cd %q && docker compose pull && docker compose up -d\n' "$dir"
+  say "  ${DIM}docker compose down keeps data; do not use down -v unless deleting hub data.${N}"
   if [ "$hubmode" = "plain" ]; then
     say "  panel:    https://$host:$pubport/   (served through your TLS terminator)"
     say "  hub:      http://127.0.0.1:$port (plain mode, loopback only, host network)"
@@ -274,10 +321,11 @@ deploy_hub_docker() {
     say "  data:     docker volume rooster-hub-data"
     say "  logs:     docker logs -f $HUB_CONTAINER"
     say "  backup:   docker exec $HUB_CONTAINER rooster hub --config /etc/rooster/hub.yaml backup --out /tmp/backup"
-    [ "$selfsigned" = "yes" ] && say "  ${DIM}self-signed CA: agents fetch the trust anchor automatically via install.sh --insecure${N}"
+    [ "$selfsigned" = "yes" ] && say "  ${DIM}self-signed CA: use the panel's fingerprint-verified enrollment command.${N}"
     join_hint "$host" "$port" "$selfsigned"
   fi
-}
+  say "  ${DIM}Signed agent installs: configure upgrade-public-key in hub.yaml, restart the hub, then upload a signed rooster-VERSION-ARCH package in the panel. Never use --allow-unsigned implicitly.${N}"
+)
 
 # ---------------- hub: source + systemd ----------------
 deploy_hub_native() (
@@ -288,7 +336,11 @@ deploy_hub_native() (
   have make || die "make not found"
 
   local ip host hosts port pubport secret dir="/etc/rooster" selfsigned tlsdir hubmode work ca=""
-  as_root test ! -e "$dir/hub.yaml" && as_root test ! -e "$dir/tls" || die "existing hub config/TLS in $dir; refusing to overwrite it (upgrade the existing deployment manually)"
+  local existing=no
+  if as_root test -f "$dir/hub.yaml"; then
+    existing=yes
+    say "${DIM}Existing hub config/TLS and data will be retained; installed artifacts will be backed up.${N}"
+  fi
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
   ip="$(detect_ip)"
@@ -337,15 +389,33 @@ deploy_hub_native() (
   esac
   local ca_config=no
   if [ -f "$tlsdir/ca.crt" ]; then ca="$tlsdir/ca.crt"; ca_config=yes; fi
-  write_hub_config "$work/hub.yaml" "$secret" "$hubmode" "$port" /usr/share/rooster/web/dist "$ca_config"
+  local publichost="$host" publicport="$port" backup
+  [[ "$publichost" != *:* ]] || publichost="[$publichost]"
+  [ "$hubmode" != plain ] || publicport="$pubport"
+  write_hub_config "$work/hub.yaml" "$secret" "$hubmode" "$port" /usr/share/rooster/web/dist "$ca_config" "https://$publichost:$publicport"
+  as_root mkdir -p "$dir"
+  backup="$(as_root mktemp -d "$dir/install-backup.XXXXXXXX")"
+  for file in "$dir/hub.yaml" "$dir/tls" /usr/local/bin/rooster /usr/share/rooster/web/dist /etc/systemd/system/rooster-hub.service; do
+    if as_root test -e "$file"; then as_root cp -a "$file" "$backup/"; fi
+  done
   as_root install -Dm755 target/release/rooster /usr/local/bin/rooster
   as_root mkdir -p "$dir" /var/lib/rooster-hub /usr/share/rooster/web/dist
   as_root cp -a web/dist/. /usr/share/rooster/web/dist/
-  if [ "$hubmode" = "static" ]; then
+  if [ "$hubmode" = "static" ] && [ "$existing" = no ]; then
     as_root mkdir -p "$dir/tls"
     as_root cp -r "$tlsdir/." "$dir/tls/"
   fi
-  as_root install -m600 "$work/hub.yaml" "$dir/hub.yaml"
+  if [ "$existing" = no ]; then
+    as_root install -m600 "$work/hub.yaml" "$dir/hub.yaml"
+  else
+    as_root cp "$dir/hub.yaml" "$work/hub.yaml"
+    as_root chown "$(id -u)" "$work/hub.yaml"
+    hubmode=static
+    grep -Eq '^[[:space:]]*mode:[[:space:]]*none' "$work/hub.yaml" && hubmode=plain
+    port="$(awk '/^listen:/ {n=split($2,a,":"); print a[n]}' "$work/hub.yaml")"
+    ca=""
+    if as_root test -f "$dir/tls/ca.crt"; then as_root cp "$dir/tls/ca.crt" "$work/existing-ca.crt"; as_root chown "$(id -u)" "$work/existing-ca.crt"; ca="$work/existing-ca.crt"; fi
+  fi
 
   as_root tee /etc/systemd/system/rooster-hub.service >/dev/null <<'EOF'
 [Unit]
@@ -366,7 +436,9 @@ ReadWritePaths=/etc/rooster /var/lib/rooster-hub
 WantedBy=multi-user.target
 EOF
   as_root systemctl daemon-reload
-  as_root systemctl enable --now rooster-hub
+  as_root systemctl enable rooster-hub
+  as_root systemctl restart rooster-hub
+  say "${DIM}Signed agent installs require upgrade-public-key in hub.yaml and a signed architecture package uploaded through the panel.${N}"
 
   wait_hub "$port" "$hubmode" "$host" "$ca"
 
@@ -398,7 +470,7 @@ deploy_agent_join() (
   local hub token selfsigned script policy
   local -a args=()
   hub="$(ask "hub URL (as shown by the panel)" "https://$(detect_ip):9443")"
-  selfsigned="$(choose "hub certificate" "self-signed / private CA (use --insecure TOFU anchor)" "public CA (no extra flag)")"
+  selfsigned="$(choose "hub certificate" "self-signed / private CA (verify CA fingerprint from trusted panel)" "public CA (no extra flag)")"
   say "get the one-time token: panel -> ${B}节点 → 添加节点${N}"
   token="$(ask "one-time token")"
   [ -n "$token" ] || die "token required"
@@ -408,12 +480,13 @@ deploy_agent_join() (
   [ "$policy" = "allow the hub's unsigned binary (same-arch only)" ] && args+=(--allow-unsigned)
   script="$(mktemp)"
   trap 'rm -f "$script"' EXIT
-  if [ "$selfsigned" = "self-signed / private CA (use --insecure TOFU anchor)" ]; then
-    curl -kfsSL "$hub/install.sh" -o "$script"
-    args+=(--insecure)
-  else
-    curl -fsSL "$hub/install.sh" -o "$script"
+  if [ "$selfsigned" = "self-signed / private CA (verify CA fingerprint from trusted panel)" ]; then
+    local fingerprint
+    fingerprint="$(ask "CA SHA-256 fingerprint from the trusted panel enrollment command")"
+    [[ "$fingerprint" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid CA SHA-256 fingerprint"
+    args+=(--ca-sha256 "$fingerprint")
   fi
+  curl -fsSL https://raw.githubusercontent.com/sxueck/rooster/main/enroll.sh -o "$script"
   as_root sh "$script" --hub "$hub" --token "$token" "${args[@]}"
 
   say ""
@@ -431,6 +504,8 @@ deploy_agent_docker() {
   local dir
   dir="$(ask "directory containing an enrolled config.yaml" "/etc/rooster")"
   [ -f "$dir/config.yaml" ] || die "no config.yaml in $dir (enroll via install.sh first, or write one)"
+  dir="$(cd "$dir" && pwd -P)"
+  docker pull "$IMAGE:latest" >/dev/null
   docker rm -f rooster-agent >/dev/null 2>&1 || true
   docker run -d --name rooster-agent --restart unless-stopped \
     --network host --cap-add NET_ADMIN \

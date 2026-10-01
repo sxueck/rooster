@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, ref } from 'vue'
+import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   RButton,
@@ -103,35 +103,50 @@ const regLoading = ref(false)
 const reg = ref<RegisterTokenResp | null>(null)
 const regRemain = ref(0)
 let regTimer = 0
+let regPollTimer = 0
+let regSession = 0
+
+function stopRegistration() {
+  regSession += 1
+  window.clearInterval(regTimer)
+  window.clearInterval(regPollTimer)
+  reg.value = null
+}
+watch(regShow, (show) => {
+  if (!show) stopRegistration()
+}, { flush: 'sync' })
 
 // 安装命令可选项:按需拼到 install_cmd 后(见 install.sh 的同名 flag)。
-const optInsecure = ref(false)
 const optUnsigned = ref(false)
 const optName = ref('')
 const installCmd = computed(() => {
   const base = reg.value?.install_cmd ?? ''
   const args: string[] = []
-  if (optInsecure.value) {
-    args.push('--insecure')
-  }
   if (optUnsigned.value) args.push('--allow-unsigned')
   const name = optName.value.trim()
-  if (name) args.push(`--name ${name}`)
-  // 外层 curl 拉 install.sh 本身也要过同一个自签 hub,一并 -k。
-  const cmd = optInsecure.value ? base.replace('curl -fsSL', 'curl -fsSLk') : base
-  return args.length ? `${cmd} ${args.join(' ')}` : cmd
+  if (name) args.push(`--name '${name.replace(/'/g, "'\\''")}'`)
+  return args.length ? `${base} ${args.join(' ')}` : base
 })
 
 async function openRegister() {
+  if (regLoading.value) return
+  stopRegistration()
+  const session = regSession
   regShow.value = true
-  optInsecure.value = false
   optUnsigned.value = false
   optName.value = ''
   regLoading.value = true
   try {
-    reg.value = await registerNodeToken()
+    const baseline = (await getNodes()).nodes
+    if (session !== regSession) return
+    nodes.value = baseline
+    const token = await registerNodeToken()
+    if (session !== regSession) return
+    reg.value = token
     startRegCountdown()
+    if (regShow.value) startRegPolling(new Set(baseline.map((node) => node.id)), session)
   } catch (e) {
+    if (session !== regSession) return
     message.error(errMsg(e))
     regShow.value = false
   } finally {
@@ -142,10 +157,36 @@ function startRegCountdown() {
   window.clearInterval(regTimer)
   const tick = () => {
     if (!reg.value) return
-    regRemain.value = Math.max(0, Math.floor(((toDate(reg.value.expires_at)?.getTime() ?? 0) - Date.now()) / 1000))
+    regRemain.value = Math.max(0, Math.ceil(((toDate(reg.value.expires_at)?.getTime() ?? 0) - Date.now()) / 1000))
+    if (regRemain.value === 0) {
+      regShow.value = false
+      message.warning('注册令牌已过期，请重新注册节点')
+    }
   }
   tick()
-  regTimer = window.setInterval(tick, 1000)
+  if (regShow.value) regTimer = window.setInterval(tick, 1000)
+}
+function startRegPolling(existingIds: Set<string>, session: number) {
+  let pending = false
+  regPollTimer = window.setInterval(async () => {
+    if (pending || session !== regSession) return
+    pending = true
+    try {
+      const current = (await getNodes()).nodes
+      if (session !== regSession) return
+      nodes.value = current
+      // API does not expose token consumption; detect new online nodes against the opening snapshot.
+      const ready = current.find((node) => !existingIds.has(node.id) && node.online)
+      if (ready) {
+        regShow.value = false
+        message.success(`节点 ${ready.id} 已就绪`)
+      }
+    } catch {
+      // Transient polling failures retry while the registration token is valid.
+    } finally {
+      pending = false
+    }
+  }, 2000)
 }
 async function copy(text: string) {
   try {
@@ -205,7 +246,7 @@ function fmtRemain(s: number): string {
   return `${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`
 }
 
-onUnmounted(() => window.clearInterval(regTimer))
+onUnmounted(stopRegistration)
 </script>
 
 <template>
@@ -215,7 +256,7 @@ onUnmounted(() => window.clearInterval(regTimer))
         <RButton size="sm" :disabled="checked.length === 0" @click="openLabelDialog(checked)">
           批量编辑标签（{{ checked.length }}）
         </RButton>
-        <RButton size="sm" tone="primary" @click="openRegister">注册新节点</RButton>
+        <RButton size="sm" tone="primary" :loading="regLoading" @click="openRegister">注册新节点</RButton>
       </template>
     </RPageHeader>
 
@@ -233,7 +274,8 @@ onUnmounted(() => window.clearInterval(regTimer))
 
     <!-- 注册新节点 -->
     <RModal v-model:show="regShow" kicker="REGISTER" title="注册新节点" :width="640">
-      <template v-if="reg">
+      <p v-if="regLoading" class="muted">正在生成注册令牌…</p>
+      <template v-else-if="reg">
         <p class="muted">
           注册令牌有效期剩余 <b class="num count">{{ fmtRemain(regRemain) }}</b>
         </p>
@@ -243,7 +285,7 @@ onUnmounted(() => window.clearInterval(regTimer))
         </div>
         <div class="micro cmd-label">OPTIONS</div>
         <div class="reg-opts">
-          <RCheckbox v-model="optInsecure">忽略证书校验（自签 Hub）</RCheckbox>
+          <span class="muted">自签 Hub 自动使用 CA 指纹验证，首次使用前请确认面板可信</span>
           <RCheckbox v-model="optUnsigned">允许未签名二进制</RCheckbox>
           <RInput v-model="optName" placeholder="节点名（默认 hostname）" style="max-width: 200px" />
         </div>

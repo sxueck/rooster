@@ -49,6 +49,15 @@ async fn start_hub_with_tls(
     upgrade_public_key: Option<String>,
     tls: rooster_hub::config::HubTls,
 ) -> HubServer {
+    start_hub_with_origin(tag, upgrade_public_key, tls, None).await
+}
+
+async fn start_hub_with_origin(
+    tag: &str,
+    upgrade_public_key: Option<String>,
+    tls: rooster_hub::config::HubTls,
+    public_url: Option<String>,
+) -> HubServer {
     let dir = std::env::temp_dir().join(format!("rooster-hub-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -56,6 +65,7 @@ async fn start_hub_with_tls(
     let cfg = HubConfig {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         data_dir: dir.clone(),
+        public_url,
         tls,
         secret_key: Some(bcrypt::hash("hub-secret", 4).unwrap()),
         cors_allowed_origins: vec![],
@@ -531,6 +541,34 @@ async fn registration_token_cannot_hijack_existing_node() {
 
 /// 安装脚本的下载必须能匿名完成(此前带鉴权 → 401 → 新机器装不起来),
 /// 而 WASM 仓库/版本包仍不得匿名开放。
+#[tokio::test]
+async fn enrollment_uses_public_https_origin_and_verified_ca_fingerprint() {
+    use sha2::{Digest, Sha256};
+    let cert = rcgen::generate_simple_self_signed(vec!["hub.example".into()]).unwrap().cert;
+    let dir = std::env::temp_dir().join(format!("rooster-enrollment-ca-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ca = dir.join("ca.crt");
+    std::fs::write(&ca, cert.pem()).unwrap();
+    let hub = start_hub_with_origin("public-origin", None, rooster_hub::config::HubTls {
+        ca: Some(ca), ..Default::default()
+    }, Some("https://hub.example:8443".into())).await;
+    let token = login(&hub).await;
+    let resp = client().post(format!("{}/v0/nodes/register-tokens", hub.base))
+        .bearer_auth(token).json(&serde_json::json!({})).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let expected: String = Sha256::digest(cert.der()).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(body["ca_sha256"].as_str(), Some(expected.as_str()));
+    let cmd = body["install_cmd"].as_str().unwrap();
+    assert!(cmd.contains("https://raw.githubusercontent.com/sxueck/rooster/main/enroll.sh"));
+    assert!(cmd.contains("--hub https://hub.example:8443"));
+    assert!(cmd.contains(&format!("--ca-sha256 {expected}")));
+    assert!(!cmd.contains("--insecure"));
+    let installer = client().get(format!("{}/install.sh", hub.base)).send().await.unwrap().text().await.unwrap();
+    assert!(installer.contains("HUB='https://hub.example:8443'"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn install_bootstrap_download_is_anonymous() {
     let hub = start_hub("bootstrap").await;

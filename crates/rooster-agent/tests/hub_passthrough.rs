@@ -40,6 +40,20 @@ async fn build_state(tag: &str) -> (Arc<AgentState>, std::path::PathBuf) {
 }
 
 #[tokio::test]
+async fn readiness_requires_a_live_hub_connection() {
+    let (state, _dir) = build_state("ready").await;
+    let (status, _, _) = management::serve_trusted(&state, "GET", "/v0/management/readyz", &[], b"").await;
+    assert_eq!(status, 503);
+    state.hub_connected.send_replace(true);
+    let (status, _, body) = management::serve_trusted(&state, "GET", "/v0/management/readyz", &[], b"").await;
+    assert_eq!(status, 200);
+    assert_eq!(body, b"ok");
+    state.hub_connected.send_replace(false);
+    let (status, _, _) = management::serve_trusted(&state, "GET", "/v0/management/readyz", &[], b"").await;
+    assert_eq!(status, 503);
+}
+
+#[tokio::test]
 async fn trusted_requests_bypass_auth_and_hit_real_routes() {
     let (state, _dir) = build_state("read").await;
 
@@ -326,6 +340,17 @@ async fn register_and_hello_share_identity_and_events_flow_without_ack() {
         other => panic!("expected Hello, got {other:?}"),
     }
 
+    assert!(!*state.hub_connected.borrow(), "Hello alone does not confirm hub acceptance");
+    {
+        use futures_util::SinkExt as _;
+        ws.send(tokio_tungstenite::tungstenite::Message::binary(rooster_proto::encode(&Frame::Pong))).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !*state.hub_connected.borrow() {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("readiness must update without a watch subscriber");
+
     // A6/A7:已连接的 agent push 一个事件,不等 ack / 不重连就应到达 hub,
     // 且首条事件 seq = 1(初始游标 0 → pending(0) 恰好包含它)。
     state.push_event(rooster_proto::Event::Ban {
@@ -346,6 +371,7 @@ async fn register_and_hello_share_identity_and_events_flow_without_ack() {
     let _ = ws.close(None).await;
     drop(ws);
     let _ = cs.await;
+    assert!(!*state.hub_connected.borrow(), "closed connections must clear readiness");
 }
 
 /// A8:GlobalUnban 只解 scope=Global 的行;本地插件的行和无行不动。

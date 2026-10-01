@@ -15,6 +15,9 @@ pub struct HubConfig {
     pub listen: SocketAddr,
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// External origin, independent of the internal TLS listener behind a proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
     #[serde(default)]
     pub tls: HubTls,
     /// bcrypt 哈希;明文首启回写。
@@ -113,6 +116,23 @@ pub struct PolicyMatch {
 }
 
 impl HubConfig {
+    pub fn hub_base(&self, host: &str) -> Result<String, String> {
+        let scheme = if matches!(self.tls_mode(), HubTlsMode::Static) { "https" } else { "http" };
+        let base = self.public_url.clone().unwrap_or_else(|| format!("{scheme}://{host}"));
+        let uri: axum::http::Uri = base.parse().map_err(|_| "invalid public-url/Host".to_string())?;
+        let authority = uri.authority().ok_or("public-url must include a host")?;
+        if !matches!(uri.scheme_str(), Some("http" | "https"))
+            || !authority.as_str().bytes().all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
+            || uri.path_and_query().is_some_and(|p| p.as_str() != "/")
+        {
+            return Err("public-url must be an http(s) origin without credentials, path or query".into());
+        }
+        if uri.scheme_str() == Some("http") && !matches!(authority.host(), "localhost" | "127.0.0.1" | "[::1]") {
+            return Err("public-url must use HTTPS outside loopback".into());
+        }
+        Ok(base.trim_end_matches('/').to_string())
+    }
+
     pub fn session_ttl(&self) -> Duration {
         self.session_ttl.unwrap_or(Duration::from_secs(12 * 3600))
     }
@@ -140,6 +160,7 @@ pub fn default_hub_config_template() -> String {
 # tls.mode: static —— Agent 凭客户端证书证明身份(强制 mTLS)。
 listen: 127.0.0.1:9443
 data-dir: /var/lib/rooster-hub
+# public-url: https://hub.example.com:443   # Required behind a TLS terminator
 tls:
   # static: 使用下方 cert/key(对外服务用这个)
   # none:   明文,仅允许 listen 为 127.0.0.1(开发/本机反代终止 TLS)
@@ -166,6 +187,20 @@ audit-retention: 180d
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_origin_overrides_internal_plaintext_and_rejects_shell_inputs() {
+        let mut cfg: HubConfig = serde_norway::from_str(&default_hub_config_template()).unwrap();
+        cfg.public_url = Some("https://hub.example:8443/".into());
+        assert_eq!(cfg.hub_base("127.0.0.1:9443").unwrap(), "https://hub.example:8443");
+        for invalid in ["http://remote.example:80", "https://hub.example/path", "https://user@hub.example", "https://hub.example?x=1", "https://hub.example/$(id)"] {
+            cfg.public_url = Some(invalid.into());
+            assert!(cfg.hub_base("127.0.0.1:9443").is_err(), "{invalid}");
+        }
+        cfg.public_url = None;
+        assert_eq!(cfg.hub_base("127.0.0.1:9443").unwrap(), "http://127.0.0.1:9443");
+        assert!(cfg.hub_base("bad;host").is_err());
+    }
 
     #[test]
     fn parses_example_config() {

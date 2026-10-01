@@ -73,7 +73,7 @@ pub async fn run(state: Arc<AgentState>) {
                 tracing::warn!("hub connection: {e}");
             }
         }
-        let _ = state.hub_connected.send(false);
+        state.hub_connected.send_replace(false);
         sleep_backoff(&mut backoff).await;
     }
 }
@@ -359,8 +359,7 @@ pub async fn connect_and_serve(
         .await
         .map_err(|e| format!("send hello: {e}"))?;
 
-    let _ = state.hub_connected.send(true);
-    tracing::info!(node = node, "connected to hub {}", ep.ws_url);
+    state.hub_connected.send_replace(false);
 
     // 补报缓冲事件。
     flush_outbox(state, &mut sink).await;
@@ -412,8 +411,15 @@ pub async fn connect_and_serve(
                     Ok(Message::Close(_)) | Err(_) => break Err("hub closed".into()),
                     _ => continue,
                 };
+                if let Frame::Error { message } = &frame {
+                    break Err(format!("hub rejected connection: {message}"));
+                }
                 if let Err(e) = handle_frame(state, &mut sink, &node, frame).await {
                     break Err(e);
+                }
+                // The first authenticated hub frame confirms Hello acceptance; send() loses state without subscribers.
+                if !state.hub_connected.send_replace(true) {
+                    tracing::info!(node = node, "connected to hub {}", ep.ws_url);
                 }
             }
             _ = tokio::time::sleep_until(last_rx + HEARTBEAT * 3) => {
@@ -423,6 +429,7 @@ pub async fn connect_and_serve(
     };
 
     hb.abort();
+    state.hub_connected.send_replace(false);
     state.clear_hub_frame(frame_gen);
     // 连接曾存活 ≥60s → 视为“曾成功”,由调用方重置退避;短命连接
     // 保持退避以免持续打抖。

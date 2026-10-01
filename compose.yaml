@@ -1,0 +1,14 @@
+services:
+  hub:
+    image: ghcr.io/sxueck/rooster:latest
+    container_name: rooster-hub
+    restart: unless-stopped
+    ports:
+      - "${ROOSTER_PORT:-9443}:9443"
+    volumes:
+      - ./:/etc/rooster
+      - hub-data:/var/lib/rooster-hub
+
+volumes:
+  hub-data:
+    name: rooster-hub-data

@@ -368,28 +368,30 @@ async fn create_register_token(
     ConnectInfo(_): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let token = new_token();
-    if let Err(e) = state.store.insert_token(&token, Duration::from_secs(15 * 60)) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        )
-            .into_response();
-    }
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("127.0.0.1:9443");
-    let scheme = match state.cfg.tls_mode() {
-        crate::config::HubTlsMode::Static => "https",
-        crate::config::HubTlsMode::None => "http",
+    let base = match state.cfg.hub_base(host) {
+        Ok(base) => base,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
+    let ca_sha256 = match state.cfg.tls.ca.as_ref().map(|path| ca_fingerprint(path)).transpose() {
+        Ok(fingerprint) => fingerprint,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    let ca_arg = ca_sha256.as_ref().map(|fp| format!(" --ca-sha256 {fp}")).unwrap_or_default();
+    let token = new_token();
+    if let Err(e) = state.store.insert_token(&token, Duration::from_secs(15 * 60)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+    }
     state.audit("panel", None, "POST", "/v0/nodes/register-tokens", b"", 200);
     Json(json!({
         "token": token,
         "expires_at": now_secs() + 15 * 60,
+        "ca_sha256": ca_sha256,
         "install_cmd": format!(
-            "curl -fsSL {scheme}://{host}/install.sh | sudo sh -s -- --hub {scheme}://{host} --token {token}"
+            "curl -fsSL https://raw.githubusercontent.com/sxueck/rooster/main/enroll.sh | sudo sh -s -- --hub {base} --token {token}{ca_arg}"
         ),
     }))
     .into_response()
@@ -1489,15 +1491,28 @@ async fn delete_wasm(State(state): State<Arc<HubState>>, Path(name): Path<String
 // ---------------------------------------------------------------------------
 // install.sh 与静态面板
 
-async fn install_script(headers: HeaderMap) -> Response {
+fn ca_fingerprint(path: &std::path::Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let pem = std::fs::read(path).map_err(|e| format!("read server CA: {e}"))?;
+    let cert = rustls_pemfile::certs(&mut pem.as_slice()).next()
+        .ok_or("server CA has no certificate")?
+        .map_err(|e| format!("parse server CA: {e}"))?;
+    Ok(Sha256::digest(cert.as_ref()).iter().map(|b| format!("{b:02x}")).collect())
+}
+
+async fn install_script(State(state): State<Arc<HubState>>, headers: HeaderMap) -> Response {
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("127.0.0.1:9443");
+    let base = match state.cfg.hub_base(host) {
+        Ok(base) => base,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, header::HeaderValue::from_static("text/x-shellscript"))],
-        install::script(host),
+        install::script(&base),
     )
         .into_response()
 }

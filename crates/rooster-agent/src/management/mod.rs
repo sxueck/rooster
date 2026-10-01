@@ -41,6 +41,7 @@ pub fn router(state: Arc<AgentState>) -> Router {
 /// 与测试使用。
 pub fn mgmt_router(state: Arc<AgentState>) -> Router {
     Router::new()
+        .route("/readyz", get(get_ready))
         .route("/config", get(get_config).put(put_config))
         .route("/forwards", get(list_forwards))
         .route(
@@ -776,6 +777,14 @@ async fn put_allowlist(
             .into_response()
         }
         Err(e) => config_err_response(e),
+    }
+}
+
+async fn get_ready(State(state): State<Arc<AgentState>>) -> Response {
+    if *state.hub_connected.borrow() {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "hub not connected").into_response()
     }
 }
 

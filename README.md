@@ -82,18 +82,67 @@ cd rooster && bash deploy.sh
   Signed releases are required by default; installing the hub's own unsigned
   binary requires an explicit choice and a matching CPU architecture.
 
-The helper refuses to overwrite existing hub configuration or TLS files.
+Docker hub deployment requires the Docker Compose plugin (`docker compose`).
+The helper downloads `compose.yaml` (or `compose.host.yaml` for upstream TLS
+termination) into the chosen config directory as `compose.yaml`, and writes
+`.env` with the selected port and a stable project name. It validates the
+Compose configuration, pulls the image, then starts the hub.
+
+Overwrite installation is supported. Before replacing files, the helper creates
+an `install-backup.*` directory with private permissions. Hub reinstalls preserve
+existing `hub.yaml`, TLS/CA and data; prompted password/TLS settings only apply to
+new installations. Compose files are refreshed and the image remains `latest`.
+Compose download, validation and image pull happen in a temporary directory,
+so failures before activation leave the existing installation untouched and can
+be retried. Native reinstalls back up installed artifacts and explicitly restart
+the service.
 Hostname/IP prompts accept a comma-separated list, so a future
 port-forward or reverse-proxy address can be baked into the same
 certificate; agents and browsers verify the address they dial against
-it. Upgrade an existing deployment manually, preserving its CA and data; a new
-CA requires updating the trust anchor on existing nodes. Native deployment
+it. Replacing a CA requires updating the trust anchor on existing nodes. Native deployment
 installs frontend dependencies and copies the panel to
 `/usr/share/rooster/web/dist`. Health checks require `/healthz` to return
 `200` and `ok`, with certificate and hostname verification for TLS.
 
 Deployment regression tests (Python 3, Bash, curl and OpenSSL):
 `python3 tests/test_deploy.py -v`.
+Agent overwrite/readiness tests: `python3 tests/test_install.py -v`.
+First-download trust tests: `python3 tests/test_enroll.py -v`.
+Node registration regression tests (after `npm --prefix web ci`):
+`node --test tests/test_node_registration.mjs`.
+
+### Agent enrollment and trust
+
+The panel enrollment command downloads `enroll.sh` over GitHub's verified HTTPS,
+then fetches the hub installer over verified TLS. For private/self-signed CAs,
+it includes `--ca-sha256` from the hub's configured `tls.ca`. Confirm the panel
+and that fingerprint through a trusted channel before copying the command.
+Only the public CA certificate is fetched with relaxed verification; its SHA-256
+fingerprint is checked before any executable is downloaded. Subsequent requests
+use that CA and enforce certificate chain and hostname verification. A locally
+provisioned CA can instead be supplied with `--ca-file /path/to/ca.crt`.
+`--insecure` is refused; it cannot bypass installer or binary verification.
+
+For a hub behind a TLS-terminating proxy, set `public-url` to its external HTTPS
+origin (for example `https://hub.example.com:8443`). Fresh deployments set this
+automatically; existing configurations retained on reinstall must add it manually.
+Neither internal plaintext mode nor untrusted forwarded headers determine the
+external protocol when `public-url` is set.
+
+Signed agent installation requires an Ed25519 signing key kept outside the hub.
+Set `upgrade-public-key: "ed25519:<base64-public-key>"` in `hub.yaml`, restart the
+hub, then upload a signed `rooster-VERSION-ARCH` package through the panel
+(`ARCH` matches `uname -m`). Missing key/package errors explain these steps.
+`--allow-unsigned` remains an explicit same-architecture development option.
+
+Agent reinstalls back up the overwritten binary, config, server CA and systemd
+unit, write `config.yaml` with mode `0600`, and retain node data/client PKI.
+The generated config replaces local settings; restore any required custom rules
+from the printed backup directory. Changing the hub/name with existing client
+PKI is refused rather than silently reusing another identity. The installer
+explicitly restarts the service and reports success only after the authenticated
+local readiness endpoint confirms a live Hub connection. If readiness fails,
+installation exits nonzero with a journal/backup hint.
 
 ## Build & run
 
@@ -107,19 +156,33 @@ cargo test      # workspace tests
 The hub serves the panel from `panel-dir` (default `web/dist`). Add nodes
 from the panel (one-time token + `install.sh` command); a registration
 token only adds a node. TLS `static` mode is required for any non-loopback
-hub `listen`, so agents have a CA to trust.
+hub `listen`, so agents have a CA to trust. The registration modal closes
+when its token expires. While it is open, the panel checks nodes every two
+seconds; a new online node closes the modal and refreshes the node list without
+reloading the whole page. Readiness is detected against the node list captured
+when opening the modal, not token consumption; concurrent registrations can
+therefore also trigger completion.
 
 ## Container image
 
 CI builds a combined agent+hub image to `ghcr.io/sxueck/rooster` on pushes
-to `main` and on `v*` tags. The hub role (or just run `bash deploy.sh`):
+to `main` and on `v*` tags. Run `bash deploy.sh` to initialize a hub, then
+manage it from the config directory selected during deployment:
 
 ```sh
-docker run -d --name rooster-hub -p 9443:9443 \
-  -v "$PWD/hub.yaml:/etc/rooster/hub.yaml" \
-  -v rooster-data:/var/lib/rooster-hub \
-  ghcr.io/sxueck/rooster
+cd /path/to/rooster-hub
+docker compose up -d       # start
+docker compose down        # stop and remove the container, keeping data
+docker compose logs -f hub
+docker compose pull && docker compose up -d   # upgrade
 ```
+
+`compose.yaml` maps `${ROOSTER_PORT:-9443}` to the hub's TLS port 9443.
+`compose.host.yaml` uses host networking for plaintext loopback mode behind a
+TLS terminator; the selected backend port is written into `hub.yaml`.
+Both mount the config directory at `/etc/rooster` and retain the existing
+`rooster-hub-data` Docker volume. Do not use `docker compose down -v` unless
+intentionally deleting hub data, including its node registry and PKI.
 
 The agent role bans via nftables on the host kernel — run it with
 `--network host --cap-add NET_ADMIN`, or enroll real nodes with
