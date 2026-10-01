@@ -164,6 +164,19 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
         .collect()
 }
 
+/// 明文监听守卫:tls.mode: none 只许绑回环;唯一放行是 env 显式开启
+/// (compose.host.yaml 的 bridge 部署:容器内须绑 0.0.0.0 才能被 ports
+/// 发布命中,宿主暴露面由发布绑定的 "127.0.0.1:" 前缀收敛回环)。
+fn plain_non_loopback_refusal(cfg: &HubConfig, env_allows: bool) -> Option<String> {
+    if cfg.tls_mode_str() == "none" && !cfg.listen.ip().is_loopback() && !env_allows {
+        return Some(format!(
+            "tls.mode: none will not bind a non-loopback address ({}); set tls.mode: static with cert/key, or bind listen to 127.0.0.1 behind a TLS terminator",
+            cfg.listen
+        ));
+    }
+    None
+}
+
 /// `rooster hub` 入口。
 pub async fn run(config_path: &Path) -> Result<(), String> {
     let raw = match std::fs::read_to_string(config_path) {
@@ -185,11 +198,11 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     // 证书,ws.rs 的 authorize 只剩“节点已注册且未吊销”可验——知道 node_id
     // 即可冒充节点,因此明文只允许绑回环(本机反代终止 TLS 的应急用法);
     // 对外服务必须 tls.mode: static 配 cert/key。
-    if cfg.tls_mode_str() == "none" && !cfg.listen.ip().is_loopback() {
-        return Err(format!(
-            "tls.mode: none will not bind a non-loopback address ({}); set tls.mode: static with cert/key, or bind listen to 127.0.0.1 behind a TLS terminator",
-            cfg.listen
-        ));
+    if let Some(msg) = plain_non_loopback_refusal(
+        &cfg,
+        std::env::var_os("ROOSTER_ALLOW_PLAIN_NON_LOOPBACK").is_some(),
+    ) {
+        return Err(msg);
     }
 
     // 明文 secret-key 首启哈希回写(保留注释)。
@@ -359,5 +372,22 @@ mod tests {
         let err = run(&cfg_path).await.unwrap_err();
         assert!(err.contains("non-loopback"), "expected refusal, got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bridge 部署的唯一放行路径:env 显式开启后,非回环明文监听不再被拒
+    /// (直接测守卫函数,不起真实服务;回环监听任何情况下都放行)。
+    #[test]
+    fn plaintext_listen_guard_respects_env_opt_in() {
+        let cfg: HubConfig = serde_norway::from_str(
+            "listen: 0.0.0.0:9443\ndata-dir: /tmp/rooster-hub-guard-test\ntls:\n  mode: none\n",
+        )
+        .unwrap();
+        assert!(plain_non_loopback_refusal(&cfg, false).is_some());
+        assert!(plain_non_loopback_refusal(&cfg, true).is_none());
+        let lo: HubConfig = serde_norway::from_str(
+            "listen: 127.0.0.1:9443\ndata-dir: /tmp/rooster-hub-guard-test\ntls:\n  mode: none\n",
+        )
+        .unwrap();
+        assert!(plain_non_loopback_refusal(&lo, false).is_none());
     }
 }

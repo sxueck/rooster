@@ -178,8 +178,11 @@ docker compose pull && docker compose up -d   # upgrade
 ```
 
 `compose.yaml` maps `${ROOSTER_PORT:-9443}` to the hub's TLS port 9443.
-`compose.host.yaml` uses host networking for plaintext loopback mode behind a
-TLS terminator; the selected backend port is written into `hub.yaml`.
+`compose.host.yaml` serves plaintext HTTP behind a TLS terminator and
+publishes it on host loopback only (`127.0.0.1:${ROOSTER_PORT:-9443}` to the
+container's port 9443); the selected port is written into `.env` as
+`ROOSTER_PORT`, and `ROOSTER_ALLOW_PLAIN_NON_LOOPBACK=1` opts the hub's
+plain-listen guard out for this bridge deployment.
 Both mount the config directory at `/etc/rooster` and retain the existing
 `rooster-hub-data` Docker volume. Do not use `docker compose down -v` unless
 intentionally deleting hub data, including its node registry and PKI.

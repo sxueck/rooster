@@ -3,7 +3,17 @@ services:
     image: ghcr.io/sxueck/rooster:latest
     container_name: rooster-hub
     restart: unless-stopped
-    network_mode: host
+    ports:
+      # loopback-only publish: the TLS terminator (nginx etc.) reaches the hub
+      # here; nothing off-host can. Keeping 127.0.0.1 is what preserves the
+      # plaintext guard's invariant after leaving host networking.
+      - "127.0.0.1:${ROOSTER_PORT:-9443}:9443"
+    environment:
+      # hub refuses tls.mode: none on a non-loopback listen; inside this bridge
+      # network the in-container 0.0.0.0 bind is required for the published
+      # port to connect, and host exposure is bounded by the 127.0.0.1 publish
+      # above — hence the explicit opt-in below.
+      - ROOSTER_ALLOW_PLAIN_NON_LOOPBACK=1
     volumes:
       - ./:/etc/rooster
       - hub-data:/var/lib/rooster-hub
