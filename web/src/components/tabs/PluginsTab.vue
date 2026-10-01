@@ -11,9 +11,10 @@ import {
   useMessage,
   type RColumn,
 } from '../../ui'
-import { getNodeConfig, getNodeWasm, putNodeWasm } from '../../api/client'
-import type { WasmPlugin } from '../../api/client'
+import { getNodeConfig, getNodePlugin, getNodeWasm, putNodePlugin, putNodeWasm } from '../../api/client'
+import type { SshGuardPluginConfig, WasmPlugin } from '../../api/client'
 import SchemaForm from '../SchemaForm.vue'
+import { armRollback, confirmRollbackIn } from '../rollback'
 import { errMsg } from '../../utils/format'
 
 const props = defineProps<{ nodeId: string }>()
@@ -21,6 +22,12 @@ const message = useMessage()
 
 const plugins = ref<WasmPlugin[]>([])
 const effectiveSection = ref('')
+/** 内置插件 ssh-guard:effective 回填的表单模型 */
+const sshForm = ref<Record<string, unknown>>({})
+const sshLoaded = ref(false)
+const sshUnsupported = ref('')
+const sshEnabled = computed(() => sshForm.value.enabled === true)
+const sshSaving = ref(false)
 const editing = ref<WasmPlugin | null>(null)
 const editConfig = ref<Record<string, unknown>>({})
 /** manifest 缺失（插件未加载成功）时，退化为整只插件 JSON 编辑，仍可修 file/hooks/sites */
@@ -66,6 +73,81 @@ async function load() {
   } catch (e) {
     message.error(errMsg(e))
   }
+  // 内置插件单独容错:旧版 agent 无 /plugins 端点时仅禁用卡片,不炸整页
+  try {
+    sshForm.value = (await getNodePlugin(props.nodeId, 'ssh-guard')) as unknown as Record<
+      string,
+      unknown
+    >
+    sshLoaded.value = true
+    sshUnsupported.value = ''
+  } catch (e) {
+    sshLoaded.value = false
+    sshUnsupported.value = errMsg(e)
+  }
+}
+
+/** ssh-guard 表单 schema(与 agent 端 SshGuardConfig 字段对齐) */
+const SSHGUARD_SCHEMA: Record<string, unknown> = {
+  properties: {
+    enabled: {
+      type: 'boolean',
+      title: '启用 ssh-guard',
+      description: '关闭后立即停止日志采集与 nftables 限速规则',
+    },
+    port: { type: 'number', title: 'SSH 端口', description: 'sshd 实际监听端口' },
+    source: {
+      type: 'string',
+      title: '日志源',
+      enum: ['journald', 'file'],
+      description: 'journald 不可用时自动回退 tail /var/log/auth.log',
+    },
+    'max-retry': {
+      type: 'number',
+      title: '失败次数阈值',
+      description: '统计窗口内认证失败达到该次数即封禁',
+    },
+    'find-time': { type: 'string', title: '统计窗口', description: '如 10m、5m' },
+    'ban-time': {
+      type: 'string',
+      title: '基础封禁时长',
+      description: '如 1h;重复违规按倍数递增',
+    },
+    'ban-time-factor': { type: 'number', title: '递增倍数', description: 'ban-time × factor^n' },
+    'ban-time-max': { type: 'string', title: '封禁上限', description: '如 7days' },
+    'conn-rate': {
+      type: 'string',
+      title: '连接速率限制',
+      description: 'nftables meter 侧执行,如 10/minute',
+    },
+    'conn-burst': { type: 'number', title: '突发容忍', description: '令牌桶 burst' },
+  },
+}
+
+async function saveSshGuard() {
+  if (!sshLoaded.value) return
+  sshSaving.value = true
+  try {
+    const resp = await putNodePlugin(
+      props.nodeId,
+      'ssh-guard',
+      sshForm.value as unknown as SshGuardPluginConfig,
+    )
+    const conf = resp.confirm
+    if (conf) {
+      // ssh_guard 段是确认-回滚类变更:弹全局倒计时,超时未确认自动回滚
+      const secs = confirmRollbackIn(conf)
+      armRollback(props.nodeId, conf.token, secs, resp.hash)
+      window.setTimeout(() => void load(), (Math.max(1, secs) + 1) * 1000)
+    } else {
+      message.success('ssh-guard 配置已保存并热生效')
+    }
+    await load()
+  } catch (e) {
+    message.error(errMsg(e))
+  } finally {
+    sshSaving.value = false
+  }
 }
 
 function openEdit(p: WasmPlugin) {
@@ -108,12 +190,35 @@ onMounted(load)
 
 <template>
   <div>
-    <RPanel title="已加载插件" kicker="LOADED PLUGINS" flush style="margin-bottom: 16px">
+    <RPanel title="内置插件 · ssh-guard" kicker="BUILTIN PLUGINS" style="margin-bottom: 16px">
+      <template #actions>
+        <RTag :tone="sshEnabled ? 'ok' : 'muted'">{{ sshEnabled ? '已启用' : '未启用' }}</RTag>
+      </template>
+      <RAlert v-if="sshUnsupported" tone="warn">
+        读取内置插件配置失败：{{ sshUnsupported }}（agent 版本过旧？）可临时使用「高级 ·
+        YAML」。
+      </RAlert>
+      <SchemaForm v-if="sshLoaded" v-model="sshForm" :schema="SSHGUARD_SCHEMA" />
+      <p class="muted" style="margin-top: 8px">
+        保存写入 managed.plugins.ssh-guard：注释保留、原子落盘、热生效；涉及
+        nftables 的变更保存后会弹出回滚确认倒计时。
+      </p>
+      <template #footer>
+        <div class="row-tight">
+          <RButton tone="primary" :loading="sshSaving" :disabled="!sshLoaded" @click="saveSshGuard">
+            保存 ssh-guard 配置
+          </RButton>
+          <RButton variant="ghost" :disabled="!sshLoaded" @click="load">放弃修改</RButton>
+        </div>
+      </template>
+    </RPanel>
+
+    <RPanel title="WASM 插件（已加载）" kicker="WASM PLUGINS" flush style="margin-bottom: 16px">
       <RTable
         :columns="cols"
         :rows="plugins"
         :row-key="(r: WasmPlugin) => r.id"
-        empty-text="NO PLUGINS · 暂无插件"
+        empty-text="NO WASM PLUGINS · 暂无 WASM 插件（内置插件见上方卡片）"
       />
     </RPanel>
 

@@ -90,6 +90,19 @@ export interface ConfigWriteResp {
   hash: string
   confirm: ConfirmInfo | null
 }
+/** 内置插件 ssh-guard 的 effective 配置(agent GET /plugins/ssh-guard 原样回填) */
+export interface SshGuardPluginConfig {
+  enabled: boolean
+  port: number
+  source: 'journald' | 'file'
+  'max-retry': number
+  'find-time': string
+  'ban-time': string
+  'ban-time-factor': number
+  'ban-time-max': string
+  'conn-rate': string
+  'conn-burst': number
+}
 export interface Layers {
   managed: Record<string, string>
   local: Record<string, string>

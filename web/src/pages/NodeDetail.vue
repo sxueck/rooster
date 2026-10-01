@@ -33,7 +33,7 @@ const tabItems = [
   { key: 'events', label: '事件' },
   { key: 'layers', label: '配置' },
   { key: 'history', label: '历史' },
-  { key: 'yaml', label: 'YAML 编辑器' },
+  { key: 'yaml', label: '高级 · YAML' },
 ]
 
 async function loadNode() {

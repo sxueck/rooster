@@ -13,6 +13,7 @@ import {
   type RegisterTokenResp,
   type OkResp,
   type NodeConfigResp,
+  type SshGuardPluginConfig,
   type ConfigWriteResp,
   type Layers,
   type ForwardRule,
@@ -166,6 +167,22 @@ export function putNodeConfig(id: string, yaml: string): Promise<ConfigWriteResp
     method: 'PUT',
     body: { yaml },
   })
+}
+// 内置插件(当前仅 ssh-guard)表单直改:agent 侧 managed.plugins 子树写
+export function getNodePlugin(id: string, name: string): Promise<SshGuardPluginConfig> {
+  return request<SshGuardPluginConfig>(
+    `/nodes/${encodeURIComponent(id)}/management/plugins/${encodeURIComponent(name)}`,
+  )
+}
+export function putNodePlugin(
+  id: string,
+  name: string,
+  cfg: SshGuardPluginConfig,
+): Promise<ConfigWriteResp> {
+  return request<ConfigWriteResp>(
+    `/nodes/${encodeURIComponent(id)}/management/plugins/${encodeURIComponent(name)}`,
+    { method: 'PUT', body: cfg },
+  )
 }
 export function getLayers(id: string): Promise<Layers> {
   return request<Layers>(`/nodes/${encodeURIComponent(id)}/management/layers`)
@@ -384,4 +401,4 @@ export function deleteWasmRegistry(name: string): Promise<OkResp> {
 }
 
 // re-exports commonly needed alongside client calls
-export type { NodeInfo, AuditEntry, WasmPlugin, Site, ForwardRule, BanPolicy }
+export type { NodeInfo, AuditEntry, WasmPlugin, Site, ForwardRule, BanPolicy, SshGuardPluginConfig }

@@ -1,5 +1,5 @@
 //! 本地管理 API:`/v0/management/*`,默认只绑定回环。
-//! 远程访问一律经由 Hub 透传;覆盖 /config、/forwards、
+//! 远程访问一律经由 Hub 透传;覆盖 /config、/plugins、/forwards、
 //! /events、/history、/apply/confirm。
 
 pub mod auth;
@@ -55,6 +55,7 @@ pub fn mgmt_router(state: Arc<AgentState>) -> Router {
         .route("/bans", get(list_bans).post(post_ban))
         .route("/bans/{ip}", delete(delete_ban))
         .route("/allowlist", get(get_allowlist).put(put_allowlist))
+        .route("/plugins/{name}", get(get_plugin).put(put_plugin))
         .route("/stats", get(get_stats))
         .route("/sites", get(list_sites))
         .route("/sites/{id}", put(put_site).delete(delete_site))
@@ -778,6 +779,106 @@ async fn put_allowlist(
         }
         Err(e) => config_err_response(e),
     }
+}
+
+// ---------------------------------------------------------------------------
+// /plugins:内置插件(ssh-guard)表单直改,面板不再要求手编 YAML。
+
+async fn get_plugin(
+    State(state): State<Arc<AgentState>>,
+    Path(name): Path<String>,
+) -> Response {
+    // 返回 effective 合并结果(含默认值),表单直接回填。
+    match name.as_str() {
+        "ssh-guard" => {
+            let eff = state.effective();
+            Json(serde_json::to_value(&eff.plugins.ssh_guard).expect("ssh-guard serializes"))
+                .into_response()
+        }
+        _ => unknown_plugin(&name),
+    }
+}
+
+async fn put_plugin(
+    State(state): State<Arc<AgentState>>,
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if name != "ssh-guard" {
+        return unknown_plugin(&name);
+    }
+    // 反序列化触发字段级校验(时长格式、枚举值)。
+    let cfg: rooster_config::SshGuardConfig = match serde_json::from_value(body) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid ssh-guard config: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    let value = serde_json::to_value(&cfg).expect("ssh-guard serializes");
+
+    // 与 put_allowlist 相同的临界区:读磁盘 → 子树替换 → 原子落盘。
+    let _guard = state.write_lock.lock().unwrap();
+    let raw = match std::fs::read_to_string(&state.config_path) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let m = [Seg::K("managed")];
+    let p = [Seg::K("managed"), Seg::K("plugins")];
+    let s = [Seg::K("managed"), Seg::K("plugins"), Seg::K("ssh-guard")];
+    let new_raw = if writer::subtree_exists(&raw, &s).unwrap_or(false) {
+        writer::replace_subtree(&raw, &s, &value)
+    } else if writer::subtree_exists(&raw, &p).unwrap_or(false) {
+        writer::add_key(&raw, &p, "ssh-guard", &value)
+    } else if writer::subtree_exists(&raw, &m).unwrap_or(false) {
+        writer::add_key(&raw, &m, "plugins", &json!({ "ssh-guard": value }))
+    } else {
+        writer::add_key(&raw, &[], "managed", &json!({ "plugins": { "ssh-guard": value } }))
+    };
+    let new_raw = match new_raw {
+        Ok(r) => r,
+        Err(e) => return config_err_response(e),
+    };
+
+    let old_eff = state.effective();
+    match state.commit_raw(&new_raw) {
+        Ok(new_eff) => {
+            state.push_event(Event::ConfigChanged {
+                hash: state.current_hash(),
+            });
+            // ssh_guard 段直接决定 nftables meter 规则:确认-回滚类变更。
+            let mut confirm = serde_json::Value::Null;
+            if AgentState::needs_confirm(&old_eff, &new_eff) {
+                let token = new_token();
+                let timeout = old_eff.security.apply_confirm_timeout();
+                state.start_confirm_timer(token.clone(), raw, timeout);
+                confirm = json!({"token": token, "rollback-in": timeout.as_secs()});
+            }
+            Json(json!({
+                "hash": state.current_hash(),
+                "confirm": confirm,
+            }))
+            .into_response()
+        }
+        Err(e) => config_err_response(e),
+    }
+}
+
+fn unknown_plugin(name: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": format!("unknown builtin plugin `{name}`")})),
+    )
+        .into_response()
 }
 
 async fn get_ready(State(state): State<Arc<AgentState>>) -> Response {

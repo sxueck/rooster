@@ -20,6 +20,7 @@ import {
   type OkResp,
   type NodeConfigResp,
   type ConfigWriteResp,
+  type SshGuardPluginConfig,
   type Layers,
   type ForwardRule,
   type BanEntry,
@@ -95,6 +96,7 @@ interface MockNodeState {
   wafRules: WafRulesResp
   history: { name: string; raw: string }[]
   wasm: WasmPlugin[]
+  sshGuard: SshGuardPluginConfig
 }
 
 // ---------------- config yaml ----------------
@@ -392,6 +394,19 @@ function randEvent(): RoosterEvent {
 }
 
 // ---------------- state ----------------
+const SSH_GUARD_DEFAULTS: SshGuardPluginConfig = {
+  enabled: false,
+  port: 22,
+  source: 'journald',
+  'max-retry': 5,
+  'find-time': '10m',
+  'ban-time': '1h',
+  'ban-time-factor': 2,
+  'ban-time-max': '7days',
+  'conn-rate': '10/minute',
+  'conn-burst': 5,
+}
+
 function buildNode(d: {
   id: string
   labels: Record<string, string>
@@ -497,6 +512,7 @@ function buildNode(d: {
       : { rules: [], total: 0, paranoia: 0, threshold: d.threshold, by_severity: {}, by_phase: {} },
     history,
     wasm: buildWasm(d.subnet),
+    sshGuard: { ...SSH_GUARD_DEFAULTS, enabled: d.id === 'edge-bj-01' },
   }
 }
 
@@ -987,6 +1003,20 @@ route('DELETE', /^\/nodes\/([^/]+)\/management\/wasm\/([^/]+)$/, (m) => {
   const st = requireOnline(decodeURIComponent(m[1]))
   st.wasm = st.wasm.filter((p) => p.id !== decodeURIComponent(m[2]))
   return null // 204
+})
+
+route('GET', /^\/nodes\/([^/]+)\/management\/plugins\/([^/]+)$/, (m) => {
+  const st = requireOnline(decodeURIComponent(m[1]))
+  const name = decodeURIComponent(m[2])
+  if (name !== 'ssh-guard') throw new ApiError(404, `未知内置插件 ${name}`)
+  return st.sshGuard satisfies SshGuardPluginConfig
+})
+route('PUT', /^\/nodes\/([^/]+)\/management\/plugins\/([^/]+)$/, (m, opts) => {
+  const st = requireOnline(decodeURIComponent(m[1]))
+  const name = decodeURIComponent(m[2])
+  if (name !== 'ssh-guard') throw new ApiError(404, `未知内置插件 ${name}`)
+  st.sshGuard = bodyOf<SshGuardPluginConfig>(opts)
+  return { hash: hex(8), confirm: null } satisfies ConfigWriteResp
 })
 
 // ---- templates & rollouts ----
