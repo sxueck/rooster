@@ -1,5 +1,7 @@
 # Rooster
 
+[![docker-image](https://github.com/sxueck/rooster/actions/workflows/docker-image.yml/badge.svg)](https://github.com/sxueck/rooster/actions/workflows/docker-image.yml)
+
 Port protection agent + management hub for Linux nodes, in a single Rust
 binary (`rooster agent` / `rooster hub`). No external middleware: the agent
 is a 80/443 reverse proxy with WAF, GeoIP, ACME and nftables-backed banning;
@@ -59,6 +61,34 @@ web/                    # Vue 3 panel (served by the hub from web/dist)
 rules/                  # built-in CRS subset, embedded into the agent at build time
 ```
 
+## Quick deploy
+
+```sh
+git clone https://github.com/sxueck/rooster.git
+cd rooster && bash deploy.sh
+```
+
+`deploy.sh` walks you through, with prompts and defaults:
+
+- **hub** — Docker (pulls `ghcr.io/sxueck/rooster`, auto-generates a
+  self-signed TLS cert + CA, writes `hub.yaml`, health-checks the endpoint),
+  native build + systemd unit, or behind an existing nginx/TLS terminator
+  (plaintext loopback mode + a ready-to-paste nginx server block);
+- **agent** — enrolls a node against an existing hub via the hub's own
+  `install.sh` (one-time token from the panel), or runs it in Docker.
+  Signed releases are required by default; installing the hub's own unsigned
+  binary requires an explicit choice and a matching CPU architecture.
+
+The helper refuses to overwrite existing hub configuration or TLS files.
+Upgrade an existing deployment manually, preserving its CA and data; a new
+CA requires updating the trust anchor on existing nodes. Native deployment
+installs frontend dependencies and copies the panel to
+`/usr/share/rooster/web/dist`. Health checks require `/healthz` to return
+`200` and `ok`, with certificate and hostname verification for TLS.
+
+Deployment regression tests (Python 3, Bash, curl and OpenSSL):
+`python3 tests/test_deploy.py -v`.
+
 ## Build & run
 
 ```sh
@@ -75,18 +105,19 @@ hub `listen`, so agents have a CA to trust.
 
 ## Container image
 
-CI builds a combined agent+hub image to GHCR on pushes to `main` and on
-`v*` tags (`ghcr.io/<owner>/rooster`). The hub role:
+CI builds a combined agent+hub image to `ghcr.io/sxueck/rooster` on pushes
+to `main` and on `v*` tags. The hub role (or just run `bash deploy.sh`):
 
 ```sh
 docker run -d --name rooster-hub -p 9443:9443 \
-  -v "$PWD/hub.yaml:/etc/rooster/hub.yaml:ro" \
+  -v "$PWD/hub.yaml:/etc/rooster/hub.yaml" \
   -v rooster-data:/var/lib/rooster-hub \
-  ghcr.io/<owner>/rooster
+  ghcr.io/sxueck/rooster
 ```
 
-The agent role bans via nftables and needs host networking plus
-`--cap-add NET_ADMIN`.
+The agent role bans via nftables on the host kernel — run it with
+`--network host --cap-add NET_ADMIN`, or enroll real nodes with
+`install.sh` (see `deploy.sh` option 3).
 
 ## Toolchain
 
