@@ -11,14 +11,18 @@ permissions:
 jobs:
   build:
     name: build (${{ matrix.suffix }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # aarch64 用 GitHub 原生 arm runner(public 仓库免费),避免
+          # ring 交叉编译的 sysroot 陷阱(宿主 /usr/include 泄入 gcc-cross)。
           - suffix: x86_64
+            runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - suffix: aarch64
+            runs-on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     env:
       SUFFIX: ${{ matrix.suffix }}
@@ -29,25 +33,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install aarch64 cross toolchain
-        if: matrix.suffix == 'aarch64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          rustup target add aarch64-unknown-linux-gnu
-          {
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_AR=aarch64-linux-gnu-ar"
-            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
-          } >> "$GITHUB_ENV"
-
       # v2
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --bin rooster --target "$TARGET"
+        run: |
+          cargo build --release --bin rooster --target "$TARGET"
+          "target/$TARGET/release/rooster" --version
+          "target/$TARGET/release/rooster" agent upgrade-guard --help >/dev/null
 
       # 产物只保留压缩形态(gz ~2.7x / xz ~4x):上传面板前本地解压再签名。
       - name: Package
