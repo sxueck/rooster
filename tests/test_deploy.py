@@ -19,6 +19,8 @@ def bash(body, answers="", cwd=ROOT, env=None):
         ["bash", "-c", f"source {shlex.quote(str(DEPLOY))}\n{body}"],
         input=answers, text=True, capture_output=True, cwd=cwd,
         env={**os.environ, **(env or {})}, timeout=20,
+        # no controlling terminal: prompts fall back from /dev/tty to stdin
+        start_new_session=True,
     )
 
 

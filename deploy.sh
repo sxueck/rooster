@@ -17,12 +17,21 @@ say()  { printf "%b\n" "$*"; }
 die()  { printf "%b\n" "${R}error:${N} $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# prompts must not read stdin: under `curl ... | bash` stdin is the script
+# pipe itself, so interactive answers come from the terminal instead
+read_tty() {
+  if [ -t 0 ]; then read "$@"
+  elif read "$@" 2>/dev/null </dev/tty; then :
+  else read "$@"
+  fi
+}
+
 # ask PROMPT [DEFAULT] -> prints the answer
 ask() {
   local p="$1" d="${2:-}" a
   if [ -n "$d" ]; then p="$p ${DIM}[$d]${N}"; fi
   printf "%b" "$p: " >&2
-  read -r a
+  read_tty -r a
   echo "${a:-$d}"
 }
 
@@ -30,13 +39,13 @@ ask() {
 ask_secret() {
   local a a2
   printf "%b" "$1 ${DIM}(empty = autogenerate)${N}: " >&2
-  read -rs a; printf "\n" >&2
+  read_tty -rs a; printf "\n" >&2
   if [ -z "$a" ]; then
     a="$(openssl rand -base64 18)"
     say "${DIM}generated: $a${N}" >&2
   fi
   printf "%b" "confirm (same password): " >&2
-  read -rs a2; printf "\n" >&2
+  read_tty -rs a2; printf "\n" >&2
   [ "$a" = "$a2" ] || die "the two entries do not match"
   echo "$a"
 }
@@ -51,7 +60,7 @@ choose() {
   n=$#
   while :; do
     printf "%b" "select ${DIM}[1-$n]${N}: " >&2
-    read -r sel
+    read_tty -r sel
     sel="${sel:-1}"
     case "$sel" in (*[!0-9]*|'') ;; (*) [ "$sel" -ge 1 ] && [ "$sel" -le "$n" ] && break ;; esac
     say "${Y}invalid choice${N}" >&2
@@ -292,7 +301,10 @@ deploy_hub_native() (
   say "${DIM}cloning + building (this takes a while) ...${N}"
   if [ ! -f Cargo.toml ]; then
     have git || die "git not found"
-    git clone "$REPO_URL.git" .
+    # clone into the scratch dir: `curl | bash` usually starts in a
+    # non-empty directory where `git clone ... .` would fail
+    git clone --depth 1 "$REPO_URL.git" "$work/src"
+    cd "$work/src"
   fi
   npm --prefix web ci --no-audit --no-fund
   make all
@@ -439,4 +451,5 @@ menu() {
   esac
 }
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then menu; fi
+# BASH_SOURCE is unset when the script is piped into bash (curl | bash)
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then menu; fi

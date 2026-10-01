@@ -64,6 +64,9 @@ rules/                  # built-in CRS subset, embedded into the agent at build 
 ## Quick deploy
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/sxueck/rooster/main/deploy.sh | bash
+
+# or clone first:
 git clone https://github.com/sxueck/rooster.git
 cd rooster && bash deploy.sh
 ```
