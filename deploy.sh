@@ -37,16 +37,13 @@ ask() {
 
 # ask_secret PROMPT -> prints the answer; empty input generates a random secret
 ask_secret() {
-  local a a2
+  local a
   printf "%b" "$1 ${DIM}(empty = autogenerate)${N}: " >&2
   read_tty -rs a; printf "\n" >&2
   if [ -z "$a" ]; then
     a="$(openssl rand -base64 18)"
     say "${DIM}generated: $a${N}" >&2
   fi
-  printf "%b" "confirm (same password): " >&2
-  read_tty -rs a2; printf "\n" >&2
-  [ "$a" = "$a2" ] || die "the two entries do not match"
   echo "$a"
 }
 
@@ -79,14 +76,18 @@ detect_ip() {
 
 # gen_tls DIR HOSTNAME IP -> writes DIR/{ca.crt,ca.key,hub.crt,hub.key}
 gen_tls() {
-  local dir="$1" host="$2" ip="$3" san
+  local dir="$1" host="$2" san name
   san="DNS:localhost,IP:127.0.0.1"
-  if [[ "$host" = *:* || "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    san="$san,IP:$host"
-  elif [ -n "$host" ]; then
-    san="$san,DNS:$host"
-  fi
-  [ -n "$ip" ] && san="$san,IP:$ip"
+  # SANs come only from the prompt: hosts may be comma-separated so later
+  # forward/proxy addresses end up on the same certificate — agents and
+  # browsers verify the address they dial
+  for name in ${host//,/ }; do
+    if [[ "$name" = *:* || "$name" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      san="$san,IP:$name"
+    else
+      san="$san,DNS:$name"
+    fi
+  done
   mkdir -p "$dir"
   openssl ecparam -name prime256v1 -genkey -noout -out "$dir/ca.key" 2>/dev/null
   openssl req -x509 -new -key "$dir/ca.key" -subj "/CN=rooster-hub-ca" -days 3650 -out "$dir/ca.crt" 2>/dev/null
@@ -191,9 +192,10 @@ deploy_hub_docker() {
   have openssl || die "openssl not found"
   have curl || die "curl not found"
 
-  local ip host port pubport secret dir selfsigned tlsdir hubmode ca="" names recreate=no
+  local ip host hosts port pubport secret dir selfsigned tlsdir hubmode ca="" names recreate=no
   ip="$(detect_ip)"
-  host="$(ask "public hostname or IP agents/panel will use" "${ip:-127.0.0.1}")"
+  hosts="$(ask "public hostname(s)/IP(s) agents and the panel will use (comma-separated)" "${ip:-127.0.0.1}")"
+  host="${hosts%%,*}"
   port="$(ask "listen port" 9443)"
   secret="$(ask_secret "panel admin password")"
   dir="$(ask "config directory (created if missing)" "$PWD/rooster-hub")"
@@ -228,7 +230,7 @@ deploy_hub_docker() {
       pubport="$(ask "public HTTPS port at the TLS terminator (agents use it too)" 443)"
       ;;
     *)
-      gen_tls "$tlsdir" "$host" "$ip"
+      gen_tls "$tlsdir" "$hosts"
       selfsigned="yes"
       ;;
   esac
@@ -285,12 +287,13 @@ deploy_hub_native() (
   have curl || die "curl not found"
   have make || die "make not found"
 
-  local ip host port pubport secret dir="/etc/rooster" selfsigned tlsdir hubmode work ca=""
+  local ip host hosts port pubport secret dir="/etc/rooster" selfsigned tlsdir hubmode work ca=""
   as_root test ! -e "$dir/hub.yaml" && as_root test ! -e "$dir/tls" || die "existing hub config/TLS in $dir; refusing to overwrite it (upgrade the existing deployment manually)"
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
   ip="$(detect_ip)"
-  host="$(ask "public hostname or IP agents/panel will use" "${ip:-127.0.0.1}")"
+  hosts="$(ask "public hostname(s)/IP(s) agents and the panel will use (comma-separated)" "${ip:-127.0.0.1}")"
+  host="${hosts%%,*}"
   port="$(ask "listen port" 9443)"
   secret="$(ask_secret "panel admin password")"
   selfsigned="$(choose "TLS certificate" \
@@ -328,7 +331,7 @@ deploy_hub_native() (
       pubport="$(ask "public HTTPS port at the TLS terminator (agents use it too)" 443)"
       ;;
     *)
-      gen_tls "$tlsdir" "$host" "$ip"
+      gen_tls "$tlsdir" "$hosts"
       selfsigned="yes"
       ;;
   esac

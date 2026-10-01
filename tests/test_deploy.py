@@ -113,10 +113,10 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
 
-    def certificates(self, host="hub.example", ip="10.0.0.2"):
+    def certificates(self, host="hub.example"):
         tls = self.dir / "certificates"
-        self.ok(bash('gen_tls "$TLS" "$HOST" "$IP"', env={
-            "TLS": str(tls), "HOST": host, "IP": ip,
+        self.ok(bash('gen_tls "$TLS" "$HOST"', env={
+            "TLS": str(tls), "HOST": host,
         }))
         return tls
 
@@ -155,6 +155,19 @@ class DeployTests(unittest.TestCase):
         ], text=True, capture_output=True)
         self.ok(result)
 
+    def test_hostname_list_covers_every_entry(self):
+        tls = self.certificates("hub.example,forward.example,10.9.9.9")
+        for flag, value in [
+            ("-verify_hostname", "hub.example"),
+            ("-verify_hostname", "forward.example"),
+            ("-verify_ip", "10.9.9.9"),
+        ]:
+            result = subprocess.run([
+                "openssl", "verify", "-CAfile", str(tls / "ca.crt"),
+                flag, value, str(tls / "hub.crt"),
+            ], text=True, capture_output=True)
+            self.ok(result)
+
     def test_health_requires_success_status_and_body(self):
         for status, body, success in [(200, b"ok", True), (502, b"ok", False), (200, b"wrong service", False)]:
             with self.subTest(status=status, body=body), endpoint(status, body) as port:
@@ -178,7 +191,7 @@ class DeployTests(unittest.TestCase):
         (config / "tls").mkdir(parents=True)
         for path in (config / "hub.yaml", config / "tls/ca.crt"):
             path.write_text("old-deployment")
-        answers = f"hub.example\n9443\ntest-only\ntest-only\n{config}\n1\n"
+        answers = f"hub.example\n9443\ntest-only\n{config}\n1\n"
         result = bash(DOCKER + "\ndeploy_hub_docker", answers, env={
             **self.env, "EXISTING_CONTAINER": "rooster-hub\n",
         })
@@ -191,7 +204,7 @@ class DeployTests(unittest.TestCase):
         config = self.dir / "existing"
         config.mkdir()
         (config / "hub.yaml").write_text("old-deployment")
-        result = bash(DOCKER + "\ndeploy_hub_docker", f"hub.example\n9443\ntest-only\ntest-only\n{config}\n", env=self.env)
+        result = bash(DOCKER + "\ndeploy_hub_docker", f"hub.example\n9443\ntest-only\n{config}\n", env=self.env)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((config / "hub.yaml").read_text(), "old-deployment")
         self.assertFalse((config / "tls").exists())
@@ -199,7 +212,7 @@ class DeployTests(unittest.TestCase):
     def test_docker_tls_uses_port_mapping_and_public_ca_mode(self):
         tls = self.certificates()
         config = self.dir / "docker config"
-        answers = f"hub.example\n10443\ntest-only\ntest-only\n{config}\n2\n{tls / 'hub.crt'}\n{tls / 'hub.key'}\n\n"
+        answers = f"hub.example\n10443\ntest-only\n{config}\n2\n{tls / 'hub.crt'}\n{tls / 'hub.key'}\n\n"
         output = self.ok(bash(DOCKER + "\ndeploy_hub_docker", answers, env=self.env))
         self.assertIn("PROBE <10443> <static> <hub.example> <>", output)
         self.assertIn("listen: 0.0.0.0:9443", (config / "hub.yaml").read_text())
@@ -209,7 +222,7 @@ class DeployTests(unittest.TestCase):
     def test_docker_custom_ca_is_copied_and_used_for_tls_probe(self):
         tls = self.certificates()
         config = self.dir / "private-ca"
-        answers = f"hub.example\n10443\ntest-only\ntest-only\n{config}\n2\n{tls / 'hub.crt'}\n{tls / 'hub.key'}\n{tls / 'ca.crt'}\n"
+        answers = f"hub.example\n10443\ntest-only\n{config}\n2\n{tls / 'hub.crt'}\n{tls / 'hub.key'}\n{tls / 'ca.crt'}\n"
         output = self.ok(bash(DOCKER + "\ndeploy_hub_docker", answers, env=self.env))
         self.assertEqual((config / "tls/ca.crt").read_bytes(), (tls / "ca.crt").read_bytes())
         self.assertIn("  ca: /etc/rooster/tls/ca.crt", (config / "hub.yaml").read_text())
@@ -217,7 +230,7 @@ class DeployTests(unittest.TestCase):
 
     def test_docker_nginx_uses_requested_backend_and_public_ports(self):
         config = self.dir / "plain"
-        answers = f"hub.example\n10443\ntest-only\ntest-only\n{config}\n3\n8443\n"
+        answers = f"hub.example\n10443\ntest-only\n{config}\n3\n8443\n"
         output = self.ok(bash(DOCKER + "\ndeploy_hub_docker", answers, env=self.env))
         self.assertIn("listen: 127.0.0.1:10443", (config / "hub.yaml").read_text())
         self.assertIn("PROBE <10443> <plain>", output)
@@ -238,7 +251,7 @@ class DeployTests(unittest.TestCase):
 
     def test_native_installs_staged_tls_panel_and_custom_port(self):
         work = self.native_workspace()
-        answers = "hub.example\n10443\ntest-only\ntest-only\n1\n"
+        answers = "hub.example\n10443\ntest-only\n1\n"
         output = self.ok(bash(NATIVE + "\ndeploy_hub_native", answers, cwd=work, env=self.env))
         system = Path(self.env["SANDBOX"])
         config = system / "etc/rooster/hub.yaml"
@@ -252,7 +265,7 @@ class DeployTests(unittest.TestCase):
 
     def test_native_nginx_uses_requested_ports_without_installing_tls(self):
         work = self.native_workspace()
-        answers = "hub.example\n10443\ntest-only\ntest-only\n3\n8443\n"
+        answers = "hub.example\n10443\ntest-only\n3\n8443\n"
         output = self.ok(bash(NATIVE + "\ndeploy_hub_native", answers, cwd=work, env=self.env))
         system = Path(self.env["SANDBOX"])
         config = (system / "etc/rooster/hub.yaml").read_text()

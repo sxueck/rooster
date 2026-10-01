@@ -83,7 +83,10 @@ cd rooster && bash deploy.sh
   binary requires an explicit choice and a matching CPU architecture.
 
 The helper refuses to overwrite existing hub configuration or TLS files.
-Upgrade an existing deployment manually, preserving its CA and data; a new
+Hostname/IP prompts accept a comma-separated list, so a future
+port-forward or reverse-proxy address can be baked into the same
+certificate; agents and browsers verify the address they dial against
+it. Upgrade an existing deployment manually, preserving its CA and data; a new
 CA requires updating the trust anchor on existing nodes. Native deployment
 installs frontend dependencies and copies the panel to
 `/usr/share/rooster/web/dist`. Health checks require `/healthz` to return
