@@ -736,12 +736,22 @@ pub async fn fetch_hub_bytes(
     state: &Arc<AgentState>,
     path: &str,
 ) -> Result<Vec<u8>, String> {
+    fetch_hub_bytes_with_progress(state, path, |_, _| {}).await
+}
+
+/// 同 fetch_hub_bytes,但按数据块回调进度 (loaded, total);
+/// total 来自 Content-Length,分块传输时为 None。
+pub async fn fetch_hub_bytes_with_progress(
+    state: &Arc<AgentState>,
+    path: &str,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>, String> {
     let eff = state.effective();
     let hub = eff.hub.clone().ok_or("hub not configured")?;
     let url = hub_file_url(&hub, path);
     let client =
         http_client_with_timeout(&hub, &eff.agent.data_dir(), Duration::from_secs(120))?;
-    let resp = client
+    let mut resp = client
         .get(&url)
         .send()
         .await
@@ -749,8 +759,15 @@ pub async fn fetch_hub_bytes(
     if !resp.status().is_success() {
         return Err(format!("http {}", resp.status()));
     }
-    let bytes = resp.bytes().await.map_err(|e| format!("body: {e}"))?;
-    Ok(bytes.to_vec())
+    let total = resp.content_length();
+    let mut out = Vec::with_capacity(total.unwrap_or(0) as usize);
+    let mut loaded: u64 = 0;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("body: {e}"))? {
+        out.extend_from_slice(&chunk);
+        loaded += chunk.len() as u64;
+        on_progress(loaded, total);
+    }
+    Ok(out)
 }
 
 pub async fn fetch_hub_file(

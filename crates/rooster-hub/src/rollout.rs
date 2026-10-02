@@ -321,6 +321,17 @@ fn add_result(
     status: &str,
     error: Option<String>,
 ) {
+    add_result_detail(state, run_id, node_id, status, error, None);
+}
+
+fn add_result_detail(
+    state: &Arc<HubState>,
+    run_id: &str,
+    node_id: String,
+    status: &str,
+    error: Option<String>,
+    detail: Option<String>,
+) {
     if let Ok(Some(mut run)) = state.store.get_rollout(run_id) {
         // 幂等:同一节点保留最新状态。
         run.results.retain(|r| r.node_id != node_id);
@@ -328,6 +339,7 @@ fn add_result(
             node_id,
             status: status.to_string(),
             error,
+            detail,
         });
         let _ = state.store.put_rollout(run_id, &run);
     }
@@ -373,12 +385,6 @@ pub fn spawn_upgrade_rollout(
                 .collect(),
             None => state.store.select_nodes(&selector).unwrap_or_default(),
         };
-        let url = state.signed_download_url(&format!("/v0/downloads/{version}"), 24 * 3600);
-        let sig = state
-            .store
-            .get_upgrade_sig(&version)
-            .unwrap_or(None)
-            .unwrap_or_default();
         let _ = state.store.put_rollout(
             &run_id,
             &RolloutRecord {
@@ -394,22 +400,17 @@ pub fn spawn_upgrade_rollout(
         for batch in nodes.chunks(batch_size.max(1)) {
             for node in batch {
                 let Some(conn) = state.registry.get(&node.id) else {
-                    add_result(&state, &run_id, node.id.clone(), "offline", None);
+                    mark_pending_upgrade(&state, &node.id, &version);
+                    add_result(&state, &run_id, node.id.clone(), "pending-offline", None);
                     continue;
                 };
-                let sent = conn.send(rooster_proto::Frame::Upgrade {
-                    version: version.clone(),
-                    url: url.clone(),
-                    signature: sig.clone(),
-                    public_key: state.cfg.upgrade_public_key.clone(),
-                });
-                add_result(
-                    &state,
-                    &run_id,
-                    node.id.clone(),
-                    if sent.is_ok() { "sent" } else { "offline" },
-                    None,
-                );
+                if conn.send(upgrade_frame(&state, &version)).is_ok() {
+                    add_result(&state, &run_id, node.id.clone(), "sent", None);
+                } else {
+                    // 连接刚断:与开局就离线同路径,重连补发。
+                    mark_pending_upgrade(&state, &node.id, &version);
+                    add_result(&state, &run_id, node.id.clone(), "pending-offline", None);
+                }
             }
             // 观察窗口:等节点重启并以新版本 Hello 回来。上报的是纯
             // semver(CARGO_PKG_VERSION),入库 key 可能带 -<arch> 后缀,
@@ -420,18 +421,32 @@ pub fn spawn_upgrade_rollout(
                 if let Ok(Some(rec)) = state.store.get_node(&node.id) {
                     if rec.version == want {
                         replace_result(&state, &run_id, &node.id, "upgraded");
-                    } else if state.registry.is_online(&node.id) && rec.version != want {
-                        // 还在线且版本没变:节点还没执行或执行失败。
-                        replace_result(&state, &run_id, &node.id, "version-unchanged");
+                        clear_pending_upgrade(&state, &node.id, &version);
                     } else {
-                        replace_result(&state, &run_id, &node.id, "unresponsive");
+                        // 在线没升级/不响应:只降级还没进入替换阶段的行;
+                        // applying/applied 的节点正在重启,由 Hello 钩子确认。
+                        let next = if state.registry.is_online(&node.id) {
+                            "version-unchanged"
+                        } else {
+                            "unresponsive"
+                        };
+                        replace_result_if(
+                            &state,
+                            &run_id,
+                            &node.id,
+                            &["sent", "downloading", "verifying"],
+                            next,
+                        );
                     }
                 }
             }
         }
         if let Ok(Some(mut run)) = state.store.get_rollout(&run_id) {
-            run.finished_at = Some(now_secs());
-            run.status = "done".into();
+            // 有 pending-offline 节点就不收尾:重连补发后由 Hello 确认,
+            // confirm_upgrade_by_hello 会把 run 落到 done。
+            let waiting = run.results.iter().any(|r| r.status == "pending-offline");
+            run.status = if waiting { "waiting-offline" } else { "done" }.into();
+            run.finished_at = (!waiting).then(now_secs);
             let _ = state.store.put_rollout(&run_id, &run);
         }
     });
@@ -446,6 +461,166 @@ fn replace_result(state: &Arc<HubState>, run_id: &str, node_id: &str, status: &s
         }
         let _ = state.store.put_rollout(run_id, &run);
     }
+}
+
+fn replace_result_if(
+    state: &Arc<HubState>,
+    run_id: &str,
+    node_id: &str,
+    allowed: &[&str],
+    status: &str,
+) {
+    if let Ok(Some(mut run)) = state.store.get_rollout(run_id) {
+        for r in run.results.iter_mut() {
+            if r.node_id == node_id && allowed.contains(&r.status.as_str()) {
+                r.status = status.to_string();
+            }
+        }
+        let _ = state.store.put_rollout(run_id, &run);
+    }
+}
+
+// -- 升级:进度回填与离线补发 -------------------------------------------
+
+/// Upgrade 帧构造(首发与重连补发共用一份,URL 签名 24h)。
+fn upgrade_frame(state: &HubState, version: &str) -> rooster_proto::Frame {
+    rooster_proto::Frame::Upgrade {
+        version: version.to_string(),
+        url: state.signed_download_url(&format!("/v0/downloads/{version}"), 24 * 3600),
+        signature: state
+            .store
+            .get_upgrade_sig(version)
+            .unwrap_or(None)
+            .unwrap_or_default(),
+        public_key: state.cfg.upgrade_public_key.clone(),
+    }
+}
+
+fn mark_pending_upgrade(state: &Arc<HubState>, node_id: &str, version: &str) {
+    if let Ok(Some(mut rec)) = state.store.get_node(node_id) {
+        rec.pending_upgrade = Some(version.to_string());
+        let _ = state.store.upsert_node(&rec);
+    }
+}
+
+fn clear_pending_upgrade(state: &Arc<HubState>, node_id: &str, version: &str) {
+    if let Ok(Some(mut rec)) = state.store.get_node(node_id) {
+        if rec.pending_upgrade.as_deref() == Some(version) {
+            rec.pending_upgrade = None;
+            let _ = state.store.upsert_node(&rec);
+        }
+    }
+}
+
+/// Agent 的 UpgradeStatus 事件 → 实时回填运行中升级 rollout 的节点行。
+/// version 是 agent 回显的入库 key,与 rollout.version 一一对应;
+/// 已收尾的 run 是历史事实,不再改写。未知 stage 直接忽略(不信任
+/// agent 侧任意字符串污染结果行)。
+pub fn update_upgrade_progress(
+    state: &Arc<HubState>,
+    node_id: &str,
+    version: &str,
+    stage: &str,
+    detail: Option<String>,
+) {
+    let status = match stage {
+        "downloading" | "verifying" | "applying" | "applied" | "failed" => stage,
+        _ => return,
+    };
+    if matches!(status, "applied" | "failed") {
+        // 二进制已替换或已放弃:补发义务解除,由 Hello 或人工决定后续。
+        clear_pending_upgrade(state, node_id, version);
+    }
+    let Ok(runs) = state.store.list_rollouts(100) else {
+        return;
+    };
+    let Some((run_id, _)) = runs
+        .into_iter()
+        .find(|(_, r)| {
+            r.kind == "upgrade"
+                && r.status == "running"
+                && r.version.as_deref() == Some(version)
+                && r.results.iter().any(|x| x.node_id == node_id)
+        })
+    else {
+        return;
+    };
+    if let Ok(Some(mut run)) = state.store.get_rollout(&run_id) {
+        if let Some(row) = run.results.iter_mut().find(|x| x.node_id == node_id) {
+            // 阶段只前进不倒退:窗口判定可能已把它标成终态。
+            if !matches!(row.status.as_str(), "upgraded" | "failed") {
+                row.status = status.to_string();
+                row.detail = detail;
+            }
+        }
+        let _ = state.store.put_rollout(&run_id, &run);
+    }
+}
+
+/// Hello 上报版本 → 升级成功确认:所有未收尾且目标版本匹配的升级
+/// rollout,该节点行标 upgraded,并清掉 pending 标记。首发窗口错过的
+/// (applied 后重启慢、pending 补发)都靠这里闭环。
+pub fn confirm_upgrade_by_hello(state: &Arc<HubState>, node_id: &str, reported: &str) {
+    let Ok(runs) = state.store.list_rollouts(100) else {
+        return;
+    };
+    for (run_id, run) in runs {
+        if run.kind != "upgrade"
+            || !matches!(run.status.as_str(), "running" | "waiting-offline")
+            || run.version.as_deref().map(artifact_semver) != Some(reported)
+        {
+            continue;
+        }
+        if !run.results.iter().any(|x| x.node_id == node_id && x.status != "upgraded") {
+            continue;
+        }
+        replace_result(state, &run_id, node_id, "upgraded");
+        if let Some(v) = run.version.as_deref() {
+            clear_pending_upgrade(state, node_id, v);
+        }
+        // waiting-offline 的 run:最后一个 pending 闭环后落 done。
+        if run.status == "waiting-offline" {
+            if let Ok(Some(mut rec)) = state.store.get_rollout(&run_id) {
+                if !rec.results.iter().any(|r| r.status == "pending-offline") {
+                    rec.finished_at = Some(now_secs());
+                    rec.status = "done".into();
+                    let _ = state.store.put_rollout(&run_id, &rec);
+                }
+            }
+        }
+    }
+}
+
+/// 节点重连后补发待下发的升级包(开局离线/发帧瞬间掉线的节点)。
+pub async fn replay_pending_upgrade(state: &Arc<HubState>, node_id: &str) {
+    let Some(rec) = state.store.get_node(node_id).ok().flatten() else {
+        return;
+    };
+    let Some(version) = rec.pending_upgrade.clone() else {
+        return;
+    };
+    // 包已被面板删除:补发义务解除。
+    if state.store.get_upgrade(&version).unwrap_or(None).is_none() {
+        let mut rec = rec;
+        rec.pending_upgrade = None;
+        let _ = state.store.upsert_node(&rec);
+        return;
+    }
+    // Hello 已是目标版本:pending 是残留,直接清。
+    if rec.version == artifact_semver(&version) {
+        let mut rec = rec;
+        rec.pending_upgrade = None;
+        let _ = state.store.upsert_node(&rec);
+        return;
+    }
+    let Some(conn) = state.registry.get(node_id) else {
+        return;
+    };
+    if conn.send(upgrade_frame(state, &version)).is_ok() {
+        tracing::info!(node = node_id, version, "pending upgrade re-sent after reconnect");
+    }
+    // pending 保留:节点确认(Hello 版本匹配/applied 事件)后才清除,
+    // 否则补发后再掉线就再也没人管了。
 }
 
 #[cfg(test)]

@@ -28,6 +28,33 @@ fn status(state: &Arc<AgentState>, version: &str, stage: &str, detail: Option<St
     });
 }
 
+/// 进度节流:已知总长按 10% 步进上报,未知按 16MiB 步进。返回
+/// (新标记, 本次 detail);标记不前进则不上报。纯函数,便于单测。
+fn download_progress_detail(last: u64, loaded: u64, total: Option<u64>) -> (u64, Option<String>) {
+    const MIB: u64 = 1024 * 1024;
+    match total.filter(|t| *t > 0) {
+        Some(total) => {
+            let pct = (loaded * 100 / total).min(100);
+            if pct >= last + 10 || (pct == 100 && last < 100) {
+                (pct, Some(format!("{pct}%")))
+            } else {
+                (last, None)
+            }
+        }
+        None => {
+            let step = loaded / (16 * MIB);
+            if step > last {
+                (
+                    step,
+                    Some(format!("{:.1} MiB", loaded as f64 / MIB as f64)),
+                )
+            } else {
+                (last, None)
+            }
+        }
+    }
+}
+
 /// 收到 Upgrade 帧后的执行流程。
 pub async fn handle(
     state: &Arc<AgentState>,
@@ -39,8 +66,20 @@ pub async fn handle(
     status(state, version, "downloading", None);
     // 下载复用 hub 下载通道:hub 下发的是相对路径(/v0/downloads/...),
     // 必须解析到 hub 基地址并携带 mTLS 节点身份;完整性由下方 Ed25519
-    // 签名校验保证(与传输通道无关)。
-    let bytes = match crate::hubclient::fetch_hub_bytes(state, url).await {
+    // 签名校验保证(与传输通道无关)。进度按 10%/16MiB 节流上报,
+    // 否则几十 MB 的包会刷屏事件流。
+    let mut last_marker: u64 = 0;
+    let fetch_state = state.clone();
+    let fetch_version = version.to_string();
+    let bytes = match crate::hubclient::fetch_hub_bytes_with_progress(state, url, move |loaded, total| {
+        let (marker, detail) = download_progress_detail(last_marker, loaded, total);
+        if let Some(d) = detail {
+            status(&fetch_state, &fetch_version, "downloading", Some(d));
+        }
+        last_marker = marker;
+    })
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             status(state, version, "failed", Some(format!("download: {e}")));
@@ -326,6 +365,26 @@ mod tests {
     /// restore_previous/guard 都作用于 current_exe 同目录的 rooster.prev,
     /// 相关测试串行以免互相干扰。
     static PREV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn download_progress_throttles_by_percent_and_mib() {
+        let total = Some(100 * 1024 * 1024);
+        // 9% 不报,10% 报;之后每 +10% 一报
+        assert_eq!(download_progress_detail(0, 9 * 1024 * 1024, total).1, None);
+        assert_eq!(download_progress_detail(0, 10 * 1024 * 1024, total).1.as_deref(), Some("10%"));
+        let (m, d) = download_progress_detail(10, 19 * 1024 * 1024, total);
+        assert_eq!(d, None, "same bucket stays silent");
+        assert_eq!(m, 10);
+        assert_eq!(download_progress_detail(90, 100 * 1024 * 1024, total).1.as_deref(), Some("100%"));
+        // 未知总长:16MiB 步进
+        let (m, d) = download_progress_detail(0, 17 * 1024 * 1024, None);
+        assert_eq!(m, 1);
+        assert_eq!(d.as_deref(), Some("17.0 MiB"));
+        assert_eq!(download_progress_detail(1, 17 * 1024 * 1024, None).1, None);
+        // total=0 视为未知,除零保护
+        let (m, _) = download_progress_detail(0, 1, Some(0));
+        assert_eq!(m, 0);
+    }
 
     #[test]
     fn signature_roundtrip() {

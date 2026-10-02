@@ -33,6 +33,8 @@ pub struct NodeRecord {
     pub cert_fp: String,
     /// 离线期间的待下发模板。
     pub pending_template: Option<String>,
+    /// 离线期间待下发的升级包(入库 key,如 `0.2.0-x86_64`)。
+    pub pending_upgrade: Option<String>,
 }
 
 impl NodeRecord {
@@ -46,6 +48,7 @@ impl NodeRecord {
             revoked: false,
             cert_fp,
             pending_template: None,
+            pending_upgrade: None,
         }
     }
 }
@@ -90,6 +93,9 @@ pub struct RolloutNodeResult {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 过程详情(升级进度:下载百分比 / 阶段说明)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

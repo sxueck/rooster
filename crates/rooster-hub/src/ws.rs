@@ -70,7 +70,7 @@ async fn agent_session(state: Arc<HubState>, meta: ConnMeta, mut sock: WebSocket
 
     // 节点状态更新 + 面板通知。
     if let Ok(Some(mut rec)) = state.store.get_node(&node_id) {
-        rec.version = version;
+        rec.version = version.clone();
         rec.config_hash = config_hash;
         rec.last_seen = now_secs();
         let _ = state.store.upsert_node(&rec);
@@ -80,7 +80,7 @@ async fn agent_session(state: Arc<HubState>, meta: ConnMeta, mut sock: WebSocket
     }));
     tracing::info!(node = node_id, peer = meta.peer.to_string(), "agent connected");
 
-    // 重连后全量同步全局封禁;补发离线期间的模板。
+    // 重连后全量同步全局封禁;补发离线期间的模板与升级包。
     rollout::global_ban_sync(&state, &node_id);
     {
         let state = state.clone();
@@ -89,6 +89,16 @@ async fn agent_session(state: Arc<HubState>, meta: ConnMeta, mut sock: WebSocket
             rollout::replay_pending_template(&state, &node_id).await;
         });
     }
+    {
+        let state = state.clone();
+        let node_id = node_id.clone();
+        tokio::spawn(async move {
+            rollout::replay_pending_upgrade(&state, &node_id).await;
+        });
+    }
+    // Hello 版本就是升级成功的事实源:首发窗口、补发、慢重启节点都在
+    // 这里闭环(见 rollout::confirm_upgrade_by_hello)。
+    rollout::confirm_upgrade_by_hello(&state, &node_id, &version);
 
     // 心跳:每 15s 发 Ping;读循环里超过 45s 无任何入站帧则断开。
     let hb_tx = tx.clone();
@@ -259,6 +269,19 @@ async fn handle_frame(state: &Arc<HubState>, conn: &Arc<crate::registry::Conn>, 
             }
             let acked = first_seq + batch.len().saturating_sub(1) as u64;
             let _ = conn.send(Frame::EventAck { acked_through: acked });
+            // 升级进度实时回填:agent 每个阶段都会发 UpgradeStatus,
+            // 不接这里 rollout 行就永远是 sent→终态两态采样。
+            for event in &batch {
+                if let Event::UpgradeStatus { version, stage, detail } = event {
+                    rollout::update_upgrade_progress(
+                        state,
+                        node_id,
+                        version,
+                        stage,
+                        detail.clone(),
+                    );
+                }
+            }
         }
         Frame::ApiResponse { .. } | Frame::TemplateResult { .. } => {
             // 完成对应的 oneshot 请求。

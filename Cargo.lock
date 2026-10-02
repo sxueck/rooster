@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "rooster"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "reqwest",
@@ -2375,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "rooster-agent"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "rooster-config"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "humantime-serde",
  "ipnet",
@@ -2439,7 +2439,7 @@ dependencies = [
 
 [[package]]
 name = "rooster-hub"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2475,7 +2475,7 @@ dependencies = [
 
 [[package]]
 name = "rooster-nft"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "ipnet",
  "libc",
@@ -2488,11 +2488,11 @@ dependencies = [
 
 [[package]]
 name = "rooster-plugin-sdk"
-version = "0.1.0"
+version = "0.2.1"
 
 [[package]]
 name = "rooster-proto"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "rooster-waf"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "regex",
  "serde",
