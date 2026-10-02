@@ -24,7 +24,7 @@ pub async fn serve(state: Arc<AgentState>, addr: SocketAddr) -> std::io::Result<
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .map_err(std::io::Error::other)
 }
 
 pub fn router(state: Arc<AgentState>) -> Router {
@@ -55,6 +55,7 @@ pub fn mgmt_router(state: Arc<AgentState>) -> Router {
         .route("/bans", get(list_bans).post(post_ban))
         .route("/bans/{ip}", delete(delete_ban))
         .route("/allowlist", get(get_allowlist).put(put_allowlist))
+        .route("/hardening", get(get_hardening).put(put_hardening))
         .route("/plugins/{name}", get(get_plugin).put(put_plugin))
         .route("/stats", get(get_stats))
         .route("/sites", get(list_sites))
@@ -197,7 +198,7 @@ fn new_token() -> String {
 /// 读侧哨兵:写回时出现该值即表示“沿用节点上的现值”。
 const SECRET_MASK: &str = "***";
 /// 凭据字段(相对配置文件的 `local` 段):hub 注册 token 与本地管理口令。
-const SECRET_PATHS: [&'static [&'static str]; 2] = [&["hub", "token"], &["management", "secret-key"]];
+const SECRET_PATHS: [&[&str]; 2] = [&["hub", "token"], &["management", "secret-key"]];
 
 fn with_local(rel: &'static [&'static str]) -> Vec<&'static str> {
     let mut v = vec!["local"];
@@ -764,6 +765,84 @@ async fn put_allowlist(
             });
             // security 属确认类变更:白名单/封禁规则变更后需确认,
             // 超时回滚(回滚会再次触发 runtime 重配置恢复内核白名单)。
+            let mut confirm = serde_json::Value::Null;
+            if AgentState::needs_confirm(&old_eff, &new_eff) {
+                let token = new_token();
+                let timeout = old_eff.security.apply_confirm_timeout();
+                state.start_confirm_timer(token.clone(), previous_raw, timeout);
+                confirm = json!({"token": token, "rollback-in": timeout.as_secs()});
+            }
+            Json(json!({
+                "hash": state.current_hash(),
+                "confirm": confirm,
+            }))
+            .into_response()
+        }
+        Err(e) => config_err_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /hardening:加固配置单段读写(面板表单直改;全部子项 opt-in)。
+
+async fn get_hardening(State(state): State<Arc<AgentState>>) -> Response {
+    // 表单回填用生效值(local/managed 合并后);字段名与 Rust schema 同源,
+    // 新增子项无需改动本端点。
+    let eff = state.effective();
+    Json(serde_json::to_value(&eff.hardening).expect("hardening serializes")).into_response()
+}
+
+async fn put_hardening(
+    State(state): State<Arc<AgentState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    // 严格反序列化:未知字段直接 422(防 `enable` 拼错导致静默不生效)。
+    let cfg: rooster_config::schema::HardeningConfig = match serde_json::from_value(body) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": format!("invalid hardening config: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    // 写入 local 层覆盖:单节点面板修改不动 Hub 模板下发的 managed 层。
+    // 所有字段 None 保持 + skip_serializing_if,未填字段不落盘,
+    // 不会以解析期默认值静默覆盖模板值(merge 测试固定了这一语义)。
+    let value = serde_json::to_value(&cfg).expect("hardening serializes");
+
+    let _guard = state.write_lock.lock().unwrap();
+    let raw = match std::fs::read_to_string(&state.config_path) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let path = [Seg::K("local"), Seg::K("hardening")];
+    let new_raw = if writer::subtree_exists(&raw, &path).unwrap_or(false) {
+        writer::replace_subtree(&raw, &path, &value)
+    } else {
+        writer::add_key(&raw, &[Seg::K("local")], "hardening", &value)
+    };
+    let new_raw = match new_raw {
+        Ok(r) => r,
+        Err(e) => return config_err_response(e),
+    };
+
+    let old_eff = state.effective();
+    let previous_raw = std::fs::read_to_string(&state.config_path).unwrap_or_default();
+    match state.commit_raw(&new_raw) {
+        Ok(new_eff) => {
+            state.push_event(Event::ConfigChanged {
+                hash: state.current_hash(),
+            });
+            // hardening 属确认类变更(state::needs_confirm 已含):蜜罐端口
+            // 误配会自断服务,超时未确认自动回滚。
             let mut confirm = serde_json::Value::Null;
             if AgentState::needs_confirm(&old_eff, &new_eff) {
                 let token = new_token();

@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rooster_config::schema::{OnExceed, RateLimitRule};
@@ -122,28 +123,21 @@ pub(crate) enum RateDecision {
 }
 
 /// 每站点一本:key → 桶。规则顺序即索引,配置变化时随站点重建。
+#[derive(Default)]
 pub(crate) struct RateBook {
     keys: HashMap<(u32, String), KeyState>,
     checks: u64,
 }
 
-impl Default for RateBook {
-    fn default() -> Self {
-        Self {
-            keys: HashMap::new(),
-            checks: 0,
-        }
-    }
-}
 
 impl RateBook {
     /// 回收空闲桶,并在触顶时淘汰最久未用的桶;内存占用因此有上界。
     fn sweep(&mut self, now: Instant) {
         self.checks += 1;
-        if self.keys.len() <= MAX_KEYS && self.checks % SWEEP_EVERY != 0 {
+        if self.keys.len() <= MAX_KEYS && !self.checks.is_multiple_of(SWEEP_EVERY) {
             return;
         }
-        if self.checks % SWEEP_EVERY != 0 {
+        if !self.checks.is_multiple_of(SWEEP_EVERY) {
             tracing::warn!(
                 entries = self.keys.len(),
                 max = MAX_KEYS,
@@ -388,6 +382,40 @@ mod tests {
         );
     }
 
+    /// 回归(F-ConnGate):计数归零的条目必须移除,不能只减不删 ——
+    /// 否则每个历史 IP 永久占据表项,普通流量也能把计数表无限撑大。
+    #[test]
+    fn conn_gate_removes_zero_count_entries_on_release() {
+        let mut gate = ConnGate::default();
+        let ip: IpAddr = "9.9.9.9".parse().unwrap();
+        assert!(gate.try_admit(ip, 2));
+        assert_eq!(gate.per_ip.len(), 1);
+        gate.release(ip);
+        assert_eq!(gate.per_ip.len(), 0, "zero-count entry must be removed on release");
+
+        // 大量「连上即断」的一次性 IP(扫描器形态)不能留下任何残余条目。
+        for i in 0..1000u32 {
+            let ip: IpAddr = format!("10.{}.{}.{}", i >> 16 & 0xff, i >> 8 & 0xff, i & 0xff)
+                .parse()
+                .unwrap();
+            assert!(gate.try_admit(ip, 2));
+            gate.release(ip);
+        }
+        assert!(gate.per_ip.is_empty(), "transient ips must not accumulate: {}", gate.per_ip.len());
+
+        // 活跃连接的条目仍然保留(不能为了清理误删在计数中的 IP)。
+        assert!(gate.try_admit(ip_of("9.9.9.9"), 2));
+        assert!(gate.try_admit(ip_of("9.9.9.9"), 2));
+        assert_eq!(gate.per_ip.len(), 1);
+        assert!(!gate.try_admit(ip_of("9.9.9.9"), 2), "at-cap ip must be rejected");
+        gate.release(ip_of("9.9.9.9"));
+        assert_eq!(gate.per_ip.len(), 1, "still-one-active entry must remain");
+    }
+
+    fn ip_of(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
     /// 回归(F7):桶表 key 含攻击者可控字符串,必须有上界。
     #[test]
     fn key_table_is_bounded() {
@@ -414,7 +442,7 @@ mod tests {
         for i in 0..2000 {
             book.check(&rules, ip, &format!("/p{i}"), &[]);
         }
-        assert!(book.keys.len() > 0);
+        assert!(!book.keys.is_empty());
         // 把所有桶的 updated 改到远期之前,下一次检查的清扫应清空它们。
         for st in book.keys.values_mut() {
             st.updated = Instant::now() - IDLE_TTL - Duration::from_secs(1);
@@ -423,5 +451,123 @@ mod tests {
         book.check(&rules, ip, "/after", &[]);
         // 只剩 /after 这一个新桶。
         assert!(book.keys.len() <= 2, "idle entries not swept: {}", book.keys.len());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L7 加固限速器(hardening):TLS ClientHello 每 IP 新建连接速率。
+// 令牌桶与 RateBook 同一数学形状,但 key 只有 IP、判定只有 Reject,
+// 且在 TLS 窥探之前执行 —— 独立实现,不与站点限速规则共享状态。
+
+/// `N/(second|minute|hour)` + burst 的每 IP 令牌桶。表有上界(触顶按空闲清扫 +
+/// LRU 淘汰),否则握手洪水的伪造源 IP 本身就成了内存耗尽攻击面。
+#[derive(Debug)]
+pub(crate) struct IpRateGate {
+    rate_per_window: u32,
+    window: Duration,
+    burst: u32,
+    keys: HashMap<IpAddr, (f64, Instant)>, // (tokens, updated)
+    checks: u64,
+}
+
+impl IpRateGate {
+    pub(crate) fn new(rate_per_window: u32, window: Duration, burst: u32) -> Self {
+        Self {
+            rate_per_window: rate_per_window.max(1),
+            window: window.max(Duration::from_millis(1)),
+            burst,
+            keys: HashMap::new(),
+            checks: 0,
+        }
+    }
+
+    /// 取一枚令牌;超限返回 false(调用方直接断开连接)。
+    pub(crate) fn allow(&mut self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        self.sweep(now);
+        let capacity = (self.rate_per_window + self.burst) as f64;
+        let per_sec = self.rate_per_window as f64 / self.window.as_secs_f64();
+        let entry = self.keys.entry(ip).or_insert((capacity, now));
+        let elapsed = now.saturating_duration_since(entry.1).as_secs_f64();
+        entry.0 = (entry.0 + elapsed * per_sec).min(capacity);
+        entry.1 = now;
+        if entry.0 >= 1.0 {
+            entry.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sweep(&mut self, now: Instant) {
+        self.checks += 1;
+        if self.keys.len() <= MAX_KEYS && !self.checks.is_multiple_of(SWEEP_EVERY) {
+            return;
+        }
+        self.keys.retain(|_, (_, t)| {
+            now.saturating_duration_since(*t) < IDLE_TTL
+        });
+        if self.keys.len() > LOW_WATER {
+            let mut by_age: Vec<(IpAddr, Instant)> =
+                self.keys.iter().map(|(k, (_, t))| (*k, *t)).collect();
+            by_age.sort_by_key(|(_, t)| *t);
+            for (k, _) in by_age.into_iter().take(self.keys.len() - LOW_WATER) {
+                self.keys.remove(&k);
+            }
+        }
+    }
+}
+
+/// 每 IP 并发连接计数(slow-loris `max-conns-per-ip`)。连接作用域由
+/// `ConnGuard` RAII 递减;表满时拒绝新连接(计数表自身即限流点)。
+#[derive(Debug, Default)]
+pub(crate) struct ConnGate {
+    per_ip: HashMap<IpAddr, u32>,
+}
+
+impl ConnGate {
+    /// 名额 +1;超上限返回 false。
+    pub(crate) fn try_admit(&mut self, ip: IpAddr, max: u32) -> bool {
+        let e = self.per_ip.entry(ip).or_insert(0);
+        if *e >= max {
+            if self.per_ip.len() > MAX_KEYS {
+                self.per_ip.retain(|_, n| *n > 0);
+            }
+            return false;
+        }
+        *e += 1;
+        true
+    }
+
+    fn release(&mut self, ip: IpAddr) {
+        let drained = match self.per_ip.get_mut(&ip) {
+            Some(n) => {
+                *n = n.saturating_sub(1);
+                *n == 0
+            }
+            None => false,
+        };
+        // Historical peers must not occupy the map after their last connection closes.
+        if drained {
+            self.per_ip.remove(&ip);
+        }
+    }
+}
+
+/// 连接级守卫:drop 即归还并发名额。接受/连接失败路径靠 RAII 保证计数对称。
+pub(crate) struct ConnGuard {
+    gate: Arc<std::sync::Mutex<ConnGate>>,
+    ip: IpAddr,
+}
+
+impl ConnGuard {
+    pub(crate) fn new(gate: Arc<std::sync::Mutex<ConnGate>>, ip: IpAddr) -> Self {
+        Self { gate, ip }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.gate.lock().unwrap().release(self.ip);
     }
 }

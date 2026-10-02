@@ -7,6 +7,7 @@ pub mod acme;
 pub mod bans;
 pub mod forward;
 pub mod geoip;
+pub mod hardening;
 pub mod httpguard;
 pub mod hubclient;
 pub mod management;
@@ -317,7 +318,7 @@ pub async fn run(config_path: &Path) -> ExitCode {
         res = &mut serve => {
             // 正常退出保留 nftables 表,重启窗口期不失保护;
             // 删表仅发生在 `rooster agent uninstall`。
-            if let Err(e) = res.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::Other, "serve task panicked"))) {
+            if let Err(e) = res.unwrap_or_else(|_| Err(std::io::Error::other("serve task panicked"))) {
                 tracing::error!("management API failed: {e}");
                 return ExitCode::FAILURE;
             }
@@ -325,6 +326,9 @@ pub async fn run(config_path: &Path) -> ExitCode {
     }
     serve.abort();
     if let Some(task) = state.sshguard_task.lock().unwrap().take() {
+        task.abort();
+    }
+    if let Some(task) = state.hardening_task.lock().unwrap().take() {
         task.abort();
     }
     state.forwards.shutdown().await;

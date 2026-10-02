@@ -36,6 +36,7 @@ pub(crate) struct ClientHelloInfo {
     /// best-effort JA4 指纹(见模块注释)。
     pub ja4: Option<String>,
     pub alpn: Vec<String>,
+    pub wire_len: usize,
 }
 
 /// 单个 TLS 记录的上限(RFC 5246:2^14 + 头)。
@@ -73,7 +74,7 @@ pub(crate) fn try_parse(buf: &[u8]) -> HelloParse {
         // 消息可能分片在多条记录里:凑齐一条完整 handshake 消息才停止
         // 拼接(4 字节头 + be24 长度);只看消息头就停会把分片 Hello
         // 误判为 NeedMore。
-        if saw_any && hs.len() >= 4 && hs.len() >= 4 + be24(&hs[1..4]) as usize {
+        if saw_any && hs.len() >= 4 && hs.len() >= 4 + be24(&hs[1..4]) {
             break;
         }
         if buf.len() == pos {
@@ -91,7 +92,7 @@ pub(crate) fn try_parse(buf: &[u8]) -> HelloParse {
     if hs.len() < 4 + mlen {
         return HelloParse::NeedMore;
     }
-    HelloParse::Done(parse_hello_body(&hs[4..4 + mlen]))
+    HelloParse::Done(parse_hello_body(&hs[4..4 + mlen], pos))
 }
 
 fn be24(b: &[u8]) -> usize {
@@ -108,18 +109,18 @@ fn take<'a>(cur: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
 }
 
 /// 解析 ClientHello body(不含 4 字节握手头)。
-fn parse_hello_body(mut cur: &[u8]) -> Option<ClientHelloInfo> {
+fn parse_hello_body(mut cur: &[u8], wire_len: usize) -> Option<ClientHelloInfo> {
     let client_version = u16::from_be_bytes(take(&mut cur, 2)?.try_into().ok()?);
     let _random = take(&mut cur, 32)?;
     let sid_len = *take(&mut cur, 1)?.first()?;
     let _sid = take(&mut cur, sid_len as usize)?;
     let ciphers_len = u16::from_be_bytes(take(&mut cur, 2)?.try_into().ok()?) as usize;
-    if ciphers_len % 2 != 0 {
+    if !ciphers_len.is_multiple_of(2) {
         return None;
     }
     let ciphers_raw = take(&mut cur, ciphers_len)?;
     let ciphers: Vec<u16> = ciphers_raw
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|c| u16::from_be_bytes([c[0], c[1]]))
         .collect();
     let comp_len = *take(&mut cur, 1)?.first()? as usize;
@@ -153,10 +154,10 @@ fn parse_hello_body(mut cur: &[u8]) -> Option<ClientHelloInfo> {
                 // supported_versions 客户端形态:u8 字节数 + u16 列表
                 // (与 parse_u16_list 的 u16 前缀不同,单独解析)
                 let n = data.first().copied().unwrap_or(0) as usize;
-                if data.len() >= 1 + n && n % 2 == 0 {
+                if data.len() > n && n.is_multiple_of(2) {
                     supported_versions.extend(
                         data[1..1 + n]
-                            .chunks_exact(2)
+                            .as_chunks::<2>().0.iter()
                             .map(|c| u16::from_be_bytes([c[0], c[1]])),
                     );
                 }
@@ -167,7 +168,7 @@ fn parse_hello_body(mut cur: &[u8]) -> Option<ClientHelloInfo> {
     }
 
     let ja4 = compute_ja4(client_version, &supported_versions, &ciphers, &exts, &sigalgs, &alpn, sni.is_some());
-    Some(ClientHelloInfo { sni, ja4, alpn })
+    Some(ClientHelloInfo { sni, ja4, alpn, wire_len })
 }
 
 fn parse_sni(data: &[u8]) -> Option<String> {
@@ -216,12 +217,12 @@ fn parse_u16_list(data: &[u8], out: &mut Vec<u16>, _unit: usize) {
         return;
     }
     let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-    if data.len() < 2 + list_len || list_len % 2 != 0 {
+    if data.len() < 2 + list_len || !list_len.is_multiple_of(2) {
         return;
     }
     out.extend(
         data[2..2 + list_len]
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]])),
     );
 }
@@ -330,9 +331,9 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     }
     msg.extend_from_slice(&bitlen.to_be_bytes());
 
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, chunk) in block.chunks_exact(4).enumerate() {
+        for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
         for i in 16..64 {
@@ -479,6 +480,19 @@ mod tests {
     }
 
     #[test]
+    fn hello_size_excludes_coalesced_application_records() {
+        let mut bytes = build_hello(0x0303, &[0x1301], &[sni_ext("example.test")], false);
+        let hello_len = bytes.len();
+        bytes.extend_from_slice(&[23, 3, 3, 0x10, 0x00]);
+        bytes.extend_from_slice(&[0; 4096]);
+        let HelloParse::Done(Some(info)) = try_parse(&bytes) else {
+            panic!("complete ClientHello must parse with trailing application records");
+        };
+        assert_eq!(info.wire_len, hello_len);
+        assert_eq!(info.sni.as_deref(), Some("example.test"));
+    }
+
+    #[test]
     fn sha256_known_vectors() {
         assert_eq!(
             sha256_hex(b""),
@@ -586,7 +600,7 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         };
         let ja4 = info.ja4.clone().unwrap();
-        assert!(super::super::passthrough::ja4_denied(&[ja4.clone()], &info.ja4));
+        assert!(super::super::passthrough::ja4_denied(std::slice::from_ref(&ja4), &info.ja4));
         assert!(!super::super::passthrough::ja4_denied(&["0000ff00_000000000000_000000000000".to_string()], &info.ja4));
         // 无指纹(解析失败)时不应误伤。
         assert!(!super::super::passthrough::ja4_denied(&[ja4], &None));

@@ -24,6 +24,16 @@ Agent:
   concurrency caps, live stats; DNS forwarding.
 - nftables ban manager over raw netlink, ssh-guard, HTTP brute-force
   lockout, ban degradation is observable via `/v0/management/stats`.
+- Optional L4/L7 hardening (`hardening:` config section, every rule
+  opt-in — nothing is enabled by default): honeypot ports (instant ban on
+  touching high-risk ports), port-scan detection (closed-port hit
+  threshold → ban), global per-IP new-connection rate limit, TCP flag /
+  conntrack-invalid drops, slowloris timeouts + per-IP connection caps,
+  TLS ClientHello rate/size caps, request-body hard cap with per-site
+  override. See `docs/hardening-plan.md` for the design and false-positive
+  guardrails (real listening ports are excluded at config validation).
+  These measures protect the host control plane only — volumetric DDoS
+  still requires upstream scrubbing/CDN.
 - `config.yaml` as single source of truth: layered `local`/`managed`
   merge, comment-preserving edits, atomic writes with history, inotify
   hot reload, confirm/rollback for critical sections; loopback-only

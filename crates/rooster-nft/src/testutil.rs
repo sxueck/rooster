@@ -13,6 +13,7 @@ use crate::consts::*;
 use crate::{NftError, NetlinkSocket};
 use std::collections::VecDeque;
 
+#[derive(Default)]
 pub struct MockSocket {
     /// 每次 GETRULE dump 应答的载荷集(属性区),FIFO;缺省空(链上无规则)。
     pub rule_dumps: VecDeque<Vec<Vec<u8>>>,
@@ -30,18 +31,6 @@ pub struct MockSocket {
     pending: VecDeque<Vec<u8>>,
 }
 
-impl Default for MockSocket {
-    fn default() -> Self {
-        MockSocket {
-            rule_dumps: VecDeque::new(),
-            elem_dumps: VecDeque::new(),
-            error_once: None,
-            error_split: None,
-            sent: Vec::new(),
-            pending: VecDeque::new(),
-        }
-    }
-}
 
 fn append_ack(buf: &mut Vec<u8>, errno: i32) {
     buf.extend_from_slice(&36u32.to_le_bytes()); // nlmsg_len = 16 + 20

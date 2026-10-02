@@ -8,7 +8,6 @@
 //! 统计计数器在站点 id 不变时跨 apply 保留。
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,8 +16,12 @@ use std::time::Duration;
 use ipnet::IpNet;
 use rooster_config::{Site, TlsMode, WafMode};
 
+pub(crate) use super::throttle::{ConnGate, ConnGuard, IpRateGate};
 use super::throttle::{ParsedRate, RateBook};
 use super::HttpGuardSettings;
+
+/// hardening 配置里的 `N/unit` 速率串解析(与站点限速同一格式)。
+pub(crate) use super::throttle::parse_rate as hardening_parse_rate;
 
 // ---------------------------------------------------------------------------
 // 每站点统计(同源:面板可轮询)。
@@ -161,13 +164,16 @@ pub(crate) struct SiteRt {
     pub stats: Arc<SiteStats>,
     /// 限速桶:key 含规则索引,站点配置变化时随 SiteRt 重建。
     pub limiter: Mutex<RateBook>,
+    /// 生效的请求体硬上限(字节);None = 未启用。站点 `max-body-size`
+    /// 覆盖全局 `hardening.body-cap.max-size`(见 build())。
+    pub body_cap: Option<u64>,
 }
 
 impl SiteRt {
     /// Host / SNI 匹配(大小写不敏感)。
     pub(crate) fn matches(&self, name: &str) -> bool {
         let name = name.to_ascii_lowercase();
-        self.names.iter().any(|n| *n == name)
+        self.names.contains(&name)
     }
 
     pub(crate) fn waf_mode(&self) -> WafMode {
@@ -186,6 +192,15 @@ pub(crate) struct Effective {
     pub geo: Option<Arc<maxminddb::Reader<Vec<u8>>>>,
     pub body_limit: usize,
     pub ban_hook: Option<Arc<dyn Fn(&str, Duration) + Send + Sync>>,
+    /// hardening.slow-loris 启用时的请求头读取超时;None = 沿用库默认。
+    pub header_timeout: Option<Duration>,
+    /// hardening.slow-loris 启用时的请求体块间空闲上限;None = 不设超时。
+    pub body_idle: Option<Duration>,
+    /// 每 IP 并发连接上限(slow-loris);None = 不限。
+    pub max_conns_per_ip: Option<u32>,
+    /// ClientHello 最大缓冲字节数(hardening.client-hello);None = 沿用
+    /// `MAX_HELLO_BUF`(只放弃窥探不断连接)。
+    pub hello_max_size: Option<usize>,
 }
 
 impl Effective {
@@ -205,6 +220,23 @@ impl Effective {
 
 /// 构建一代生效配置;非法条目记日志并跳过,整体不失败。
 pub(crate) fn build(cfg: &HttpGuardSettings, stats: &Mutex<HashMap<String, Arc<SiteStats>>>) -> Arc<Effective> {
+    // hardening L7:全部子项 opt-in;未启用时字段为 None → 沿用现行为。
+    let hr = &cfg.hardening;
+    let slow = hr.slow_loris.as_ref().filter(|c| c.enabled);
+    // 启用即应用默认(accessor);未启用才是 None = 沿用现行为。
+    let header_timeout = slow.map(|s| s.header_timeout_or_default());
+    let body_idle = slow.map(|s| s.body_idle_or_default());
+    let max_conns_per_ip = slow.map(|s| s.max_conns_or_default());
+    let hello_max_size = hr
+        .client_hello
+        .as_ref()
+        .filter(|c| c.enabled)
+        .map(|c| c.max_size_or_default());
+    let global_body_cap: Option<u64> = hr
+        .body_cap
+        .as_ref()
+        .filter(|c| c.enabled)
+        .map(|c| c.max_size_or_default());
     let mut sites = Vec::new();
     for site in &cfg.sites {
         let Some(upstream) = Upstream::parse(&site.upstream) else {
@@ -267,6 +299,8 @@ pub(crate) fn build(cfg: &HttpGuardSettings, stats: &Mutex<HashMap<String, Arc<S
             tls_server,
             stats: st,
             limiter: Mutex::new(RateBook::default()),
+            // A site override is not an independent body-cap enable switch.
+            body_cap: global_body_cap.and_then(|g| site.max_body_size.or(Some(g))),
         }));
     }
     if sites.is_empty() {
@@ -298,6 +332,10 @@ pub(crate) fn build(cfg: &HttpGuardSettings, stats: &Mutex<HashMap<String, Arc<S
         geo,
         body_limit,
         ban_hook: cfg.ban_hook.clone(),
+        header_timeout,
+        body_idle,
+        max_conns_per_ip,
+        hello_max_size,
     })
 }
 
@@ -373,6 +411,7 @@ mod tests {
                 proxy_protocol: None,
                 ja4_deny: vec![],
                 redirect_https: None,
+                max_body_size: None,
             },
             names: vec![format!("{id}.test")],
             upstream: Upstream::parse("http://127.0.0.1:1").unwrap(),
@@ -380,6 +419,7 @@ mod tests {
             tls_server: None,
             stats: Arc::new(SiteStats::new()),
             limiter: Mutex::new(RateBook::default()),
+            body_cap: None,
         })
     }
 
@@ -406,6 +446,58 @@ mod tests {
         site.stats.active.store(0, Ordering::Relaxed);
         gc_stats(&stats, &[]);
         assert_eq!(stats.lock().unwrap().len(), 0, "无活跃连接时应回收");
+    }
+
+    /// 回归(F-BodyCap):`sites[].max-body-size` 是 hardening.body-cap 的
+    /// 覆盖项而非独立开关 —— 未启用 body-cap 时它必须完全惰性(None),
+    /// 启用时才作为「站点覆盖 > 全局默认」生效。
+    #[test]
+    fn site_max_body_size_is_inert_without_body_cap() {
+        let site_with_override = |max_body_size: Option<u64>, hardening: rooster_config::schema::HardeningConfig| {
+            HttpGuardSettings {
+                listen_http: None,
+                listen_https: None,
+                sites: vec![rooster_config::Site {
+                    id: "s".to_string(),
+                    server_names: vec!["s.test".to_string()],
+                    tls: Default::default(),
+                    upstream: "http://127.0.0.1:1".to_string(),
+                    waf: None,
+                    rate_limit: vec![],
+                    geo: None,
+                    proxy_protocol: None,
+                    ja4_deny: vec![],
+                    redirect_https: None,
+                    max_body_size,
+                }],
+                trusted_proxies: vec![],
+                geoip_db: None,
+                body_limit: 0,
+                ban_hook: None,
+                hardening,
+            }
+        };
+        // 未启用 body-cap:站点 1 KiB 覆盖也必须惰性。
+        let eff = build(
+            &site_with_override(Some(1024), Default::default()),
+            &Mutex::new(HashMap::new()),
+        );
+        assert_eq!(eff.sites[0].body_cap, None, "site max-body-size must not apply when body-cap disabled");
+
+        // body-cap 显式 enabled:false:同样惰性。
+        let mut h = rooster_config::schema::HardeningConfig::default();
+        h.body_cap = Some(rooster_config::schema::BodyCapConfig { enabled: false, max_size: None });
+        let eff = build(&site_with_override(Some(1024), h), &Mutex::new(HashMap::new()));
+        assert_eq!(eff.sites[0].body_cap, None, "disabled body-cap must stay off despite site override");
+
+        // 启用后:站点覆盖 > 全局。
+        let mut h = rooster_config::schema::HardeningConfig::default();
+        h.body_cap = Some(rooster_config::schema::BodyCapConfig { enabled: true, max_size: Some(4096) });
+        let eff = build(&site_with_override(Some(1024), h.clone()), &Mutex::new(HashMap::new()));
+        assert_eq!(eff.sites[0].body_cap, Some(1024), "site override wins when body-cap enabled");
+        // 启用但无站点覆盖 → 全局值。
+        let eff = build(&site_with_override(None, h), &Mutex::new(HashMap::new()));
+        assert_eq!(eff.sites[0].body_cap, Some(4096), "global max-size applies when no site override");
     }
 
     /// 限速规则在构建时拿到稳定身份:限速桶表按它寻址,而不是按调用方
@@ -441,11 +533,13 @@ mod tests {
                 proxy_protocol: None,
                 ja4_deny: vec![],
                 redirect_https: None,
+                max_body_size: None,
             }],
             trusted_proxies: vec![],
             geoip_db: None,
             body_limit: 0,
             ban_hook: None,
+            hardening: Default::default(),
         };
         let eff = build(&cfg, &Mutex::new(HashMap::new()));
         let rates = &eff.sites[0].rates;

@@ -14,9 +14,9 @@ use crate::NftError;
 pub fn attr(out: &mut Vec<u8>, atype: u16, payload: &[u8]) {
     let len = (4 + payload.len()) as u16;
     out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&(atype & 0xffff).to_le_bytes());
+    out.extend_from_slice(&atype.to_le_bytes());
     out.extend_from_slice(payload);
-    while out.len() % NLMSG_ALIGNTO != 0 {
+    while !out.len().is_multiple_of(NLMSG_ALIGNTO) {
         out.push(0);
     }
 }
@@ -83,7 +83,7 @@ pub fn wrap_batch(ops: &[u8], seq_begin: u32, seq_end: u32) -> Vec<u8> {
         let pos = buf.len();
         buf.extend_from_slice(&20u32.to_le_bytes()); // nlmsg_len = 16 + 4(nfgenmsg)
         buf.extend_from_slice(&mt.to_le_bytes());
-        buf.extend_from_slice(&NLM_F_REQUEST.to_le_bytes());
+        buf.extend_from_slice(&(NLM_F_REQUEST | NLM_F_EXTACK).to_le_bytes());
         buf.extend_from_slice(&seq.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes()); // pid
         buf.push(0); // nfgen_family = AF_UNSPEC
@@ -210,7 +210,7 @@ impl<'a> Iterator for AttrIter<'a> {
 }
 
 /// 在属性区里找指定类型的第一个属性载荷。
-pub fn find_attr<'a>(buf: &'a [u8], atype: u16) -> Option<&'a [u8]> {
+pub fn find_attr(buf: &[u8], atype: u16) -> Option<&[u8]> {
     AttrIter::new(buf).find(|(t, _)| *t == atype).map(|(_, p)| p)
 }
 

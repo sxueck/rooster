@@ -52,6 +52,10 @@ pub struct AgentState {
     pub sshguard_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 当前运行中的 ssh-guard 配置(序列化快照,变更比对用)。
     pub sshguard_cfg: Mutex<Option<serde_json::Value>>,
+    /// L4 加固提升器任务(蜜罐/扫描/限速命中 → 封禁);配置变化时重启。
+    pub hardening_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 加固下发快照:hardening 段 + 影响 openports 的字段(变更比对用)。
+    pub hardening_cfg: Mutex<Option<serde_json::Value>>,
     /// 事件通道(ssh-guard 等子任务 → 事件环)。
     pub events_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Event>>>,
     /// 运行时重配置通知:commit_raw 与热重载 Applied 后触发,run() 中的
@@ -113,6 +117,8 @@ impl AgentState {
             forwards: Arc::new(crate::forward::ForwardRuntime::new()),
             sshguard_task: Mutex::new(None),
             sshguard_cfg: Mutex::new(None),
+            hardening_task: Mutex::new(None),
+            hardening_cfg: Mutex::new(None),
             events_tx: Mutex::new(None),
             runtime_notify: tokio::sync::Notify::new(),
             wasmrt: Arc::new(crate::wasmrt::WasmRuntime::new()),
@@ -243,6 +249,8 @@ impl AgentState {
                 "security": &e.security,
                 // ssh-guard 限速/端口直接决定 nftables meter 规则
                 "ssh_guard": &e.plugins.ssh_guard,
+                // 加固规则同样直接写 nftables(蜜罐封禁误配会断真实服务)
+                "hardening": &e.hardening,
             })
         };
         part(old) != part(new)

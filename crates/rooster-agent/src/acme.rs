@@ -173,7 +173,7 @@ impl Acme {
             .map_err(|e| format!("csr: {e}"))?;
 
         order
-            .finalize(&csr.der())
+            .finalize(csr.der())
             .await
             .map_err(|e| format!("finalize: {e}"))?;
         let mut delay = Duration::from_millis(500);
@@ -347,6 +347,7 @@ mod tests {
             proxy_protocol: None,
             ja4_deny: vec![],
             redirect_https: None,
+            max_body_size: None,
         };
 
         // 没有缓存 → None(拒绝握手)。

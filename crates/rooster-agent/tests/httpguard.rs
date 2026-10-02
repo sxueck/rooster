@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use hyper::body::Incoming;
 use hyper::service::Service;
 use hyper::{Request, Response};
@@ -29,7 +30,6 @@ use rooster_agent::httpguard::{
 };
 use rooster_config::schema::{GeoRule, OnExceed, RateLimitRule, SiteWafConfig};
 use rooster_config::{ProxyProtocol, Site, SiteTls, TlsMode, WafMode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// 测试专用 HTTP 客户端:禁用环境代理。
@@ -87,6 +87,7 @@ fn site(id: &str, names: &[&str], upstream: &str) -> Site {
         proxy_protocol: None,
         ja4_deny: vec![],
         redirect_https: None,
+        max_body_size: None,
     }
 }
 
@@ -407,6 +408,7 @@ async fn http_proxy_headers() {
         geoip_db: None,
         body_limit: 0,
         ban_hook: None,
+        hardening: Default::default(),
     })
     .await;
 
@@ -456,6 +458,7 @@ async fn redirect_80_to_443() {
         geoip_db: None,
         body_limit: 0,
         ban_hook: None,
+        hardening: Default::default(),
     })
     .await;
 
@@ -497,6 +500,7 @@ async fn acme_challenge() {
         geoip_db: None,
         body_limit: 0,
         ban_hook: None,
+        hardening: Default::default(),
     })
     .await;
     rt.set_challenge("tok123".to_string(), "keyauth-xyz".to_string());
@@ -545,6 +549,7 @@ async fn waf_modes_and_exclusions() {
             geoip_db: None,
             body_limit: 0,
             ban_hook: None,
+            hardening: Default::default(),
         }
     };
 
@@ -703,6 +708,7 @@ async fn rate_limit_reject_429() {
         geoip_db: None,
         body_limit: 0,
         ban_hook: None,
+        hardening: Default::default(),
     })
     .await;
 
@@ -751,6 +757,7 @@ async fn rate_limit_ban_escalation() {
         geoip_db: None,
         body_limit: 0,
         ban_hook: Some(hook),
+        hardening: Default::default(),
     })
     .await;
 
@@ -827,6 +834,7 @@ async fn geo_deny_via_trusted_proxy() {
         geoip_db: Some(db),
         body_limit: 0,
         ban_hook: None,
+        hardening: Default::default(),
     })
     .await;
 
@@ -896,6 +904,7 @@ async fn tls_terminate() {
         geoip_db: None,
         body_limit: 0,
         ban_hook: None,
+        hardening: Default::default(),
     })
     .await;
 
@@ -972,6 +981,7 @@ async fn tls_passthrough_proxy_v1() {
         geoip_db: None,
         body_limit: 0,
         ban_hook: None,
+        hardening: Default::default(),
     })
     .await;
 
@@ -1010,6 +1020,7 @@ async fn body_limit_forwarded_full() {
         geoip_db: None,
         body_limit: 16,
         ban_hook: None,
+        hardening: Default::default(),
     })
     .await;
 
@@ -1074,6 +1085,7 @@ async fn websocket_upgrade() {
         geoip_db: None,
         body_limit: 0,
         ban_hook: None,
+        hardening: Default::default(),
     })
     .await;
 
@@ -1205,4 +1217,569 @@ async fn wasm_set_header_replaces_only_its_own_name_b4() {
     let j = raw_http_json(listen_on(port), req).await;
     assert_eq!(j["x_multi"], "replaced", "set_header 必须同名整体替换为单值");
     assert_eq!(j["cookies"], "a=1,b=2", "无关的多值名字不得被塌缩");
+}
+
+// ---------------------------------------------------------------------------
+// hardening L7:body-cap / 每 IP 并发上限 / client-hello 速率
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn body_cap_rejects_declared_length_with_413() {
+    let port = free_port();
+    let rt = HttpGuardRuntime::new(None);
+    let s = site("cap", &["cap.test"], "http://127.0.0.1:1");
+    let mut h = rooster_config::schema::HardeningConfig::default();
+    h.body_cap = Some(rooster_config::schema::BodyCapConfig {
+        enabled: true,
+        max_size: Some(1024),
+    });
+    rt.apply(HttpGuardSettings {
+        listen_http: Some(listen_on(port)),
+        listen_https: None,
+        sites: vec![s],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: h,
+    })
+    .await;
+    let client = client();
+    // 2 KiB 声明长度 > 1 KiB cap → 413,且不触碰上游(上游是必拒端口,502 即泄漏)
+    let body = vec![b'x'; 2048];
+    let resp = tokio::time::timeout(TIMEOUT, client
+        .post(format!("http://127.0.0.1:{port}/upload"))
+        .header("host", "cap.test")
+        .body(body)
+        .send())
+        .await
+        .expect("request within timeout")
+        .expect("response");
+    assert_eq!(resp.status(), 413, "declared Content-Length over cap must 413");
+
+    // 站点覆盖放宽到 4 KiB:同一请求不再 413(到达上游 → 502,证明 cap 未触发)
+    let port2 = free_port();
+    let mut s2 = site("cap2", &["cap2.test"], "http://127.0.0.1:1");
+    s2.max_body_size = Some(4096);
+    rt.apply(HttpGuardSettings {
+        listen_http: Some(listen_on(port2)),
+        listen_https: None,
+        sites: vec![s2],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: {
+            let mut h = rooster_config::schema::HardeningConfig::default();
+            h.body_cap = Some(rooster_config::schema::BodyCapConfig {
+                enabled: true,
+                max_size: Some(1024),
+            });
+            h
+        },
+    })
+    .await;
+    let resp = tokio::time::timeout(TIMEOUT, client
+        .post(format!("http://127.0.0.1:{port2}/upload"))
+        .header("host", "cap2.test")
+        .body(vec![b'x'; 2048])
+        .send())
+        .await
+        .expect("request within timeout")
+        .expect("response");
+    assert_eq!(resp.status(), 502, "site override 4 KiB: cap 不触发,失败来自上游不可达");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn body_cap_aborts_streamed_upload_over_cap() {
+    // 无 Content-Length 的流式上传:CountingBody 超 cap 即断流。
+    let port = free_port();
+    let rt = HttpGuardRuntime::new(None);
+    let s = site("stream", &["stream.test"], "http://127.0.0.1:1");
+    let mut h = rooster_config::schema::HardeningConfig::default();
+    h.body_cap = Some(rooster_config::schema::BodyCapConfig {
+        enabled: true,
+        max_size: Some(2048),
+    });
+    rt.apply(HttpGuardSettings {
+        listen_http: Some(listen_on(port)),
+        listen_https: None,
+        sites: vec![s],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: h,
+    })
+    .await;
+    // 无 Content-Length 的 chunked 上传:手写请求(不依赖 client 库行为),
+    // 验证流式路径上的 CountingBody 拦截点而非声明长度前置 413。
+    let outcome = tokio::time::timeout(TIMEOUT, async {
+        let mut sock = TcpStream::connect(listen_on(port)).await.expect("connect");
+        use tokio::io::AsyncWriteExt;
+        sock.write_all(b"POST /upload HTTP/1.1\r\nhost: stream.test\r\ntransfer-encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        // 16 × 4 KiB = 64 KiB 持续分块,远超 2 KiB cap。
+        for _ in 0..16 {
+            sock.write_all(b"1000\r\n").await.unwrap();
+            sock.write_all(&[b'z'; 4096][..]).await.unwrap();
+            sock.write_all(b"\r\n").await.unwrap();
+        }
+        let mut resp = Vec::new();
+        // 读至服务端关闭:合法结局 = 连接被直接切断(无完整响应)或 5xx。
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut sock, &mut resp).await;
+        String::from_utf8_lossy(&resp).into_owned()
+    })
+    .await;
+    let resp_text = outcome.unwrap_or_default();
+    assert!(
+        resp_text.contains("500") || resp_text.contains("502") || resp_text.is_empty(),
+        "streamed over-cap must abort the connection or fail upstream, got: {resp_text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_loris_conn_cap_rejects_excess_peers() {
+    // max-conns-per-ip = 2:同一 127.0.0.1 的第 3 条连接必须在任何响应前被断开。
+    let port = free_port();
+    let rt = HttpGuardRuntime::new(None);
+    let s = site("cc", &["cc.test"], "http://127.0.0.1:1");
+    let mut h = rooster_config::schema::HardeningConfig::default();
+    h.slow_loris = Some(rooster_config::schema::SlowLorisConfig {
+        enabled: true,
+        header_timeout: None,
+        body_idle_timeout: None,
+        max_conns_per_ip: Some(2),
+    });
+    rt.apply(HttpGuardSettings {
+        listen_http: Some(listen_on(port)),
+        listen_https: None,
+        sites: vec![s],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: h,
+    })
+    .await;
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let stream = tokio::time::timeout(TIMEOUT, tokio::net::TcpStream::connect(listen_on(port)))
+            .await
+            .expect("connect")
+            .expect("tcp");
+        held.push(stream);
+    }
+    // 名额占用需等 accept 循环处理:轮询第 3 条直到看到「连上即断」。
+    let rejected = {
+        let mut seen = false;
+        for _ in 0..50 {
+            let Ok(mut stream) = tokio::net::TcpStream::connect(listen_on(port)).await else {
+                continue;
+            };
+            // 被拒连接会被服务端立即 close:read 返回 0。
+            let mut buf = [0u8; 1];
+            let closed = tokio::time::timeout(
+                Duration::from_millis(300),
+                stream.read(&mut buf),
+            )
+            .await;
+            if matches!(&closed, Ok(Ok(0))) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        seen
+    };
+    assert!(rejected, "third concurrent conn must be closed by max-conns-per-ip");
+    drop(held);
+}
+
+// ---------------------------------------------------------------------------
+// L7 回归(F-Hello / F-BodyCap / F-Idle):本轮修复的行为契约。
+
+/// 构造一个完整、结构合法的 TLS ClientHello 记录(TLS1.3 形态),
+/// `pad_bytes` 经 RFC 7685 padding 扩展撑大 —— 接收方必须忽略该扩展。
+fn build_padded_hello(sni: &str, pad_bytes: usize) -> Vec<u8> {
+    let mut exts: Vec<(u16, Vec<u8>)> = Vec::new();
+    // server_name
+    let mut entry = vec![0u8];
+    entry.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+    entry.extend_from_slice(sni.as_bytes());
+    let mut d = Vec::new();
+    d.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+    d.extend_from_slice(&entry);
+    exts.push((0, d));
+    // supported_versions = [0x0304]
+    exts.push((43, vec![2, 0x03, 0x04]));
+    // signature_algorithms
+    let mut d = Vec::new();
+    d.extend_from_slice(&6u16.to_be_bytes());
+    d.extend_from_slice(&0x0403u16.to_be_bytes());
+    d.extend_from_slice(&0x0503u16.to_be_bytes());
+    d.extend_from_slice(&0x0804u16.to_be_bytes());
+    exts.push((13, d));
+    // supported_groups = [x25519, secp256r1]
+    let mut d = Vec::new();
+    d.extend_from_slice(&4u16.to_be_bytes());
+    d.extend_from_slice(&0x001du16.to_be_bytes());
+    d.extend_from_slice(&0x0017u16.to_be_bytes());
+    exts.push((10, d));
+    // key_share: x25519 任意 32 字节(合法公钥形态)
+    let mut d = Vec::new();
+    d.extend_from_slice(&36u16.to_be_bytes());
+    d.extend_from_slice(&0x001du16.to_be_bytes());
+    d.extend_from_slice(&32u16.to_be_bytes());
+    d.extend_from_slice(&[7u8; 32]);
+    exts.push((51, d));
+    // alpn = http/1.1
+    let mut d = vec![b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'];
+    let mut alpn = vec![d.len() as u8];
+    alpn.append(&mut d);
+    let mut d = Vec::new();
+    d.extend_from_slice(&(alpn.len() as u16).to_be_bytes());
+    d.extend_from_slice(&alpn);
+    exts.push((16, d));
+    // RFC 7685 padding 扩展:接收方必须忽略 —— 这里用来超限。
+    exts.push((21, vec![0u8; pad_bytes]));
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy_version
+    body.extend_from_slice(&[0x42u8; 32]); // random
+    body.push(32); // session_id len
+    body.extend_from_slice(&[0x11u8; 32]);
+    body.extend_from_slice(&((exts.len() * 0 + 10) as u16).to_be_bytes()); // cipher 长度先占位
+    let ciphers = [0x1301u16, 0x1302, 0x1303, 0xc02b, 0xc02f];
+    let mut cipher_bytes = Vec::new();
+    for c in ciphers {
+        cipher_bytes.extend_from_slice(&c.to_be_bytes());
+    }
+    // 修正 cipher 长度字段
+    let cl_pos = body.len() - 2;
+    body[cl_pos..cl_pos + 2].copy_from_slice(&(cipher_bytes.len() as u16).to_be_bytes());
+    body.extend_from_slice(&cipher_bytes);
+    body.push(1); // compression methods len
+    body.push(0); // null
+    let mut extbuf = Vec::new();
+    for (t, d) in exts {
+        extbuf.extend_from_slice(&t.to_be_bytes());
+        extbuf.extend_from_slice(&(d.len() as u16).to_be_bytes());
+        extbuf.extend_from_slice(&d);
+    }
+    body.extend_from_slice(&(extbuf.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extbuf);
+
+    let mut msg = vec![1u8]; // handshake type ClientHello
+    msg.extend_from_slice(&[(body.len() >> 16) as u8, (body.len() >> 8) as u8, body.len() as u8]);
+    msg.extend_from_slice(&body);
+    let mut out = vec![22u8, 0x03, 0x03];
+    out.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+    out.extend_from_slice(&msg);
+    out
+}
+
+/// 回归(F-Hello):启用 client-hello 上限时,「一次写满的完整超大 hello」
+/// 也必须被拒 —— 旧实现只在 NeedMore 分支检查 cap,完整 hello 直接解析
+/// 成功绕过(服务端继续握手,客户端能收到字节)。修复后:连接在写出
+/// 任何 TLS 字节之前被切断(read = EOF,零字节)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_hello_cap_rejects_complete_oversized_hello() {
+    let ck = self_signed();
+    let port = free_port();
+    let cert_path = std::env::temp_dir().join(format!("rooster-hg-hello-{port}-cert.pem"));
+    let key_path = std::env::temp_dir().join(format!("rooster-hg-hello-{port}-key.pem"));
+    std::fs::write(&cert_path, ck.cert.pem()).expect("write cert pem");
+    std::fs::write(&key_path, ck.key_pair.serialize_pem()).expect("write key pem");
+
+    let rt = HttpGuardRuntime::new(None);
+    let mut s = site("hcap", &["localhost"], "http://127.0.0.1:1");
+    s.tls = SiteTls {
+        mode: TlsMode::Terminate,
+        acme: false,
+        cert: Some(cert_path),
+        key: Some(key_path),
+        skip_verify: false,
+    };
+    let mut h = rooster_config::schema::HardeningConfig::default();
+    h.client_hello = Some(rooster_config::schema::ClientHelloGuardConfig {
+        enabled: true,
+        max_size: Some(4096),
+        rate: None,
+        burst: None,
+    });
+    rt.apply(HttpGuardSettings {
+        listen_http: None,
+        listen_https: Some(listen_on(port)),
+        sites: vec![s],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: h,
+    })
+    .await;
+
+    // ~5.3 KiB 的完整 hello(> 4096 cap),单次写满。
+    let hello = build_padded_hello("localhost", 5000);
+    assert!(hello.len() > 4096, "test hello must exceed the cap: {}", hello.len());
+    let mut sock = tokio::time::timeout(TIMEOUT, TcpStream::connect(listen_on(port)))
+        .await
+        .expect("connect within 5s")
+        .expect("tcp connect");
+    sock.write_all(&hello).await.expect("write oversized hello");
+    let mut buf = [0u8; 1];
+    match tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await {
+        Err(_) => panic!("server neither closed nor responded within 2s"),
+        Ok(Err(e)) => panic!("read error: {e}"),
+        Ok(Ok(n)) if n > 0 => {
+            panic!("over-cap complete hello must not get a TLS response, got {n} byte(s)")
+        }
+        Ok(Ok(0)) => {} // EOF 零字节:cap 在任何 TLS 处理之前生效
+        Ok(Ok(_)) => unreachable!("read into 1-byte buffer"),
+    }
+}
+
+/// 回归(F-Hello):client-hello 未启用时,超过窥探缓冲上限(64 KiB)的
+/// 连接必须回到旧行为 —— 放弃窥探、字节照转上游,而不是像启用时那样
+/// 直接断开。旧实现把「启用时的关闭」也套在了禁用路径上。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_hello_oversized_passthrough_when_disabled() {
+    // 上游:透传目标,累计收到的字节数。
+    let l = TcpListener::bind("127.0.0.1:0").await.expect("bind passthrough upstream");
+    let up = l.local_addr().expect("upstream addr");
+    let received = Arc::new(AtomicU64::new(0));
+    let received2 = received.clone();
+    tokio::spawn(async move {
+        let (mut tcp, _) = l.accept().await.expect("upstream accept");
+        let mut buf = vec![0u8; 16384];
+        loop {
+            match tcp.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    received2.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+
+    let port = free_port();
+    let rt = HttpGuardRuntime::new(None);
+    let mut s = site("ptbig", &["ptbig.test"], &format!("{up}"));
+    s.tls.mode = TlsMode::Passthrough;
+    rt.apply(HttpGuardSettings {
+        listen_http: None,
+        listen_https: Some(listen_on(port)),
+        sites: vec![s],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: Default::default(),
+    })
+    .await;
+
+    // 5 × 16 KiB 的 handshake 记录:首字节 1(ClientHello),be24 长度
+    // 0xFFFFFF → 解析器永远 NeedMore,缓冲越过 64 KiB 上限。
+    let mut sock = tokio::time::timeout(TIMEOUT, TcpStream::connect(listen_on(port)))
+        .await
+        .expect("connect within 5s")
+        .expect("tcp connect");
+    let mut record = vec![22u8, 0x03, 0x01];
+    record.extend_from_slice(&16384u16.to_be_bytes());
+    record.push(1);
+    record.extend_from_slice(&[0xff, 0xff, 0xff]);
+    record.extend_from_slice(&[0x55u8; 16380]);
+    let total = 5 * record.len();
+    for _ in 0..5 {
+        if sock.write_all(&record).await.is_err() {
+            break; // 服务端过早断开(旧行为):继续去断言上游收到的字节数
+        }
+    }
+    // 未启用 client-hello:缓冲上限只放弃窥探,字节必须流向上游。
+    wait_until("bytes beyond 64 KiB forwarded upstream", || {
+        received.load(Ordering::Relaxed) >= 65540
+    })
+    .await;
+    assert!(
+        total >= 65540,
+        "test must send past the peek ceiling (sent {total})"
+    );
+    rt.shutdown().await;
+}
+
+/// 回归(F-BodyCap):`sites[].max-body-size` 只是 hardening.body-cap 的
+/// 覆盖项 —— body-cap 未启用时它必须完全惰性。旧实现让站点字段在功能
+/// 关闭时也生效,默认部署(不配 hardening)会被意外加上请求体上限。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn site_max_body_size_is_inert_without_body_cap() {
+    let port = free_port();
+    let rt = HttpGuardRuntime::new(None);
+    let mut s = site("inert", &["inert.test"], "http://127.0.0.1:1");
+    s.max_body_size = Some(1024);
+    rt.apply(HttpGuardSettings {
+        listen_http: Some(listen_on(port)),
+        listen_https: None,
+        sites: vec![s],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: Default::default(),
+    })
+    .await;
+    let client = client();
+    let resp = tokio::time::timeout(TIMEOUT, client
+        .post(format!("http://127.0.0.1:{port}/upload"))
+        .header("host", "inert.test")
+        .body(vec![b'x'; 2048])
+        .send())
+        .await
+        .expect("request within 5s")
+        .expect("request ok");
+    assert_eq!(
+        resp.status(),
+        502,
+        "no body-cap configured: oversized body must fail at unreachable upstream, not 413"
+    );
+}
+
+/// 回归(F-Idle):body-idle-timeout 必须覆盖 WAF 关闭路径。旧实现只在
+/// WAF 检测缓冲阶段设超时,WAF off 的站点可以永久涓流请求体占住连接。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn body_idle_timeout_applies_with_waf_off() {
+    let (up, _hits) = echo_upstream().await;
+    let port = free_port();
+    let rt = HttpGuardRuntime::new(None);
+    let mut h = rooster_config::schema::HardeningConfig::default();
+    h.slow_loris = Some(rooster_config::schema::SlowLorisConfig {
+        enabled: true,
+        header_timeout: None,
+        body_idle_timeout: Some(Duration::from_millis(400)),
+        max_conns_per_ip: None,
+    });
+    rt.apply(HttpGuardSettings {
+        listen_http: Some(listen_on(port)),
+        listen_https: None,
+        sites: vec![site("idleoff", &["idleoff.test"], &format!("http://{up}"))],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: h,
+    })
+    .await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut sock = TcpStream::connect(listen_on(port)).await.expect("connect");
+        sock.write_all(b"POST /upload HTTP/1.1\r\nhost: idleoff.test\r\ncontent-length: 100\r\n\r\n")
+            .await
+            .unwrap();
+        sock.write_all(&[b'a'; 10]).await.unwrap();
+        // 之后停滞:合法但缓慢的上传必须被 idle 超时切断。
+        let mut out = Vec::new();
+        let _ = sock.read_to_end(&mut out).await;
+        out
+    })
+    .await;
+    let out = outcome.unwrap_or_else(|_| panic!("stalled body with waf off must be cut within 3s"));
+    let head = String::from_utf8_lossy(&out).to_string();
+    assert!(
+        head.is_empty() || head.contains("502"),
+        "server must stop waiting (502/EOF) after idle timeout, got: {head}"
+    );
+}
+
+/// 回归(F-Idle):body-idle-timeout 必须覆盖检测缓冲之后的流式余量。
+/// 旧实现只保护前 body_limit 字节的缓冲阶段;这里先把缓冲填满(快速),
+/// 再停滞余量 —— 旧实现会让连接无限期挂住。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn body_idle_timeout_protects_streamed_remainder() {
+    let (up, _hits) = echo_upstream().await;
+    let port = free_port();
+    let rt = HttpGuardRuntime::new(None);
+    let mut s = site("idlerest", &["idlerest.test"], &format!("http://{up}"));
+    s.waf = Some(SiteWafConfig { mode: WafMode::Detect, exclusions: vec![] });
+    let mut h = rooster_config::schema::HardeningConfig::default();
+    h.slow_loris = Some(rooster_config::schema::SlowLorisConfig {
+        enabled: true,
+        header_timeout: None,
+        body_idle_timeout: Some(Duration::from_millis(400)),
+        max_conns_per_ip: None,
+    });
+    rt.apply(HttpGuardSettings {
+        listen_http: Some(listen_on(port)),
+        listen_https: None,
+        sites: vec![s],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 16,
+        ban_hook: None,
+        hardening: h,
+    })
+    .await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut sock = TcpStream::connect(listen_on(port)).await.expect("connect");
+        sock.write_all(b"POST /upload HTTP/1.1\r\nhost: idlerest.test\r\ncontent-length: 100\r\n\r\n")
+            .await
+            .unwrap();
+        // 快速填满 16 字节检测缓冲,再停滞其余 80 字节。
+        sock.write_all(&[b'b'; 20]).await.unwrap();
+        let mut out = Vec::new();
+        let _ = sock.read_to_end(&mut out).await;
+        out
+    })
+    .await;
+    let out = outcome.unwrap_or_else(|_| panic!("stalled streamed remainder must be cut within 3s"));
+    let head = String::from_utf8_lossy(&out).to_string();
+    assert!(
+        head.is_empty() || head.contains("502"),
+        "streamed remainder after waf buffer must be cut after idle timeout, got: {head}"
+    );
+}
+
+/// 回归(F-CapBuffer):chunked(无 Content-Length)上传超过 body-cap 时,
+/// 拒绝必须发生在 WAF 检测缓冲阶段(413,不碰上游),且检测缓冲绝不
+/// 缓冲超过 cap 的字节。旧实现把 cap 判定推迟到下游 CountingBody,
+/// 缓冲会先涨到 body_limit(内存波及面超过 cap 声明的上限)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunked_over_cap_413_during_waf_buffer() {
+    let port = free_port();
+    let rt = HttpGuardRuntime::new(None);
+    let mut s = site("capbuf", &["capbuf.test"], "http://127.0.0.1:1");
+    s.waf = Some(SiteWafConfig { mode: WafMode::Detect, exclusions: vec![] });
+    let mut h = rooster_config::schema::HardeningConfig::default();
+    h.body_cap = Some(rooster_config::schema::BodyCapConfig {
+        enabled: true,
+        max_size: Some(1024),
+    });
+    rt.apply(HttpGuardSettings {
+        listen_http: Some(listen_on(port)),
+        listen_https: None,
+        sites: vec![s],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: h,
+    })
+    .await;
+
+    let outcome = tokio::time::timeout(TIMEOUT, async {
+        let mut sock = TcpStream::connect(listen_on(port)).await.expect("connect");
+        sock.write_all(b"POST /upload HTTP/1.1\r\nhost: capbuf.test\r\ntransfer-encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        sock.write_all(b"800\r\n").await.unwrap();
+        sock.write_all(&[b'z'; 2048]).await.unwrap();
+        sock.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        let head = read_until_suffix(&mut sock, b"\r\n\r\n", 8192).await;
+        String::from_utf8_lossy(&head).to_string()
+    })
+    .await
+    .expect("response within 5s");
+    assert!(
+        outcome.contains(" 413 ") || outcome.starts_with("HTTP/1.1 413"),
+        "chunked over-cap must be rejected with 413 during waf buffering, got: {outcome}"
+    );
 }

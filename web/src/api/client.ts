@@ -14,6 +14,8 @@ import {
   type OkResp,
   type NodeConfigResp,
   type SshGuardPluginConfig,
+  type HardeningSectionConfig,
+  type HardeningConfig,
   type ConfigWriteResp,
   type Layers,
   type ForwardRule,
@@ -183,6 +185,16 @@ export function putNodePlugin(
     `/nodes/${encodeURIComponent(id)}/management/plugins/${encodeURIComponent(name)}`,
     { method: 'PUT', body: cfg },
   )
+}
+/** 加固配置(managed.hardening):整段 PUT,所有子项默认关闭 */
+export function getNodeHardening(id: string): Promise<HardeningConfig> {
+  return request<HardeningConfig>(`/nodes/${encodeURIComponent(id)}/management/hardening`)
+}
+export function putNodeHardening(id: string, cfg: HardeningConfig): Promise<ConfigWriteResp> {
+  return request<ConfigWriteResp>(`/nodes/${encodeURIComponent(id)}/management/hardening`, {
+    method: 'PUT',
+    body: cfg,
+  })
 }
 export function getLayers(id: string): Promise<Layers> {
   return request<Layers>(`/nodes/${encodeURIComponent(id)}/management/layers`)
@@ -401,4 +413,4 @@ export function deleteWasmRegistry(name: string): Promise<OkResp> {
 }
 
 // re-exports commonly needed alongside client calls
-export type { NodeInfo, AuditEntry, WasmPlugin, Site, ForwardRule, BanPolicy, SshGuardPluginConfig }
+export type { NodeInfo, AuditEntry, WasmPlugin, Site, ForwardRule, BanPolicy, SshGuardPluginConfig, HardeningSectionConfig, HardeningConfig }

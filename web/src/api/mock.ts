@@ -21,6 +21,7 @@ import {
   type NodeConfigResp,
   type ConfigWriteResp,
   type SshGuardPluginConfig,
+  type HardeningConfig,
   type Layers,
   type ForwardRule,
   type BanEntry,
@@ -97,6 +98,7 @@ interface MockNodeState {
   history: { name: string; raw: string }[]
   wasm: WasmPlugin[]
   sshGuard: SshGuardPluginConfig
+  hardening: HardeningConfig
 }
 
 // ---------------- config yaml ----------------
@@ -513,6 +515,7 @@ function buildNode(d: {
     history,
     wasm: buildWasm(d.subnet),
     sshGuard: { ...SSH_GUARD_DEFAULTS, enabled: d.id === 'edge-bj-01' },
+    hardening: {},
   }
 }
 
@@ -1017,6 +1020,36 @@ route('PUT', /^\/nodes\/([^/]+)\/management\/plugins\/([^/]+)$/, (m, opts) => {
   if (name !== 'ssh-guard') throw new ApiError(404, `未知内置插件 ${name}`)
   st.sshGuard = bodyOf<SshGuardPluginConfig>(opts)
   return { hash: hex(8), confirm: null } satisfies ConfigWriteResp
+})
+// 加固:GET 返回稀疏 effective;PUT 校验蜜罐端口与真实监听(转发 + 22)冲突→422
+route('GET', /^\/nodes\/([^/]+)\/management\/hardening$/, (m) => {
+  const st = requireOnline(decodeURIComponent(m[1]))
+  return JSON.parse(JSON.stringify(st.hardening)) as HardeningConfig
+})
+route('PUT', /^\/nodes\/([^/]+)\/management\/hardening$/, (m, opts) => {
+  const id = decodeURIComponent(m[1])
+  const st = requireOnline(id)
+  const body = bodyOf<HardeningConfig>(opts)
+  const hp = body.honeypot
+  if (hp?.enabled) {
+    const used = new Set<number>([22, ...st.forwards.map((f) => Number(f.listen.split(':').pop()))])
+    const clash = (hp.ports ?? []).filter((p) => used.has(p))
+    if (clash.length > 0) {
+      throw new ApiError(422, 'validation failed', {
+        error: 'validation failed',
+        details: clash.map((p) => `honeypot port ${p} is in real use (forward listen / ssh 22)`),
+      })
+    }
+  }
+  const prev = JSON.parse(JSON.stringify(st.hardening)) as HardeningConfig
+  const changed = JSON.stringify(body) !== JSON.stringify(prev)
+  st.hardening = body
+  const confirm = changed
+    ? armConfirm(id, () => {
+        st.hardening = prev
+      }, 10)
+    : null
+  return { hash: hex(8), confirm } satisfies ConfigWriteResp
 })
 
 // ---- templates & rollouts ----

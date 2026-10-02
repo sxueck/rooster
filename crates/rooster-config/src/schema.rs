@@ -41,6 +41,9 @@ pub struct LocalConfig {
     /// 远程升级执行方式。
     #[serde(default)]
     pub upgrade: UpgradeSection,
+    /// 单节点加固覆盖项;与 managed 层递归合并(local 优先)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardening: Option<HardeningConfig>,
     /// local 层也可以有转发规则;与 managed 层按 `id` 合并。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forwards: Vec<ForwardRule>,
@@ -66,6 +69,9 @@ pub struct ManagedConfig {
     pub allowlist: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wasm_plugins: Vec<WasmPlugin>,
+    /// 由 Hub 模板下发的加固配置;所有子项默认关闭,必须显式启用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardening: Option<HardeningConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +183,236 @@ impl Default for SecuritySection {
 pub struct EventsSection {
     #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
     pub retention: Option<Duration>,
+}
+
+// ---------------------------------------------------------------------------
+// 加固(hardening):L4/L7 强化措施。全部子项 opt-in —— 缺省 = 不启用。
+//
+// 设计约束(docs/hardening-plan.md):蜜罐/扫描检测必须排除真实监听端口,
+// 该检查在 validate_effective 做;L7 各项缺省时沿用现行为(不设显式阈值)。
+
+/// 加固配置:全部子项 opt-in;未知字段直接拒(拼写错误不得静默变成
+/// 「未配置」),缺省值在消费侧 accessor 应用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HardeningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub honeypot: Option<HoneypotConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_guard: Option<PortGuardConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_limit: Option<ConnLimitConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag_guard: Option<FlagGuardConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_loris: Option<SlowLorisConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_hello: Option<ClientHelloGuardConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_cap: Option<BodyCapConfig>,
+}
+
+/// 蜜罐端口:命中即把源 IP 投入封禁队列(经 BanManager 落地)。
+///
+/// 字段全部 None 保持(不在反序列化时填默认):`local.hardening` 是
+/// managed 模板之上的部分覆盖,填了默认值的字段会在 merge 时静默覆盖
+/// 模板;默认一律在消费侧 accessor 里应用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HoneypotConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 高危端口清单;缺省 [`honeypot_ports_of`]。与真实监听端口冲突时
+    /// 配置校验直接报错,不会带病下发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<u16>>,
+    /// 命中暂存集的元素存活时长(判定的聚合窗口)。默认 5m。
+    #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
+    pub hit_window: Option<Duration>,
+    /// 封禁时长。默认 1h。
+    #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
+    pub ban_time: Option<Duration>,
+}
+
+impl HoneypotConfig {
+    pub fn hit_window_or_default(&self) -> Duration {
+        self.hit_window.unwrap_or_else(|| dur(300))
+    }
+
+    pub fn ban_time_or_default(&self) -> Duration {
+        self.ban_time.unwrap_or_else(|| dur(3600))
+    }
+}
+
+/// 通用端口扫描检测(sshguard 的泛化):窗口内对未监听端口的
+/// 新建连接次数超阈值 → 封禁。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PortGuardConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 窗口内允许命中未监听端口的次数上限;超过即封。默认 30。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hits: Option<u32>,
+    /// 统计窗口(find time)。默认 60s。
+    #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
+    pub find_time: Option<Duration>,
+    /// 额外放行端口(主机上非 rooster 管理的真实监听,如打印机/数据库)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_open_ports: Vec<u16>,
+    /// 封禁时长。默认 30m。
+    #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
+    pub ban_time: Option<Duration>,
+}
+
+impl PortGuardConfig {
+    pub fn max_hits_or_default(&self) -> u32 {
+        self.max_hits.unwrap_or(30)
+    }
+
+    pub fn find_time_or_default(&self) -> Duration {
+        self.find_time.unwrap_or_else(|| dur(60))
+    }
+
+    pub fn ban_time_or_default(&self) -> Duration {
+        self.ban_time.unwrap_or_else(|| dur(1800))
+    }
+}
+
+/// 全局 L4 新建连接限速(每源 IP,所有端口);超限者进封禁队列。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ConnLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `N/(second|minute|hour)`,如 `60/second`。默认 `60/second`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<String>,
+    /// 突发宽容(令牌桶 burst)。默认 20。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+    /// 超限后的封禁时长。默认 30m。
+    #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
+    pub ban_time: Option<Duration>,
+}
+
+impl ConnLimitConfig {
+    pub fn rate_or_default(&self) -> &str {
+        self.rate.as_deref().unwrap_or("60/second")
+    }
+
+    pub fn burst_or_default(&self) -> u32 {
+        self.burst.unwrap_or(20)
+    }
+
+    pub fn ban_time_or_default(&self) -> Duration {
+        self.ban_time.unwrap_or_else(|| dur(1800))
+    }
+}
+
+/// ct state invalid 与 TCP flag 异常(NULL / SYN+FIN / XMAS)直接丢弃。
+/// 同样 deny_unknown_fields:`enable` 拼错不得静默变成「未配置」。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FlagGuardConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Slowloris / 慢读防护(终止模式的 HTTP 数据面)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SlowLorisConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 请求头读取超时。默认 15s。
+    #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
+    pub header_timeout: Option<Duration>,
+    /// 请求体两个数据块之间的最大空闲(WAF 检测缓冲阶段)。默认 15s。
+    #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
+    pub body_idle_timeout: Option<Duration>,
+    /// 每 IP 并发连接上限(明文 80 与 TLS 443 合计,按 socket 对端计)。默认 64。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_conns_per_ip: Option<u32>,
+}
+
+impl SlowLorisConfig {
+    pub fn header_timeout_or_default(&self) -> Duration {
+        self.header_timeout.unwrap_or_else(|| dur(15))
+    }
+
+    pub fn body_idle_or_default(&self) -> Duration {
+        self.body_idle_timeout.unwrap_or_else(|| dur(15))
+    }
+
+    pub fn max_conns_or_default(&self) -> u32 {
+        self.max_conns_per_ip.unwrap_or(64).max(1)
+    }
+}
+
+/// TLS ClientHello 窥探阶段的速率与大小上限(握手洪水防护)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ClientHelloGuardConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 单条连接可缓冲的 ClientHello 最大字节数;超过直接断开。默认 16 KiB。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<usize>,
+    /// 每源 IP 的 TLS 新建连接速率。默认 `30/minute`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<String>,
+    /// 突发宽容。默认 10。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+}
+
+impl ClientHelloGuardConfig {
+    pub fn max_size_or_default(&self) -> usize {
+        self.max_size.unwrap_or(16 * 1024).max(517)
+    }
+
+    pub fn rate_or_default(&self) -> &str {
+        self.rate.as_deref().unwrap_or("30/minute")
+    }
+
+    pub fn burst_or_default(&self) -> u32 {
+        self.burst.unwrap_or(10)
+    }
+}
+
+/// 全局请求体硬上限(WAF 之前的资源保护);站点可用
+/// `sites[].max-body-size` 单独放宽/收紧。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct BodyCapConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 默认 32 MiB。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<u64>,
+}
+
+impl BodyCapConfig {
+    pub fn max_size_or_default(&self) -> u64 {
+        self.max_size.unwrap_or(32 * 1024 * 1024).max(1024)
+    }
+}
+
+fn dur(secs: u64) -> Duration {
+    Duration::from_secs(secs)
+}
+
+fn default_honeypot_ports() -> Vec<u16> {
+    [23u16, 135, 137, 139, 445, 1433, 1521, 2049, 3306, 3389, 4444, 5900, 6379, 7547, 8081,
+     9200, 11211, 27017, 27018, 50000]
+        .into_iter()
+        .collect()
+}
+
+/// 蜜罐默认端口表(仅当 `ports` 未显式给出时生效)。
+pub fn honeypot_ports_of(cfg: &HoneypotConfig) -> Vec<u16> {
+    cfg.ports.clone().unwrap_or_else(default_honeypot_ports)
 }
 
 /// 远程升级执行方式。
@@ -477,6 +713,10 @@ pub struct Site {
     /// 80 端口访问本站点时 301 到 https(默认关闭)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect_https: Option<bool>,
+    /// 本站点请求体硬上限(bytes);仅当 `hardening.body-cap` 启用时生效,
+    /// 未配置则用全局 `hardening.body-cap.max-size`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -616,6 +856,8 @@ pub struct EffectiveConfig {
     pub events: EventsSection,
     #[serde(default)]
     pub upgrade: UpgradeSection,
+    #[serde(default)]
+    pub hardening: HardeningConfig,
     #[serde(default)]
     pub forwards: Vec<ForwardRule>,
     #[serde(default)]

@@ -19,7 +19,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::{CONNECTION, HOST, UPGRADE};
+use http::header::{CONNECTION, CONTENT_LENGTH, HOST, UPGRADE};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
@@ -42,7 +42,7 @@ type B = BoxBody<Bytes, io::Error>;
 
 /// hyper 错误并入 io::Error(统一 BoxBody 的错误类型)。
 fn hyper_err_to_io(e: hyper::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e)
+    io::Error::other(e)
 }
 
 fn io_err(e: impl Into<io::Error>) -> io::Error {
@@ -105,30 +105,96 @@ impl<Rest: Body<Data = Bytes> + Unpin> Body for DelayedBody<Rest> {
     }
 }
 
+/// 空闲超时体(slow-loris `body-idle-timeout` 的流式段):两帧之间
+/// 空闲超过 `idle` 即以错误终止上传。覆盖 WAF 关闭(完全不缓冲)与
+/// 检测缓冲之后的余量转发两条路径 —— 旧实现只在缓冲阶段设超时,其余
+/// 段可以永久涓流。实现:成功产出帧时重置定时器;Pending 时轮询定时
+/// 器,定时器到点会唤醒上层任务,因此即使客户端一字不发也会被切断。
+struct IdleTimeoutBody {
+    inner: B,
+    idle: Duration,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Body for IdleTimeoutBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                // 有帧 = 有进展:重置空闲计时(错误/结束不重置,交上层)。
+                this.sleep = Some(Box::pin(tokio::time::sleep(this.idle)));
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(other) => Poll::Ready(other),
+            Poll::Pending => {
+                let sleep = this
+                    .sleep
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(this.idle)));
+                match std::future::Future::poll(sleep.as_mut(), cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "request body idle timeout",
+                    )))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
 /// 字节计数体:Data 字节数累加到站点统计(HTTP 模式的 bytes_in /
-/// bytes_out,透传模式由拷贝循环计数)。
+/// bytes_out,透传模式由拷贝循环计数)。`cap` 为 Some 时同时充当
+/// 请求体硬上限:累计字节超过 cap 立即以错误终止流(hardening.body-cap;
+/// 无 Content-Length 的分块上传只有这里能拦)。
 struct CountingBody<Inner: Body<Data = Bytes> + Unpin> {
     inner: Inner,
     counter: Arc<std::sync::atomic::AtomicU64>,
+    cap: Option<u64>,
+    seen: u64,
 }
 
-impl<Inner: Body<Data = Bytes> + Unpin> Body for CountingBody<Inner> {
+impl<Inner: Body<Data = Bytes> + Unpin> Body for CountingBody<Inner>
+where
+    Inner::Error: std::error::Error + Send + Sync + 'static,
+{
     type Data = Bytes;
-    type Error = Inner::Error;
+    type Error = io::Error;
 
     fn poll_frame(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    this.counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    let n = data.len() as u64;
+                    this.counter.fetch_add(n, Ordering::Relaxed);
+                    this.seen += n;
+                    if this.cap.is_some_and(|c| this.seen > c) {
+                        return Poll::Ready(Some(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "request body over hardening.body-cap",
+                        ))));
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            other => other,
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(io::Error::other(
+                e,
+            )))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -320,7 +386,25 @@ async fn route_plain(
         return resp;
     }
 
-    handle_site_request(shared, eff, site, req, peer, "http").await
+    handle_site_request(
+        shared,
+        eff.clone(),
+        site,
+        real_ip_of(&eff, req.headers(), peer),
+        req,
+        peer,
+        "http",
+    )
+    .await
+}
+
+/// 可信代理链下的真实 IP(与 handle_site_request 旧内联逻辑同源)。
+fn real_ip_of(eff: &Effective, headers: &HeaderMap, peer: SocketAddr) -> std::net::IpAddr {
+    let xff = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    super::realip::real_ip(peer.ip(), xff.as_deref(), &eff.trusted_proxies)
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +431,8 @@ impl Service<Request<Incoming>> for TlsService {
         let peer = self.peer;
         Box::pin(async move {
             site.stats.requests.fetch_add(1, Ordering::Relaxed);
-            Ok(handle_site_request(shared, eff, site, req, peer, "https").await)
+            let ip = real_ip_of(&eff, req.headers(), peer);
+            Ok(handle_site_request(shared, eff, site, ip, req, peer, "https").await)
         })
     }
 }
@@ -385,19 +470,11 @@ async fn handle_site_request(
     shared: Arc<Shared>,
     eff: Arc<Effective>,
     site: Arc<SiteRt>,
+    ip: std::net::IpAddr,
     mut req: Request<Incoming>,
-    peer: SocketAddr,
+    _peer: SocketAddr,
     proto: &'static str,
 ) -> Response<B> {
-    // 可信代理链下的真实 IP。
-    let xff_header = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let ip =
-        super::realip::real_ip(peer.ip(), xff_header.as_deref(), &eff.trusted_proxies);
-
     // WebSocket 升级探测。
     let is_ws = wants_websocket(req.headers());
     // 先取 OnUpgrade;返回 101 后由隧道任务等待。
@@ -487,29 +564,66 @@ async fn handle_site_request(
     // detect/block → 缓冲前 body_limit 字节交给 inspector,超出部分
     // 打标记继续转发(不因超限失败请求)。
     let waf_mode = site.waf_mode();
+    // hardening.body-cap:声明式 Content-Length 直接 413(不占上游连接);
+    // 分块/无长度上传由 CountingBody 在流式路径上拦截。
+    if let (Some(cap), Some(cl)) = (site.body_cap, req.headers().get(CONTENT_LENGTH)) {
+        let declared = cl.to_str().ok().and_then(|s| s.trim().parse::<u64>().ok());
+        if matches!(declared, Some(n) if n > cap) {
+            tracing::debug!(
+                site = %site.cfg.id, ip = %ip, cap,
+                "request body over hardening.body-cap; rejected with 413"
+            );
+            return text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large\n");
+        }
+    }
     let (parts, rest_body) = req.into_parts();
     let mut buffered: Vec<u8> = Vec::new();
     let mut leftover: Option<Bytes> = None;
     let mut truncated = false;
     let mut rest_body = rest_body;
     if waf_mode != WafMode::Off {
+        // When the hard cap is smaller than the WAF buffer, reject excess bytes
+        // before inspection instead of allocating the full inspection buffer.
+        let cap_u64 = site.body_cap.unwrap_or(u64::MAX);
+        let inspect_limit = (eff.body_limit as u64).min(cap_u64) as usize;
+        let count_through = cap_u64 < eff.body_limit as u64;
+        let mut seen: u64 = 0;
         loop {
-            if buffered.len() >= eff.body_limit {
+            if buffered.len() >= inspect_limit && !count_through {
                 break;
             }
-            match rest_body.frame().await {
+            let frame = match eff.body_idle {
+                Some(idle) => match tokio::time::timeout(idle, rest_body.frame()).await {
+                    Ok(f) => f,
+                    Err(_) => {
+                        tracing::debug!(site = %site.cfg.id, ip = %ip, "request body stalled; 408");
+                        return text(StatusCode::REQUEST_TIMEOUT, "request body timeout\n");
+                    }
+                },
+                None => rest_body.frame().await,
+            };
+            match frame {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
-                        let room = eff.body_limit - buffered.len();
-                        if data.len() <= room {
-                            buffered.extend_from_slice(&data);
-                        } else {
-                            let mut head = data;
-                            let tail = head.split_off(room);
-                            buffered.extend_from_slice(&head);
-                            leftover = Some(tail);
-                            truncated = true;
-                            break;
+                        seen += data.len() as u64;
+                        if seen > cap_u64 {
+                            tracing::debug!(
+                                site = %site.cfg.id, ip = %ip, cap = cap_u64,
+                                "chunked request body over hardening.body-cap; rejected with 413"
+                            );
+                            return text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large\n");
+                        }
+                        if buffered.len() < inspect_limit {
+                            let room = inspect_limit - buffered.len();
+                            if data.len() <= room {
+                                buffered.extend_from_slice(&data);
+                            } else {
+                                let mut head = data;
+                                let tail = head.split_off(room);
+                                buffered.extend_from_slice(&head);
+                                leftover = Some(tail);
+                                truncated = true;
+                            }
                         }
                     }
                 }
@@ -554,7 +668,7 @@ async fn handle_site_request(
                 if exclusions.contains(id) {
                     continue;
                 }
-                hits.push((id.clone(), msg.clone()));
+                hits.push((*id, msg.clone()));
                 hit_sevs.push(verdict.hit_severities.get(i).copied().unwrap_or(0));
             }
             if verdict.blocked || !verdict.hits.is_empty() {
@@ -672,16 +786,29 @@ async fn handle_site_request(
         if let Some(lo) = leftover.take() {
             pending.push_back(lo);
         }
-        DelayedBody {
+        let delayed = DelayedBody {
             pending,
             rest: Some(rest_body),
         }
         .map_err(hyper_err_to_io)
-        .boxed()
+        .boxed();
+        match eff.body_idle {
+            // WAF-off and post-inspection uploads must retain the same idle bound.
+            Some(idle) => IdleTimeoutBody {
+                inner: delayed,
+                idle,
+                sleep: None,
+            }
+            .boxed(),
+            None => delayed,
+        }
     };
+    // 请求体计数;cap = 本站点生效的 body-cap(仅 client→upstream 方向)。
     let up_body = CountingBody {
         inner: up_body,
         counter: site.stats.bytes_in.clone(),
+        cap: site.body_cap,
+        seen: 0,
     };
 
     let up_req = match up_req_builder.body(up_body) {
@@ -734,8 +861,9 @@ async fn handle_site_request(
     let counting = CountingBody {
         inner: resp_body,
         counter: site.stats.bytes_out.clone(),
+        cap: None,
+        seen: 0,
     }
-    .map_err(hyper_err_to_io)
     .boxed();
 
     for name in collect_hop_by_hop(&up_parts.headers, ws_tunnel) {
@@ -933,10 +1061,17 @@ pub(crate) async fn serve_plain(
 ) {
     let svc = PlainService {
         shared,
-        eff,
+        eff: eff.clone(),
         peer,
     };
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    // slow-loris:请求头读取超时(h2 自带流级超时语义,此项只作用于 h1)。
+    // timer 必须一并提供:hyper 在配置了 header_read_timeout 而没有
+    // timer 时直接 panic(整条连接被 panic 关闭),TokioTimer 是标配配套。
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(eff.header_timeout);
     let io = hyper_util::rt::TokioIo::new(stream);
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         tracing::debug!(peer = %peer, error = %e, "http connection error");
@@ -953,11 +1088,15 @@ pub(crate) async fn serve_tls(
 ) {
     let svc = TlsService {
         shared,
-        eff,
+        eff: eff.clone(),
         site,
         peer,
     };
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(eff.header_timeout);
     let io = hyper_util::rt::TokioIo::new(stream);
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         tracing::debug!(peer = %peer, error = %e, "tls connection error");

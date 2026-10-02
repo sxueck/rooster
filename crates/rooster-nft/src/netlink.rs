@@ -36,7 +36,7 @@ impl RealSocket {
             libc::socket(
                 libc::AF_NETLINK,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                libc::NETLINK_NETFILTER as i32,
+                libc::NETLINK_NETFILTER,
             )
         };
         if fd < 0 {
@@ -207,6 +207,7 @@ impl NftHandle {
             }
             leftover.drain(..consumed);
         }
+        log_acks("batch", batch, acks, expected);
         if let Some(e) = first_err {
             return Err(e);
         }
@@ -275,12 +276,198 @@ impl NftHandle {
             build_ssh_creates(&mut seq)
         };
         self.request(&batch, &[EEXIST])?;
+        // 元素过期 = max(单位, 60s),走 set 级 timeout(F-014 根因修复:
+        // dynset 不再带与 limit 互斥的 TIMEOUT 属性)。
+        for set in ["sshm4", "sshm6"] {
+            let batch = {
+                let mut seq = self.seq.lock().unwrap();
+                build_ssh_set_timeout_update(&mut seq, set, unit_ms.max(60_000))
+            };
+            self.request(&batch, &[EEXIST])?;
+        }
         let handles = self.dump_rule_handles(SSH_CHAIN)?;
         let batch = {
             let mut seq = self.seq.lock().unwrap();
             build_ssh_rules(&mut seq, &handles, port, n, unit_ms, burst)
         };
         self.request(&batch, &[])
+    }
+
+    /// 下发整套加固规则:幂等创建 8 set + 4 链,逐链清旧规则重建,
+    /// 全量替换蜜罐/开放端口集,并清空命中暂存(配置变更时窗口重新计数)。
+    pub fn set_hardening(
+        &self,
+        spec: &HardeningSpec,
+        honeyports: &[u16],
+        openports: &[u16],
+    ) -> Result<(), NftError> {
+        // 端口集先建(仅缺失时;key 类型错误无法原地改的旧表在删表重建时
+        // 自然修正);随后幂等建齐 8 set + 4 链。
+        let reset = {
+            let mut seq = self.seq.lock().unwrap();
+            build_hardening_ports_reset(&mut seq)
+        };
+        self.request(&reset, &[EEXIST])
+            .map_err(|e| annotate(e, "ports-ensure"))?;
+        let batch = {
+            let mut seq = self.seq.lock().unwrap();
+            build_hardening_sets_create(&mut seq, spec)
+        };
+        if std::env::var_os("ROOSTER_NFT_DEBUG_BATCH").is_some() {
+            std::fs::write("/tmp/nftbatch-creates.bin", &batch).ok();
+        }
+        self.request(&batch, &[])
+            .map_err(|e| annotate(e, "sets-create"))?;
+        // 只为缺失的链建批:存量链用 EXCL 重开会让内核 EEXIST 回滚同批。
+        let have = self.dump_chain_names()?;
+        let missing: Vec<&'static str> = hardening_chains()
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| !have.iter().any(|h| h == n))
+            .collect();
+        if !missing.is_empty() {
+            let batch = {
+                let mut seq = self.seq.lock().unwrap();
+                build_hardening_chains_create(&mut seq, &missing)
+            };
+            self.request(&batch, &[EEXIST])
+                .map_err(|e| annotate(e, "chains-create"))?;
+        }
+        for (chain, _prio) in hardening_chains() {
+            let handles = self
+                .dump_rule_handles(chain)
+                .map_err(|e| annotate(e, chain))?;
+            let batches = {
+                let mut seq = self.seq.lock().unwrap();
+                build_hardening_chain_rule_batches(&mut seq, chain, &handles, spec)
+            };
+            for (i, batch) in batches.into_iter().enumerate() {
+                if std::env::var_os("ROOSTER_NFT_DEBUG_BATCH").is_some() {
+                    std::fs::write(format!("/tmp/nftbatch-{chain}-{i}.bin"), &batch)
+                        .ok();
+                }
+                self.request(&batch, &[])
+                    .map_err(|e| annotate(e, &format!("{chain}#{i}")))?;
+            }
+        }
+        for (set, ports) in [(SET_HONEYPORTS, honeyports), (SET_OPENPORTS, openports)] {
+            let batch = {
+                let mut seq = self.seq.lock().unwrap();
+                build_replace_ports(&mut seq, set, ports)
+            };
+            self.request(&batch, &[ENOENT])
+                .map_err(|e| annotate(e, set))?;
+        }
+        self.flush_hardening_hits()
+            .map_err(|e| annotate(e, "flush-hits"))
+    }
+
+    /// 全关时的清理:**只删不建,且只碰 dump 确认存在的对象**。DELRULE 带
+    /// table+chain 不带 handle = `nft flush chain`;DELSETELEM 不带
+    /// ELEMENTS = `nft flush set`。批是原子事务:对缺失 set 的 flush 会
+    /// ENOENT 并把同批的链清空一并回滚(6.18 实测,升级路径上 scanports_*
+    /// 不存在时旧规则永久残留的根因),所以先 dump 链/集名单再组批;
+    /// ENOENT 仍容忍 dump 与删除之间的竞态。不会新建任何规则、集合或链。
+    /// l4meter 的令牌桶元素一并清空:规则都没了,状态留着无意义。
+    pub fn clear_hardening(&self) -> Result<(), NftError> {
+        let chains = self.dump_chain_names()?;
+        let sets = self.dump_set_names()?;
+        let mut ops = Vec::with_capacity(512);
+        {
+            let mut seq = self.seq.lock().unwrap();
+            for (chain, _prio) in hardening_chains() {
+                if chains.iter().any(|c| c == chain) {
+                    ops.extend_from_slice(&crate::builders::plain_delrule_msg(&mut seq, chain));
+                }
+            }
+            for set in hardening_state_sets() {
+                if sets.iter().any(|s| s == set) {
+                    ops.extend_from_slice(&del_setelem_msg(&mut seq, set, &[]));
+                }
+            }
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let batch = {
+            let mut seq = self.seq.lock().unwrap();
+            wrap_batch(&ops, seq.get(), seq.get())
+        };
+        self.request(&batch, &[ENOENT])
+    }
+
+    /// 清空命中/元组暂存集(禁用子项 / 重新应用时防止陈旧命中被误封)。
+    /// l4meter 不在列:令牌桶状态有自己的生命周期,消费命中/重下发的
+    /// 时候都不重置它,否则超速源每次都能白得一个新令牌桶。
+    /// 与 clear_hardening 同理由:只 flush dump 里存在的集,缺失集的
+    /// ENOENT 会回滚同批其余 flush(原子事务)。
+    pub fn flush_hardening_hits(&self) -> Result<(), NftError> {
+        let sets = self.dump_set_names()?;
+        let existing: Vec<&str> = hardening_hit_sets()
+            .into_iter()
+            .filter(|s| sets.iter().any(|h| h == s))
+            .collect();
+        if existing.is_empty() {
+            return Ok(());
+        }
+        let mut ops = Vec::with_capacity(384);
+        {
+            let mut seq = self.seq.lock().unwrap();
+            for set in existing {
+                ops.extend_from_slice(&del_setelem_msg(&mut seq, set, &[]));
+            }
+        }
+        let batch = {
+            let mut seq = self.seq.lock().unwrap();
+            wrap_batch(&ops, seq.get(), seq.get())
+        };
+        self.request(&batch, &[ENOENT])
+    }
+
+    /// 从非区间命中集删单 IP(promoter 消费一条命中后清位)。
+    pub fn delete_plain_element(&self, set: &str, ip: &str) -> Result<(), NftError> {
+        let batch = {
+            let mut seq = self.seq.lock().unwrap();
+            build_del_plain_ip(&mut seq, set, ip)
+        };
+        if batch.is_empty() {
+            return Err(NftError::InvalidAddress(ip.to_string()));
+        }
+        self.request(&batch, &[ENOENT])
+    }
+
+    /// dump 拼接元组集:((源 IP, 目的端口), 剩余毫秒)。扫描检测的
+    /// distinct-port 计数用;klen 取自 hardening_meter_sets(v4 8 / v6 20)。
+    pub fn list_scan_tuples(&self, set: &str) -> Result<Vec<((IpAddr, u16), Option<u64>)>, NftError> {
+        let Some(klen) = hardening_hit_set_klen(set) else {
+            return Err(NftError::InvalidAddress(set.to_string()));
+        };
+        let req = {
+            let mut seq = self.seq.lock().unwrap();
+            build_get_setelem(&mut seq, set)
+        };
+        let payloads = self.dump(&req)?;
+        Ok(parse_set_tuples(&payloads, klen))
+    }
+
+    /// 从拼接元组集删元素(promoter 清理非路由源/封禁后的残留)。
+    pub fn delete_scan_tuple(&self, set: &str, ip: &IpAddr, port: u16) -> Result<(), NftError> {
+        let key = scan_tuple_key(ip, port);
+        let mut m = Vec::with_capacity(160);
+        let (m, s) = {
+            let mut seq = self.seq.lock().unwrap();
+            let s = seq.get();
+            let pos = nf_msg_start(&mut m, NFT_MSG_DELSETELEM, NFPROTO_INET, F_ACK_ONLY, s);
+            attr_str(&mut m, NFTA_SET_ELEM_LIST_TABLE, crate::TABLE);
+            attr_str(&mut m, NFTA_SET_ELEM_LIST_SET, set);
+            let els = nest_start(&mut m, NFTA_SET_ELEM_LIST_ELEMENTS);
+            put_plain_elem(&mut m, &key);
+            nest_end(&mut m, els);
+            nf_msg_end(&mut m, pos);
+            (wrap_batch(&m, seq.get(), seq.get()), s)
+        };
+        let _ = s;
+        self.request(&m, &[ENOENT])
     }
 
     pub fn add_set_element(
@@ -359,6 +546,41 @@ impl NftHandle {
         self.request(&batch, &[])
     }
 
+    /// GETCHAIN dump(table inet rooster)→ 链名列表。
+    pub fn dump_chain_names(&self) -> Result<Vec<String>, NftError> {
+        let req = {
+            let mut seq = self.seq.lock().unwrap();
+            build_get_chain(&mut seq)
+        };
+        let mut payloads = self.dump(&req)?;
+        let mut out = Vec::new();
+        for p in payloads.drain(..) {
+            if let Some(n) = find_attr(&p, NFTA_CHAIN_NAME) {
+                let s = String::from_utf8_lossy(n).trim_end_matches('\0').to_string();
+                out.push(s);
+            }
+        }
+        Ok(out)
+    }
+
+    /// GETSET dump(table inet rooster)→ set 名列表。clear/flush 先确认
+    /// 对象存在再组批(对缺失 set 的 op 会让内核回滚同批事务)。
+    pub fn dump_set_names(&self) -> Result<Vec<String>, NftError> {
+        let req = {
+            let mut seq = self.seq.lock().unwrap();
+            build_get_sets(&mut seq)
+        };
+        let mut payloads = self.dump(&req)?;
+        let mut out = Vec::new();
+        for p in payloads.drain(..) {
+            if let Some(n) = find_attr(&p, NFTA_SET_NAME) {
+                let s = String::from_utf8_lossy(n).trim_end_matches('\0').to_string();
+                out.push(s);
+            }
+        }
+        Ok(out)
+    }
+
     fn dump_rule_handles(&self, chain: &str) -> Result<Vec<u64>, NftError> {
         let req = {
             let mut seq = self.seq.lock().unwrap();
@@ -370,6 +592,42 @@ impl NftHandle {
             out.extend(parse_rule_handles(&[p]));
         }
         Ok(out)
+    }
+
+    /// 真内核隔离测试专用(netns 内):发送任意 builders 批,用于构造
+    /// 「链在、规则在、新命名 set 缺失」的升级现场。
+    #[doc(hidden)]
+    pub fn ktest_send_batch(&self, batch: &[u8], tolerated: &[i32]) -> Result<(), NftError> {
+        self.request(batch, tolerated)
+    }
+
+    /// 真内核隔离测试专用:链上规则 handle 数(清理断言)。
+    #[doc(hidden)]
+    pub fn ktest_rule_count(&self, chain: &str) -> Result<usize, NftError> {
+        Ok(self.dump_rule_handles(chain)?.len())
+    }
+}
+
+/// 批失败时标注是哪一步(chain / set / creates)+ ack 清单,供 agent 层
+/// 日志直接定位(内核对批内 ACK 位缺失的 op 静默跳过,清单能暴露错位)。
+fn annotate(e: NftError, step: &str) -> NftError {
+    match e {
+        NftError::Netlink(msg) => NftError::Netlink(format!("[{step}] {msg}")),
+        other => other,
+    }
+}
+
+/// debug:记录每个 request 的 ack 计数(需要 ROOSTER_NFT_DEBUG_BATCH)。
+fn log_acks(step: &str, _batch: &[u8], acks: usize, expected: usize) {
+    if std::env::var_os("ROOSTER_NFT_DEBUG_BATCH").is_some() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/nft-ack.log")
+        {
+            let _ = writeln!(f, "{step}: acks={acks}/{expected}");
+        }
     }
 }
 
@@ -448,7 +706,6 @@ fn _unused(v4: Ipv4Addr, v6: Ipv6Addr) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::testutil::shared_handle;
     use crate::SET_ALLOW_V4;
     use std::sync::Arc;

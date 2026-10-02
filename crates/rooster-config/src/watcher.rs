@@ -84,10 +84,10 @@ pub async fn spawn(
             }
         }
     })
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    .map_err(std::io::Error::other)?;
     watcher
         .watch(&dir, RecursiveMode::NonRecursive)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let handle = tokio::spawn(async move {
         // watcher 必须存活于任务期间

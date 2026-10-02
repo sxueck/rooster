@@ -394,3 +394,30 @@ export interface AuditEntry {
 export interface AuditResp {
   entries: AuditEntry[]
 }
+
+/** 加固(hardening)单段形态:仅 enabled 必填,可选字段按段适用(时长为 humantime 字符串) */
+export interface HardeningSectionConfig {
+  enabled: boolean
+  ports?: number[]
+  'hit-window'?: string
+  'ban-time'?: string
+  'max-hits'?: number
+  'find-time'?: string
+  'extra-open-ports'?: number[]
+  rate?: string
+  burst?: number
+  'header-timeout'?: string
+  'body-idle-timeout'?: string
+  'max-conns-per-ip'?: number
+  'max-size'?: number
+}
+/** GET/PUT /management/hardening 的整体配置(稀疏:未配置段缺省/为 null,全部默认关闭) */
+export interface HardeningConfig {
+  honeypot?: HardeningSectionConfig | null
+  'port-guard'?: HardeningSectionConfig | null
+  'conn-limit'?: HardeningSectionConfig | null
+  'flag-guard'?: HardeningSectionConfig | null
+  'slow-loris'?: HardeningSectionConfig | null
+  'client-hello'?: HardeningSectionConfig | null
+  'body-cap'?: HardeningSectionConfig | null
+}

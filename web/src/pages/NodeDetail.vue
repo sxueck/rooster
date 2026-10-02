@@ -6,6 +6,7 @@ import { getNodes } from '../api/client'
 import type { NodeInfo } from '../api/types'
 import OverviewTab from '../components/tabs/OverviewTab.vue'
 import PluginsTab from '../components/tabs/PluginsTab.vue'
+import HardeningTab from '../components/tabs/HardeningTab.vue'
 import SitesTab from '../components/tabs/SitesTab.vue'
 import ForwardsTab from '../components/tabs/ForwardsTab.vue'
 import BansTab from '../components/tabs/BansTab.vue'
@@ -26,6 +27,7 @@ const tab = ref('overview')
 const tabItems = [
   { key: 'overview', label: '概况' },
   { key: 'plugins', label: '插件' },
+  { key: 'hardening', label: '加固' },
   { key: 'sites', label: '站点' },
   { key: 'forwards', label: '转发' },
   { key: 'bans', label: '封禁' },
@@ -81,6 +83,7 @@ onMounted(loadNode)
         <template #default="{ seen }">
           <OverviewTab v-if="seen('overview')" v-show="tab === 'overview'" :node-id="nodeId" :node="node" />
           <PluginsTab v-if="seen('plugins')" v-show="tab === 'plugins'" :node-id="nodeId" />
+          <HardeningTab v-if="seen('hardening')" v-show="tab === 'hardening'" :node-id="nodeId" />
           <SitesTab v-if="seen('sites')" v-show="tab === 'sites'" :node-id="nodeId" />
           <ForwardsTab v-if="seen('forwards')" v-show="tab === 'forwards'" :node-id="nodeId" />
           <BansTab v-if="seen('bans')" v-show="tab === 'bans'" :node-id="nodeId" />

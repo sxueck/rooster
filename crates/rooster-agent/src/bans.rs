@@ -222,7 +222,10 @@ pub async fn reconfigure(state: &Arc<AgentState>) {
     // 3. ssh-guard:配置变化重启;未启用停止。
     ensure_sshguard(state, &eff).await;
 
-    // 4. http-guard:80/443 反代 + WAF 规则集热重建。
+    // 4. L4 加固:蜜罐/扫描/限速/flag 规则下发 + 命中提升器(全部 opt-in)。
+    crate::hardening::ensure(state, &eff).await;
+
+    // 5. http-guard:80/443 反代 + WAF 规则集热重建。
     ensure_httpguard(state, &eff).await;
 }
 
@@ -345,6 +348,7 @@ async fn ensure_httpguard(state: &Arc<AgentState>, eff: &EffectiveConfig) {
         geoip_db,
         body_limit: 0,
         ban_hook,
+        hardening: eff.hardening.clone(),
     };
     state.httpguard.apply(settings).await;
 }

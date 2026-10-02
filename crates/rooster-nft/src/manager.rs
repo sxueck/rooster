@@ -377,7 +377,7 @@ mod tests {
         live.expires_at = Some(now_secs() + 1800);
         seed_db(&db, &[expired, live]);
 
-        let mut mock = MockSocket::default();
+        let mock = MockSocket::default();
         let mock = std::sync::Arc::new(std::sync::Mutex::new(mock));
         let mgr = NftBanManager::new(shared_handle(mock.clone()), &db).unwrap();
 
@@ -389,7 +389,7 @@ mod tests {
         let sock = mock.lock().unwrap();
         let adds = sock.setelem_ops(crate::consts::NFT_MSG_NEWSETELEM, crate::SET_BLOCK_V4);
         assert!(adds.iter().any(|(s, t)| {
-            s == "203.0.113.20" && t.map(|x| x >= 1795 && x <= 1800).unwrap_or(false)
+            s == "203.0.113.20" && t.map(|x| (1795..=1800).contains(&x)).unwrap_or(false)
         }));
         drop(mgr);
         let _ = std::fs::remove_file(&db);

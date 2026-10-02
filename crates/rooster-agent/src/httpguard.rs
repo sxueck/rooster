@@ -97,6 +97,8 @@ pub struct HttpGuardSettings {
     pub body_limit: usize,
     /// 持续超限升级 Ban 时回调(封禁由主会话的封禁管理器执行)。
     pub ban_hook: Option<Arc<dyn Fn(&str, std::time::Duration) + Send + Sync>>,
+    /// L7 加固(slow-loris / client-hello / body-cap);全部子项 opt-in。
+    pub hardening: rooster_config::schema::HardeningConfig,
 }
 
 // Arc<dyn Fn> 无法 derive(Debug),手工实现保持 API 形态。
@@ -109,6 +111,7 @@ impl fmt::Debug for HttpGuardSettings {
             .field("trusted_proxies", &self.trusted_proxies)
             .field("geoip_db", &self.geoip_db)
             .field("body_limit", &self.body_limit)
+            .field("hardening", &self.hardening)
             .field("ban_hook", &self.ban_hook.is_some())
             .finish()
     }
@@ -139,6 +142,10 @@ pub(crate) struct Shared {
     pub(crate) https_slot: Mutex<Option<ListenerSlot>>,
     /// 站点统计:id → 计数器(跨 apply 保留,见 settings::gc_stats)。
     pub(crate) stats: Mutex<HashMap<String, Arc<settings::SiteStats>>>,
+    /// 每 IP 并发连接计数(slow-loris max-conns-per-ip;None 时闲置)。
+    pub(crate) conn_gate: Arc<Mutex<settings::ConnGate>>,
+    /// TLS ClientHello 每 IP 速率闸门;None = 未启用(hardening.client-hello)。
+    pub(crate) hello_gate: Mutex<Option<settings::IpRateGate>>,
     /// 串行化 apply / shutdown 的整段 diff 流程。用 Semaphore(1) 而非
     /// Mutex:permit 跨 await 持有是 tokio 语义,且避开 lock-guard 静态
     /// 规则的误报(该规则按 std 锁的阻塞语义建模,在此不成立)。
@@ -162,6 +169,8 @@ impl HttpGuardRuntime {
                 http_slot: Mutex::new(None),
                 https_slot: Mutex::new(None),
                 stats: Mutex::new(HashMap::new()),
+                conn_gate: Arc::new(Mutex::new(settings::ConnGate::default())),
+                hello_gate: Mutex::new(None),
                 gate: tokio::sync::Semaphore::new(1),
             }),
         }
@@ -190,6 +199,7 @@ impl HttpGuardRuntime {
             *guard = Some(eff.clone());
         }
         settings::gc_stats(&self.inner.stats, &eff.sites);
+        self.reconcile_hello_gate(&cfg);
 
         let want_http = if sites_empty {
             None
@@ -205,6 +215,25 @@ impl HttpGuardRuntime {
             .await;
         self.reconcile_listener(&self.inner.https_slot, want_https, ListenerKind::Https)
             .await;
+    }
+
+    /// ClientHello 速率闸门:配置变了整体重建,禁用时清空(既有连接自然
+    /// 结束,新连接回到不限速状态)。速率格式非法 → 记日志并保持禁用。
+    fn reconcile_hello_gate(&self, cfg: &HttpGuardSettings) {
+        let want = cfg
+            .hardening
+            .client_hello
+            .as_ref()
+            .filter(|c| c.enabled)
+            .and_then(|c| match settings::hardening_parse_rate(c.rate_or_default()) {
+                Some((n, window)) => Some((n, window, c.burst_or_default())),
+                None => {
+                    tracing::error!(rate = c.rate_or_default(), "hardening.client-hello: unparsable rate, gate disabled");
+                    None
+                }
+            });
+        *self.inner.hello_gate.lock().unwrap() =
+            want.map(|(n, window, burst)| settings::IpRateGate::new(n, window, burst));
     }
 
     /// 每站点统计:{id, requests, blocked, conns_passthrough, bytes_in,
@@ -357,8 +386,14 @@ async fn http_accept_loop(inner: Arc<Shared>, listener: TcpListener) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let Some(eff) = snapshot(&inner) else { return };
+                let guard = match admit_conn(&inner, &eff, peer) {
+                    Admit::Open(g) => g,
+                    Admit::Rejected => continue,
+                };
                 let inner2 = inner.clone();
                 tokio::spawn(async move {
+                    // guard 随任务存活:连接结束(drop)才归还并发名额。
+                    let _guard = guard;
                     let _ = stream.set_nodelay(true);
                     httpsrv::serve_plain(inner2, eff, stream, peer).await;
                 });
@@ -371,6 +406,28 @@ async fn http_accept_loop(inner: Arc<Shared>, listener: TcpListener) {
     }
 }
 
+enum Admit {
+    /// 放行;Option<ConnGuard> = 是否受并发上限管控。
+    Open(Option<settings::ConnGuard>),
+    /// 超 `max-conns-per-ip`,直接断开(不进入 TLS/HTTP 任何处理)。
+    Rejected,
+}
+
+/// slow-loris `max-conns-per-ip`:超限时在任何协议解析之前就断开。
+fn admit_conn(inner: &Arc<Shared>, eff: &settings::Effective, peer: SocketAddr) -> Admit {
+    let Some(max) = eff.max_conns_per_ip else {
+        return Admit::Open(None);
+    };
+    if !inner.conn_gate.lock().unwrap().try_admit(peer.ip(), max) {
+        tracing::debug!(peer = %peer, max, "http-guard conn over max-conns-per-ip, dropping");
+        return Admit::Rejected;
+    }
+    Admit::Open(Some(settings::ConnGuard::new(
+        inner.conn_gate.clone(),
+        peer.ip(),
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // 443 端口:TLS 窥探 → 透传 / 终止
 
@@ -379,8 +436,13 @@ async fn https_accept_loop(inner: Arc<Shared>, listener: TcpListener) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let Some(eff) = snapshot(&inner) else { return };
+                let guard = match admit_conn(&inner, &eff, peer) {
+                    Admit::Open(g) => g,
+                    Admit::Rejected => continue,
+                };
                 let inner2 = inner.clone();
                 tokio::spawn(async move {
+                    let _guard = guard;
                     let _ = stream.set_nodelay(true);
                     handle_tls_conn(inner2, eff, stream, peer).await;
                 });
@@ -399,18 +461,53 @@ async fn handle_tls_conn(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
 ) {
+    // client-hello 速率闸门(hardening.client-hello):在任何缓冲之前判。
+    let hello_over = {
+        let mut gate = inner.hello_gate.lock().unwrap();
+        match gate.as_mut() {
+            Some(g) => !g.allow(peer.ip()),
+            None => false,
+        }
+    };
+    if hello_over {
+        tracing::debug!(peer = %peer, "tls conn over client-hello rate, dropping");
+        return;
+    }
     let mut ps = peek::PeekStream::new(stream);
     // 窥探 ClientHello:不消费字节,解析失败也保留缓冲原样重放。
     let mut hello = None;
     loop {
         match clienthello::try_parse(ps.buffer()) {
             clienthello::HelloParse::Done(h) => {
+                // Exclude early-data records coalesced with a complete ClientHello.
+                if let Some(cap) = eff.hello_max_size {
+                    let size = h.as_ref().map_or(ps.buffer().len(), |hello| hello.wire_len);
+                    if size > cap {
+                        tracing::debug!(peer = %peer, cap, "client hello too large; closing");
+                        return;
+                    }
+                }
                 hello = h;
                 break;
             }
             clienthello::HelloParse::NeedMore => {
-                if ps.buffer().len() >= clienthello::MAX_HELLO_BUF {
-                    tracing::debug!(peer = %peer, "client hello too large; giving up peek");
+                let over = match eff.hello_max_size {
+                    // 启用:超限 = 断开(超大 hello 本身就是攻击载荷)。
+                    Some(cap) => ps.buffer().len() > cap,
+                    // 未启用:回到旧行为 —— 只放弃窥探,字节照转上游,
+                    // 不能在功能关闭时改变默认透传语义。
+                    None => ps.buffer().len() >= clienthello::MAX_HELLO_BUF,
+                };
+                if over {
+                    if let Some(cap) = eff.hello_max_size {
+                        tracing::debug!(peer = %peer, cap, "client hello too large; closing");
+                        return;
+                    }
+                    tracing::debug!(
+                        peer = %peer,
+                        cap = clienthello::MAX_HELLO_BUF,
+                        "client hello too large; giving up peek"
+                    );
                     break;
                 }
                 match tokio::time::timeout(HELLO_READ_TIMEOUT, ps.fill()).await {
