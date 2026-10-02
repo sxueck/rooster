@@ -61,7 +61,11 @@ async fn agent_session(state: Arc<HubState>, meta: ConnMeta, mut sock: WebSocket
         }
     }
 
-    let conn = crate::registry::Conn::new(&node_id, tx.clone());
+    let conn = crate::registry::Conn::new_with_peer_ip(
+        &node_id,
+        tx.clone(),
+        Some(meta.peer.ip()),
+    );
     state.registry.register(&node_id, conn.clone());
 
     // 节点状态更新 + 面板通知。

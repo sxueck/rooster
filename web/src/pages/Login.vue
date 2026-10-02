@@ -53,19 +53,24 @@ async function submit() {
       </template>
 
       <div class="stack">
-        <RField label="HUB · 地址">
-          <RInput
-            v-model="hub"
-            mono
-            placeholder="https://hub.example.com（留空 = 使用本站代理）"
-            @keyup.enter="submit"
-          />
-        </RField>
+        <details class="advanced">
+          <summary class="micro">高级选项 · Hub 地址</summary>
+          <RField label="HUB · 地址">
+            <RInput
+              v-model="hub"
+              mono
+              width="100%"
+              placeholder="https://hub.example.com（留空 = 使用本站代理）"
+              @keyup.enter="submit"
+            />
+          </RField>
+        </details>
         <RField label="SECRET_KEY · 密钥">
           <RInput
             v-model="secret"
             type="password"
             mono
+            width="100%"
             placeholder="管理员密钥"
             @keyup.enter="submit"
           />
@@ -83,7 +88,7 @@ async function submit() {
 
 <style scoped>
 .wrap {
-  height: 100vh;
+  min-height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -91,6 +96,19 @@ async function submit() {
 }
 .card {
   width: 400px;
+  max-width: calc(100vw - 32px);
+}
+.advanced {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.advanced summary {
+  cursor: pointer;
+  width: fit-content;
+}
+.advanced summary:hover {
+  color: var(--ink);
 }
 .brand {
   display: flex;

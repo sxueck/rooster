@@ -3,6 +3,7 @@
 //! /events、/history、/apply/confirm。
 
 pub mod auth;
+mod network;
 
 use crate::state::AgentState;
 use axum::extract::{ConnectInfo, Path, State};
@@ -58,6 +59,7 @@ pub fn mgmt_router(state: Arc<AgentState>) -> Router {
         .route("/hardening", get(get_hardening).put(put_hardening))
         .route("/plugins/{name}", get(get_plugin).put(put_plugin))
         .route("/stats", get(get_stats))
+        .route("/network", get(get_network))
         .route("/sites", get(list_sites))
         .route("/sites/{id}", put(put_site).delete(delete_site))
         .route("/layers", get(get_layers))
@@ -984,6 +986,10 @@ async fn get_stats(State(state): State<Arc<AgentState>>) -> Response {
         "ban_engine": *state.ban_status.read().unwrap(),
     }))
     .into_response()
+}
+
+async fn get_network() -> Response {
+    Json(network::snapshot()).into_response()
 }
 
 async fn list_sites(State(state): State<Arc<AgentState>>) -> Response {

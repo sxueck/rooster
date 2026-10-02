@@ -781,3 +781,21 @@ async fn management_endpoints_redact_credentials_and_roundtrip_restores_them() {
     assert!(!archived.contains("tok-secret-value"), "历史快照不得带出 token");
     assert!(!archived.contains(SECRET), "历史快照不得带出管理口令");
 }
+
+#[tokio::test]
+async fn network_endpoint_reports_current_interface_counters() {
+    let srv = start("network").await;
+    let (status, body) = trusted_json(
+        &srv.state,
+        "GET",
+        "/v0/management/network",
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{body:?}");
+    assert!(body["connection_ip"].is_null());
+    let interfaces = body["interfaces"].as_array().expect("interface array");
+    assert!(!interfaces.is_empty(), "Linux procfs should expose loopback");
+    assert!(interfaces[0]["rx_bytes"].is_number());
+    assert!(interfaces[0]["tx_bytes"].is_number());
+}

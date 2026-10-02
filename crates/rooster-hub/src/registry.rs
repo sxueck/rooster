@@ -2,6 +2,7 @@
 
 use rooster_proto::Frame;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -10,6 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// 一条已建立的 Agent 长连接的 Hub 侧句柄。
 pub struct Conn {
     node_id: String,
+    peer_ip: Option<IpAddr>,
     tx: mpsc::UnboundedSender<Frame>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Frame>>>,
     next_id: AtomicU64,
@@ -34,9 +36,18 @@ pub enum RequestError {
 
 impl Conn {
     pub fn new(node_id: &str, tx: mpsc::UnboundedSender<Frame>) -> Arc<Self> {
+        Self::new_with_peer_ip(node_id, tx, None)
+    }
+
+    pub fn new_with_peer_ip(
+        node_id: &str,
+        tx: mpsc::UnboundedSender<Frame>,
+        peer_ip: Option<IpAddr>,
+    ) -> Arc<Self> {
         let (hangup_tx, hangup_rx) = watch::channel(false);
         Arc::new(Self {
             node_id: node_id.to_string(),
+            peer_ip,
             tx,
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -47,6 +58,10 @@ impl Conn {
 
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    pub fn peer_ip(&self) -> Option<IpAddr> {
+        self.peer_ip
     }
 
     /// 要求该连接立即退出(仅移除注册表项并不会关 socket:会话循环自己

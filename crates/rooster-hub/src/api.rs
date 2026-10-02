@@ -478,6 +478,22 @@ async fn revoke_node(State(state): State<Arc<HubState>>, Path(id): Path<String>)
 // ---------------------------------------------------------------------------
 // 透传
 
+fn add_connection_ip(body: Vec<u8>, peer_ip: Option<std::net::IpAddr>) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body;
+    };
+    object.insert(
+        "connection_ip".to_string(),
+        peer_ip
+            .map(|ip| json!(ip.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    serde_json::to_vec(&value).unwrap_or(body)
+}
+
 async fn passthrough(
     State(state): State<Arc<HubState>>,
     Path((id, path)): Path<(String, String)>,
@@ -524,6 +540,11 @@ async fn passthrough(
             if method != "GET" && method != "HEAD" && method != "OPTIONS" {
                 state.audit("panel", Some(&id), &method, &mgmt_path, &body, status.as_u16());
             }
+            let resp_body = if method == "GET" && path == "network" {
+                add_connection_ip(resp_body, conn.peer_ip())
+            } else {
+                resp_body
+            };
             let mut resp = (status, resp_body).into_response();
             for (k, v) in resp_headers {
                 if let (Ok(name), Ok(val)) = (
@@ -1196,6 +1217,8 @@ struct UpgradeRolloutBody {
     #[serde(default)]
     selector: BTreeMap<String, String>,
     #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
     batch_size: Option<usize>,
     #[serde(default)]
     wait_secs: Option<u64>,
@@ -1217,12 +1240,32 @@ async fn rollout_upgrade(
         Some(Json(b)) => b,
         None => Default::default(),
     };
+    if let Some(node_id) = body.node_id.as_deref() {
+        match state.store.get_node(node_id) {
+            Ok(Some(node)) if !node.revoked => {}
+            Ok(_) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "node not found"})),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e})),
+                )
+                    .into_response()
+            }
+        }
+    }
     let run_id = new_run_id("u");
     rollout::spawn_upgrade_rollout(
         state.clone(),
         run_id.clone(),
         version.clone(),
         body.selector,
+        body.node_id,
         body.batch_size.unwrap_or(1),
         body.wait_secs.unwrap_or(300),
     );
@@ -1623,5 +1666,14 @@ mod tests {
         assert_eq!(bootstrap_sig_bytes(&b64.encode(raw)).unwrap(), raw.to_vec());
         assert!(bootstrap_sig_bytes("not-base64!").is_none());
         assert!(bootstrap_sig_bytes(&b64.encode(&raw[..63])).is_none());
+    }
+
+    #[test]
+    fn network_response_contains_the_live_connection_ip() {
+        let body = br#"{"interfaces":[],"connection_ip":null}"#.to_vec();
+        let augmented = add_connection_ip(body, Some("192.0.2.8".parse().unwrap()));
+        let value: serde_json::Value = serde_json::from_slice(&augmented).unwrap();
+        assert_eq!(value["connection_ip"], "192.0.2.8");
+        assert_eq!(value["interfaces"], serde_json::json!([]));
     }
 }

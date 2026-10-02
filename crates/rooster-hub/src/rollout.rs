@@ -357,11 +357,22 @@ pub fn spawn_upgrade_rollout(
     run_id: String,
     version: String,
     selector: BTreeMap<String, String>,
+    node_id: Option<String>,
     batch_size: usize,
     wait_secs: u64,
 ) {
     tokio::spawn(async move {
-        let nodes = state.store.select_nodes(&selector).unwrap_or_default();
+        let nodes = match node_id {
+            Some(id) => state
+                .store
+                .get_node(&id)
+                .ok()
+                .flatten()
+                .filter(|n| !n.revoked)
+                .into_iter()
+                .collect(),
+            None => state.store.select_nodes(&selector).unwrap_or_default(),
+        };
         let url = state.signed_download_url(&format!("/v0/downloads/{version}"), 24 * 3600);
         let sig = state
             .store
@@ -697,6 +708,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn targeted_upgrade_only_sends_to_requested_node() {
+        let (state, store) = test_state("targeted-upgrade");
+        for id in ["node-a", "node-b"] {
+            store.upsert_node(&node(id, &[])).unwrap();
+        }
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::unbounded_channel();
+        state.registry.register("node-a", crate::registry::Conn::new("node-a", tx_a));
+        state.registry.register("node-b", crate::registry::Conn::new("node-b", tx_b));
+
+        spawn_upgrade_rollout(
+            state.clone(),
+            "run-targeted".into(),
+            "0.2.0-x86_64".into(),
+            Default::default(),
+            Some("node-b".into()),
+            1,
+            0,
+        );
+        let frame = tokio::time::timeout(Duration::from_secs(1), rx_b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(frame, Frame::Upgrade { .. }));
+        tokio::task::yield_now().await;
+        assert!(
+            rx_a.try_recv().is_err(),
+            "non-target node must not receive upgrade"
+        );
+    }
+
     /// C6:入库 key 带架构后缀、节点 Hello 上报纯 semver → 必须判为
     /// upgraded,而不是永远 version-unchanged。
     #[tokio::test]
@@ -714,6 +757,7 @@ mod tests {
             "run-u".into(),
             "0.2.0-x86_64".into(),
             Default::default(),
+            None,
             1,
             0,
         );

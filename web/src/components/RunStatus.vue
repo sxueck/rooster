@@ -22,6 +22,18 @@ function statusLabel(s: string): string {
       return '失败'
     case 'skipped':
       return '跳过'
+    case 'done':
+      return '已结束'
+    case 'upgraded':
+      return '升级成功'
+    case 'version-unchanged':
+      return '版本未变化'
+    case 'unresponsive':
+      return '节点未响应'
+    case 'offline':
+      return '节点离线'
+    case 'sent':
+      return '已下发'
     default:
       return s
   }
@@ -38,11 +50,11 @@ const cols: RColumn<RolloutResult>[] = [
         RTag,
         {
           tone:
-            r.status === 'applied'
+            r.status === 'applied' || r.status === 'upgraded'
               ? 'ok'
-              : r.status === 'failed'
+              : r.status === 'failed' || r.status === 'unresponsive'
                 ? 'danger'
-                : r.status === 'skipped'
+                : r.status === 'skipped' || r.status === 'version-unchanged' || r.status === 'offline'
                   ? 'warn'
                   : 'muted',
         },
@@ -85,8 +97,14 @@ onUnmounted(() => window.clearTimeout(timer))
     <div class="row meta">
       <span class="micro">RUN</span>
       <code class="mono">{{ run.id }}</code>
-      <span class="micro">TEMPLATE</span>
-      <span class="num">{{ run.template_id }}</span>
+      <template v-if="run.template_id">
+        <span class="micro">TEMPLATE</span>
+        <span class="num">{{ run.template_id }}</span>
+      </template>
+      <template v-else-if="run.version">
+        <span class="micro">VERSION</span>
+        <span class="num">{{ run.version }}</span>
+      </template>
       <span class="micro">KIND</span>
       <span>{{ run.kind === 'template' ? '模板下发' : '版本升级' }}</span>
       <span class="micro">STATUS</span>

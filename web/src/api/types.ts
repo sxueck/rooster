@@ -157,6 +157,24 @@ export interface NodeStats {
   /** 旧节点可能不返回该字段 */
   ban_engine?: BanEngineStatus
 }
+export interface NodeNetworkInterface {
+  name: string
+  addresses: string[]
+  state: string
+  mac: string | null
+  rx_bytes: number
+  rx_packets: number
+  rx_errors: number
+  rx_dropped: number
+  tx_bytes: number
+  tx_packets: number
+  tx_errors: number
+  tx_dropped: number
+}
+export interface NodeNetwork {
+  connection_ip: string | null
+  interfaces: NodeNetworkInterface[]
+}
 export type WafMode = 'off' | 'detect' | 'block'
 export interface Site {
   id: string
@@ -325,7 +343,8 @@ export interface RolloutResult {
 }
 export interface RolloutRun {
   id: string
-  template_id: string
+  template_id: string | null
+  version?: string | null
   kind: string
   started_at: number
   status: string

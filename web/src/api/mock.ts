@@ -28,6 +28,7 @@ import {
   type NodeBansResp,
   type AllowlistResp,
   type NodeStats,
+  type NodeNetwork,
   type Site,
   type BanEngineStatus,
   type AllowlistEffectiveEntry,
@@ -943,6 +944,28 @@ route('GET', /^\/nodes\/([^/]+)\/management\/stats$/, (m) => {
   const st = requireOnline(decodeURIComponent(m[1]))
   return { ...st.stats, bans: st.bans.length } satisfies NodeStats
 })
+route('GET', /^\/nodes\/([^/]+)\/management\/network$/, (m) => {
+  requireOnline(decodeURIComponent(m[1]))
+  return {
+    connection_ip: '192.0.2.10',
+    interfaces: [
+      {
+        name: 'eth0',
+        addresses: ['192.0.2.10'],
+        state: 'up',
+        mac: '02:00:00:00:00:10',
+        rx_bytes: 12_345_678,
+        rx_packets: 12_345,
+        rx_errors: 0,
+        rx_dropped: 0,
+        tx_bytes: 8_765_432,
+        tx_packets: 8_765,
+        tx_errors: 0,
+        tx_dropped: 0,
+      },
+    ],
+  } satisfies NodeNetwork
+})
 // 真实 agent：GET /sites 返回裸数组；PUT /sites/{id} 返回 {hash, id}；DELETE 204
 route('GET', /^\/nodes\/([^/]+)\/management\/sites$/, (m) => requireOnline(decodeURIComponent(m[1])).sites)
 route('PUT', /^\/nodes\/([^/]+)\/management\/sites\/([^/]+)$/, (m, opts) => {
@@ -1024,7 +1047,7 @@ route('PUT', /^\/nodes\/([^/]+)\/management\/plugins\/([^/]+)$/, (m, opts) => {
 // 加固:GET 返回稀疏 effective;PUT 校验蜜罐端口与真实监听(转发 + 22)冲突→422
 route('GET', /^\/nodes\/([^/]+)\/management\/hardening$/, (m) => {
   const st = requireOnline(decodeURIComponent(m[1]))
-  return JSON.parse(JSON.stringify(st.hardening)) as HardeningConfig
+  return structuredClone(st.hardening) as HardeningConfig
 })
 route('PUT', /^\/nodes\/([^/]+)\/management\/hardening$/, (m, opts) => {
   const id = decodeURIComponent(m[1])
@@ -1041,7 +1064,7 @@ route('PUT', /^\/nodes\/([^/]+)\/management\/hardening$/, (m, opts) => {
       })
     }
   }
-  const prev = JSON.parse(JSON.stringify(st.hardening)) as HardeningConfig
+  const prev = structuredClone(st.hardening) as HardeningConfig
   const changed = JSON.stringify(body) !== JSON.stringify(prev)
   st.hardening = body
   const confirm = changed
@@ -1175,8 +1198,11 @@ route('POST', /^\/upgrades$/, (_m, opts) => {
 route('POST', /^\/upgrades\/([^/]+)\/rollout$/, (m, opts) => {
   const version = decodeURIComponent(m[1])
   if (!state.upgrades.some((u) => u.version === version)) throw new ApiError(404, '版本不存在')
-  const b = bodyOf<{ selector?: Record<string, string>; batch_size?: number; wait_secs?: number }>(opts)
-  const targets = targetNodes(b.selector ?? {}).filter((n) => n.info.online)
+  const b = bodyOf<{ selector?: Record<string, string>; node_id?: string; batch_size?: number; wait_secs?: number }>(opts)
+  const targets = (b.node_id !== undefined
+    ? state.nodes.filter((n) => n.info.id === b.node_id)
+    : targetNodes(b.selector ?? {})
+  ).filter((n) => n.info.online)
   const runId = startRollout('upgrade', version, targets)
   return { run_id: runId } satisfies RolloutKickResp
 })

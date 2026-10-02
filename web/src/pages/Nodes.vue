@@ -18,6 +18,7 @@ import {
 import { deleteNode, getNodes, putNodeLabels, registerNodeToken } from '../api/client'
 import type { NodeInfo, RegisterTokenResp } from '../api/types'
 import KvEditor from '../components/KvEditor.vue'
+import NodeUpgradeControl from '../components/NodeUpgradeControl.vue'
 import { errMsg, fmtRelative, fmtTime, toDate } from '../utils/format'
 
 const router = useRouter()
@@ -88,9 +89,10 @@ const cols = computed<RColumn[]>(() => [
   {
     title: 'ACTIONS',
     key: 'actions',
-    width: 150,
+    width: 230,
     render: (row) =>
       h('span', { class: 'row-tight' }, [
+        h(NodeUpgradeControl, { nodeId: row.id, online: row.online }),
         h(RButton, { variant: 'link', onClick: () => openLabelDialog([row.id]) }, { default: () => '编辑标签' }),
         h(RButton, { variant: 'link', tone: 'danger', onClick: () => confirmRevoke(row) }, { default: () => '注销' }),
       ]),

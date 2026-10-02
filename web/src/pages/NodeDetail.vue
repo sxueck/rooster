@@ -15,6 +15,7 @@ import EventsTab from '../components/tabs/EventsTab.vue'
 import LayersTab from '../components/tabs/LayersTab.vue'
 import HistoryTab from '../components/tabs/HistoryTab.vue'
 import YamlTab from '../components/tabs/YamlTab.vue'
+import NodeUpgradeControl from '../components/NodeUpgradeControl.vue'
 import { errMsg, fmtRelative } from '../utils/format'
 
 const route = useRoute()
@@ -62,6 +63,7 @@ onMounted(loadNode)
     <template v-else>
       <RPageHeader kicker="CLUSTER · NODE DETAIL" :title="nodeId" sub="节点详情">
         <template #extra>
+          <NodeUpgradeControl v-if="node" :node-id="node.id" :online="node.online" />
           <RButton variant="ghost" size="sm" @click="router.back()">← 返回</RButton>
           <RStatusDot :tone="node?.online ? 'ok' : 'muted'" :pulse="!!node?.online">
             {{ node?.online ? '在线' : '离线' }}

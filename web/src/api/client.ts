@@ -22,6 +22,7 @@ import {
   type NodeBansResp,
   type AllowlistResp,
   type NodeStats,
+  type NodeNetwork,
   type Site,
   type WafReportResp,
   type WafRulesResp,
@@ -246,6 +247,9 @@ export function putAllowlist(id: string, cidrs: string[]): Promise<ConfigWriteRe
 export function getNodeStats(id: string): Promise<NodeStats> {
   return request<NodeStats>(`/nodes/${encodeURIComponent(id)}/management/stats`)
 }
+export function getNodeNetwork(id: string): Promise<NodeNetwork> {
+  return request<NodeNetwork>(`/nodes/${encodeURIComponent(id)}/management/network`)
+}
 export function getSites(id: string): Promise<Site[]> {
   return request<Site[]>(`/nodes/${encodeURIComponent(id)}/management/sites`)
 }
@@ -385,7 +389,7 @@ export function uploadUpgrade(file: File, version: string, signature: string): P
 }
 export function rolloutUpgrade(
   version: string,
-  body: { selector: Record<string, string>; batch_size: number; wait_secs: number },
+  body: { selector: Record<string, string>; node_id?: string; batch_size: number; wait_secs: number },
 ): Promise<RolloutKickResp> {
   return request<RolloutKickResp>(`/upgrades/${encodeURIComponent(version)}/rollout`, {
     method: 'POST',
