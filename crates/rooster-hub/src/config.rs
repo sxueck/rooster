@@ -116,19 +116,40 @@ pub struct PolicyMatch {
 }
 
 impl HubConfig {
-    pub fn hub_base(&self, host: &str) -> Result<String, String> {
-        let scheme = if matches!(self.tls_mode(), HubTlsMode::Static) { "https" } else { "http" };
-        let base = self.public_url.clone().unwrap_or_else(|| format!("{scheme}://{host}"));
-        let uri: axum::http::Uri = base.parse().map_err(|_| "invalid public-url/Host".to_string())?;
-        let authority = uri.authority().ok_or("public-url must include a host")?;
+    /// 注册/安装入口的公开 origin。请求 Host 头优先:调用方用哪个地址访问
+    /// hub,agent 就拨哪个地址;public-url 只在请求不带 Host 时兑底。
+    /// scheme:static TLS 恒 https;plain 模式回环按 http、其余按 https——
+    /// install.sh 本就拒绝非回环的 http 目标,TLS 终结器场景的实际出口
+    /// 几乎总是 https。
+    pub fn hub_base(&self, host: Option<&str>) -> Result<String, String> {
+        let loopback =
+            |authority: &str| matches!(authority.split(':').next(), Some("localhost") | Some("127.0.0.1") | Some("[::1]"));
+        let scheme = |authority: &str| {
+            if matches!(self.tls_mode(), HubTlsMode::Static) {
+                "https"
+            } else if loopback(authority) {
+                "http"
+            } else {
+                "https"
+            }
+        };
+        let base = match host.filter(|h| !h.trim().is_empty()) {
+            Some(host) => format!("{}://{host}", scheme(host)),
+            None => self
+                .public_url
+                .clone()
+                .unwrap_or_else(|| format!("{}://127.0.0.1:9443", scheme("127.0.0.1:9443"))),
+        };
+        let uri: axum::http::Uri = base.parse().map_err(|_| "invalid public Host/public-url".to_string())?;
+        let authority = uri.authority().ok_or("public Host/public-url must include a host")?;
         if !matches!(uri.scheme_str(), Some("http" | "https"))
             || !authority.as_str().bytes().all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
             || uri.path_and_query().is_some_and(|p| p.as_str() != "/")
         {
-            return Err("public-url must be an http(s) origin without credentials, path or query".into());
+            return Err("public origin must be an http(s) host without credentials, path or query".into());
         }
         if uri.scheme_str() == Some("http") && !matches!(authority.host(), "localhost" | "127.0.0.1" | "[::1]") {
-            return Err("public-url must use HTTPS outside loopback".into());
+            return Err("public origin must use HTTPS outside loopback".into());
         }
         Ok(base.trim_end_matches('/').to_string())
     }
@@ -160,7 +181,7 @@ pub fn default_hub_config_template() -> String {
 # tls.mode: static —— Agent 凭客户端证书证明身份(强制 mTLS)。
 listen: 127.0.0.1:9443
 data-dir: /var/lib/rooster-hub
-# public-url: https://hub.example.com:443   # Required behind a TLS terminator
+# public-url: https://hub.example.com:443   # fallback used only when a request carries no Host header
 tls:
   # static: 使用下方 cert/key(对外服务用这个)
   # none:   明文,仅允许 listen 为 127.0.0.1(开发/本机反代终止 TLS)
@@ -189,17 +210,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_origin_overrides_internal_plaintext_and_rejects_shell_inputs() {
+    fn request_host_wins_and_public_url_is_fallback_only() {
         let mut cfg: HubConfig = serde_norway::from_str(&default_hub_config_template()).unwrap();
+        // plain 模式:请求 Host 优先,非回环缺省按 https(TLS 终结器出口)
+        assert_eq!(cfg.hub_base(Some("hub.example:8443")).unwrap(), "https://hub.example:8443");
+        // 回环按 http
+        assert_eq!(cfg.hub_base(Some("127.0.0.1:9443")).unwrap(), "http://127.0.0.1:9443");
+        // static TLS 恒 https
+        cfg.tls.mode = Some(HubTlsMode::Static);
+        assert_eq!(cfg.hub_base(Some("127.0.0.1:9443")).unwrap(), "https://127.0.0.1:9443");
+        cfg.tls.mode = None;
+        // 请求无 Host 时才轮到 public-url;非法值仍然报错
         cfg.public_url = Some("https://hub.example:8443/".into());
-        assert_eq!(cfg.hub_base("127.0.0.1:9443").unwrap(), "https://hub.example:8443");
+        assert_eq!(cfg.hub_base(None).unwrap(), "https://hub.example:8443");
         for invalid in ["http://remote.example:80", "https://hub.example/path", "https://user@hub.example", "https://hub.example?x=1", "https://hub.example/$(id)"] {
             cfg.public_url = Some(invalid.into());
-            assert!(cfg.hub_base("127.0.0.1:9443").is_err(), "{invalid}");
+            assert!(cfg.hub_base(None).is_err(), "{invalid}");
         }
         cfg.public_url = None;
-        assert_eq!(cfg.hub_base("127.0.0.1:9443").unwrap(), "http://127.0.0.1:9443");
-        assert!(cfg.hub_base("bad;host").is_err());
+        assert_eq!(cfg.hub_base(None).unwrap(), "http://127.0.0.1:9443");
+        assert!(cfg.hub_base(Some("bad;host")).is_err());
     }
 
     #[test]

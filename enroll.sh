@@ -27,6 +27,8 @@ case "$HUB" in
   *) fail "hub must use HTTPS (HTTP is allowed only on loopback)";;
 esac
 HUB="${HUB%/}"
+STEPS=2
+[ -z "$CA_SHA256" ] || STEPS=3
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -40,8 +42,10 @@ if [ -n "$CA_SHA256" ]; then
   [ "${#EXPECTED}" = 64 ] || fail "CA SHA-256 fingerprint must have 64 hex digits"
   [ "$PROTO" = '=https' ] || fail "CA fingerprint requires HTTPS"
   # Only public CA bytes may cross an unverified connection, never executable code.
+  echo "[1/$STEPS] fetching and verifying the hub CA certificate ..."
   curl -kfsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 \
-    "$HUB/v0/ca.crt" -o "$WORK/ca.crt"
+    "$HUB/v0/ca.crt" -o "$WORK/ca.crt" \
+    || fail "cannot fetch $HUB/v0/ca.crt (curl exit $?); check the hub address and that it runs static TLS"
   openssl x509 -in "$WORK/ca.crt" -outform DER -out "$WORK/ca.der"
   ACTUAL="$(openssl dgst -sha256 -r "$WORK/ca.der" | awk '{print $1}')"
   [ "$ACTUAL" = "$EXPECTED" ] || fail "hub CA fingerprint mismatch; installer was not downloaded"
@@ -52,13 +56,20 @@ fi
 set -- --hub "$HUB" --token "$TOKEN"
 [ -z "$NAME" ] || set -- "$@" --name "$NAME"
 [ "$ALLOW_UNSIGNED" = 0 ] || set -- "$@" --allow-unsigned
+N=1
+[ -z "$CA_SHA256" ] || N=2
+echo "[$N/$STEPS] fetching the installer from $HUB ..."
 if [ -n "$CA_FILE" ]; then
   [ -f "$CA_FILE" ] || fail "CA file not found"
   curl -fsSL --proto "$PROTO" --proto-redir "$PROTO" --cacert "$CA_FILE" \
-    --connect-timeout 10 --max-time 120 "$HUB/install.sh" -o "$WORK/install.sh"
+    --connect-timeout 10 --max-time 120 "$HUB/install.sh" -o "$WORK/install.sh" \
+    || fail "cannot fetch $HUB/install.sh (curl exit $?); check the hub address and that the hub is current"
   set -- "$@" --ca-file "$CA_FILE"
 else
   curl -fsSL --proto "$PROTO" --proto-redir "$PROTO" --connect-timeout 10 --max-time 120 \
-    "$HUB/install.sh" -o "$WORK/install.sh"
+    "$HUB/install.sh" -o "$WORK/install.sh" \
+    || fail "cannot fetch $HUB/install.sh (curl exit $?); check the hub address and that the hub is current"
 fi
+N=$((N + 1))
+echo "[$N/$STEPS] running the installer (installs the rooster binary and the rooster systemd service) ..."
 sh "$WORK/install.sh" "$@"

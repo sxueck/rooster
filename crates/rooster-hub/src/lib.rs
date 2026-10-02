@@ -5,6 +5,7 @@
 //! 不依赖外部中间件。
 
 pub mod api;
+pub mod compress;
 pub mod config;
 pub mod diff;
 pub mod http;

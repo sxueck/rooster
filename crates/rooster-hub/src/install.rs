@@ -9,6 +9,10 @@ umask 077
 HUB='{hub_base}'
 TOKEN="" NAME="$(hostname)" CA_FILE="" ALLOW_UNSIGNED=0
 BIN_DIR="${ROOSTER_BIN_DIR:-/usr/local/bin}"
+# 引导二进制可压到 ~1/3(37 MiB → 14 MiB),30 分钟上限等价于 ≥8 KB/s 的链路。
+# 低于 FETCH_SPEED_LIMIT 连续 60s 则判死链。两者都可环境变量覆盖。
+FETCH_MAX_TIME="${ROOSTER_FETCH_MAX_TIME:-1800}"
+FETCH_SPEED_LIMIT="${ROOSTER_FETCH_SPEED_LIMIT:-512}"
 CONF_DIR="${ROOSTER_CONF_DIR:-/etc/rooster}"
 DATA_DIR="${ROOSTER_DATA_DIR:-/var/lib/rooster}"
 UNIT_DIR="${ROOSTER_UNIT_DIR:-/etc/systemd/system}"
@@ -45,35 +49,41 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 trap 'exit 1' HUP INT TERM
 fetch() {
+  # 体积优化在 hub 侧:hub 支持时回 gzip(curl 解压后落盘才是签名原文)。
+  # 不断流的死链由限速看门狗提前掉,而不是靠 max-time 切断正常慢链。
   if [ -n "$CA_FILE" ]; then
-    curl -fsSL --proto "$PROTO" --proto-redir "$PROTO" --connect-timeout 10 --max-time 120 --cacert "$CA_FILE" "$@"
+    curl -fsSL --compressed --proto "$PROTO" --proto-redir "$PROTO" --connect-timeout 10 --max-time "$FETCH_MAX_TIME" --speed-limit "$FETCH_SPEED_LIMIT" --speed-time 60 --cacert "$CA_FILE" "$@"
   else
-    curl -fsSL --proto "$PROTO" --proto-redir "$PROTO" --connect-timeout 10 --max-time 120 "$@"
+    curl -fsSL --compressed --proto "$PROTO" --proto-redir "$PROTO" --connect-timeout 10 --max-time "$FETCH_MAX_TIME" --speed-limit "$FETCH_SPEED_LIMIT" --speed-time 60 "$@"
   fi
 }
 # 1) verify all downloads before touching the installed files.
 ARCH="$(uname -m)"
+echo "[1/3] fetching the rooster agent binary ($ARCH) from $HUB ..."
 if fetch -o "$TMP_DIR/rooster.new" "$HUB/v0/downloads/rooster-$ARCH"; then
   SIGNED=1
 elif fetch -o "$TMP_DIR/rooster.new" "$HUB/v0/downloads/rooster"; then
   SIGNED=0
 else
-  fail "no binary available; upload a signed release for $ARCH in the panel"
+  fail "hub serves no binary for $ARCH (both $HUB/v0/downloads/rooster-$ARCH and /v0/downloads/rooster failed); upload a signed release package via the panel, or rerun with --allow-unsigned on a same-arch hub"
 fi
 if [ "$SIGNED" = 1 ]; then
+  echo "      signed release package: fetching signature and verification key"
   fetch -o "$TMP_DIR/rooster.sig" "$HUB/v0/downloads/rooster-$ARCH.sig" || fail "package has no signature"
   fetch -o "$TMP_DIR/rooster.pub" "$HUB/v0/pubkey.pem" || fail "configure upgrade-public-key in hub.yaml, restart the hub, and upload a signed release"
+  echo "      verifying the ed25519 package signature ..."
   # Ed25519 large files require pkeyutl -rawin, not dgst -verify.
   openssl pkeyutl -verify -pubin -inkey "$TMP_DIR/rooster.pub" -rawin \
     -in "$TMP_DIR/rooster.new" -sigfile "$TMP_DIR/rooster.sig" >/dev/null || fail "package signature verification FAILED"
 elif [ "$ALLOW_UNSIGNED" != 1 ]; then
-  fail "configure upgrade-public-key in hub.yaml, restart the hub and upload a signed package for $ARCH; --allow-unsigned is only for explicit same-arch development installs"
+  fail "no signed package for $ARCH, but this hub serves its own unsigned binary; add --allow-unsigned for an explicit same-arch development install, or configure upgrade-public-key in hub.yaml, restart the hub and upload a signed package"
 fi
 chmod 700 "$TMP_DIR/rooster.new"
 "$TMP_DIR/rooster.new" --version >/dev/null 2>&1 || fail "binary is incompatible with this host"
 "$TMP_DIR/rooster.new" agent upgrade-guard --help >/dev/null 2>&1 || fail "binary does not support the systemd upgrade guard"
 
 # 2) back up overwritten artifacts; never delete node data or PKI.
+echo "[2/3] installing binary, config and systemd service (existing files are backed up) ..."
 mkdir -p "$BIN_DIR" "$CONF_DIR" "$DATA_DIR" "$UNIT_DIR"
 BACKUP="$(mktemp -d "$CONF_DIR/install-backup.XXXXXXXX")"
 for file in "$CONF_DIR/config.yaml" "$CONF_DIR/server-ca.crt" "$BIN_DIR/rooster" "$UNIT_DIR/rooster.service"; do
@@ -120,17 +130,45 @@ systemctl daemon-reload
 systemctl enable rooster
 systemctl restart rooster
 
+# Kernel L3/L4 defensive floor (hardening-plan item 5). Report-only by
+# default: the installer never changes sysctls. Pass ROOSTER_SYSCTL_BASELINE=1
+# to persist and apply the baseline via /etc/sysctl.d/99-rooster.conf.
+sysctl_get() { sysctl -n "$1" 2>/dev/null || true; }
+ROOSTER_SYSCTLS='net.ipv4.tcp_syncookies=1
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+net.netfilter.nf_conntrack_max=262144'
+if command -v sysctl >/dev/null 2>&1; then
+  if [ "${ROOSTER_SYSCTL_BASELINE:-0}" = 1 ]; then
+    printf '%s\n' "$ROOSTER_SYSCTLS" > /etc/sysctl.d/99-rooster.conf
+    sysctl -p /etc/sysctl.d/99-rooster.conf >/dev/null 2>&1 || \
+      echo "warning: kernel does not expose some conntrack sysctls; see /etc/sysctl.d/99-rooster.conf"
+    echo "sysctl baseline written to /etc/sysctl.d/99-rooster.conf and applied"
+  else
+    printf '%s\n' "$ROOSTER_SYSCTLS" | while IFS='=' read -r k want; do
+      cur="$(sysctl_get "$k")"
+      [ -z "$cur" ] && continue
+      [ "$cur" = "$want" ] || echo "note: sysctl $k=$cur (baseline recommends $want); opt in with ROOSTER_SYSCTL_BASELINE=1"
+    done
+  fi
+fi
+
 # A live local API alone does not prove registration or the control channel is ready.
+echo "[3/3] starting rooster and waiting for the hub connection (up to 60s) ..."
 i=0
 while [ "$i" -lt 60 ]; do
+  printf '.'
   if systemctl is-active --quiet rooster && \
     [ "$(curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 -H "Authorization: Bearer $SECRET" http://127.0.0.1:9870/v0/management/readyz 2>/dev/null || true)" = ok ]; then
+    echo ''
     echo "rooster agent installed and connected (node-name: $NAME); overwritten files backed up in $BACKUP"
     exit 0
   fi
   i=$((i + 1))
   sleep 1
 done
+echo ''
 fail "agent did not connect to the hub; inspect journalctl -u rooster -n 50; backups: $BACKUP"
 "#
     .replace("{hub_base}", &hub_base.replace('\'', "'\\''"))
@@ -156,6 +194,21 @@ mod tests {
         assert!(s.contains("[ \"$ALLOW_UNSIGNED\" != 1 ]"));
         assert!(s.contains("systemctl restart rooster"));
         assert!(s.contains("/v0/management/readyz"));
+    }
+
+    /// 二进制下载走 gzip + 看门狗超时:签掉旧的硬 120s 上限就会重新引入 curl(28)。
+    #[test]
+    fn binary_fetch_is_encoding_negotiated_and_stall_guarded() {
+        let s = super::script("https://hub.example:9443");
+        assert!(s.contains("--compressed"), "fetch must accept hub-side gzip");
+        assert!(!s.contains("--max-time 120"), "hard 120s cap cut slow links");
+        assert!(s.contains("--speed-limit \"$FETCH_SPEED_LIMIT\""));
+        assert!(s.contains("ROOSTER_FETCH_MAX_TIME:-1800"));
+        // 两个变量必须在 fetch() 之前定义,且两处 curl 分支都带上。
+        let fetch = s.find("fetch() {").unwrap();
+        assert!(s.find("FETCH_MAX_TIME=").unwrap() < fetch);
+        assert_eq!(s.matches("--compressed").count(), 2);
+        assert_eq!(s.matches("--speed-time 60").count(), 2);
     }
 
     #[test]

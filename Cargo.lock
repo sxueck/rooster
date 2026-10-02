@@ -2445,6 +2445,7 @@ dependencies = [
  "base64 0.22.1",
  "bcrypt",
  "ed25519-dalek",
+ "flate2",
  "futures-util",
  "humantime-serde",
  "hyper",

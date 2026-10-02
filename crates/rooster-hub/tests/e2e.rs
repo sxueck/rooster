@@ -49,7 +49,7 @@ async fn start_hub_with_tls(
     upgrade_public_key: Option<String>,
     tls: rooster_hub::config::HubTls,
 ) -> HubServer {
-    start_hub_with_origin(tag, upgrade_public_key, tls, None).await
+    start_hub_with_origin(tag, upgrade_public_key, tls, None, vec![]).await
 }
 
 async fn start_hub_with_origin(
@@ -57,6 +57,7 @@ async fn start_hub_with_origin(
     upgrade_public_key: Option<String>,
     tls: rooster_hub::config::HubTls,
     public_url: Option<String>,
+    cors_allowed_origins: Vec<String>,
 ) -> HubServer {
     let dir = std::env::temp_dir().join(format!("rooster-hub-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -68,7 +69,7 @@ async fn start_hub_with_origin(
         public_url,
         tls,
         secret_key: Some(bcrypt::hash("hub-secret", 4).unwrap()),
-        cors_allowed_origins: vec![],
+        cors_allowed_origins,
         session_ttl: Some(Duration::from_secs(3600)),
         panel_dir: dir.join("no-panel"),
         auto_confirm_delay_secs: 1,
@@ -542,18 +543,20 @@ async fn registration_token_cannot_hijack_existing_node() {
 /// 安装脚本的下载必须能匿名完成(此前带鉴权 → 401 → 新机器装不起来),
 /// 而 WASM 仓库/版本包仍不得匿名开放。
 #[tokio::test]
-async fn enrollment_uses_public_https_origin_and_verified_ca_fingerprint() {
+async fn enrollment_uses_request_host_origin_and_verified_ca_fingerprint() {
     use sha2::{Digest, Sha256};
     let cert = rcgen::generate_simple_self_signed(vec!["hub.example".into()]).unwrap().cert;
     let dir = std::env::temp_dir().join(format!("rooster-enrollment-ca-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let ca = dir.join("ca.crt");
     std::fs::write(&ca, cert.pem()).unwrap();
+    // public-url 只是兑底:请求 Host 不同时必须赢过它
     let hub = start_hub_with_origin("public-origin", None, rooster_hub::config::HubTls {
         ca: Some(ca), ..Default::default()
-    }, Some("https://hub.example:8443".into())).await;
+    }, Some("https://fallback.example:8443".into()), vec![]).await;
     let token = login(&hub).await;
     let resp = client().post(format!("{}/v0/nodes/register-tokens", hub.base))
+        .header("host", "hub.example:8443")
         .bearer_auth(token).json(&serde_json::json!({})).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
@@ -564,7 +567,7 @@ async fn enrollment_uses_public_https_origin_and_verified_ca_fingerprint() {
     assert!(cmd.contains("--hub https://hub.example:8443"));
     assert!(cmd.contains(&format!("--ca-sha256 {expected}")));
     assert!(!cmd.contains("--insecure"));
-    let installer = client().get(format!("{}/install.sh", hub.base)).send().await.unwrap().text().await.unwrap();
+    let installer = client().get(format!("{}/install.sh", hub.base)).header("host", "hub.example:8443").send().await.unwrap().text().await.unwrap();
     assert!(installer.contains("HUB='https://hub.example:8443'"));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -787,6 +790,248 @@ async fn install_artifacts_verify_with_openssl() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 传输层 gzip:线上字节必须明显变小,但解压后逐字节等于原文 —— Ed25519
+/// 签名始终针对原文,所以任何一侧不一致都会直接砸在验签上。
+#[tokio::test]
+async fn bootstrap_package_gzip_round_trips_without_touching_signature_semantics() {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let sk = SigningKey::generate(&mut rand::rng());
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let hub = start_hub_with_key(
+        "gzip",
+        Some(format!("ed25519:{}", b64.encode(sk.verifying_key().to_bytes()))),
+    )
+    .await;
+
+    // 类似 ELF 符号表的中等可压正文(必须跨过 64 KiB 阈值)。
+    let mut binary = Vec::new();
+    for i in 0..4000 {
+        binary.extend_from_slice(format!("rooster-agent::upgrade::handle::{i}\0").as_bytes());
+    }
+    let raw_sig = sk.sign(&binary);
+    let resp = client()
+        .post(format!("{}/v0/upgrades", hub.base))
+        .bearer_auth(login(&hub).await)
+        .header("x-rooster-version", "0.9.0-x86_64")
+        .header("x-rooster-signature", b64.encode(raw_sig.to_bytes()))
+        .body(binary.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload rejected: {:?}", resp.text().await.ok());
+
+    let url = format!("{}/v0/downloads/rooster-x86_64", hub.base);
+    // 不自动解压的客户端:能看到线上编码本身。
+    let raw = reqwest::Client::builder()
+        .no_proxy()
+        .gzip(false)
+        .build()
+        .unwrap();
+
+    // 1) 未声明 gzip → 原文(老 agent / 老 install.sh 行为不变)。
+    let resp = raw
+        .get(&url)
+        .header("accept-encoding", "identity")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "identity must get raw bytes"
+    );
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), &binary[..]);
+
+    // 2) 声明 gzip → 编码上变小,解压后逐字节还原且原文签名仍成立。
+    let resp = raw
+        .get(&url)
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(resp.headers().get("vary").unwrap(), "Accept-Encoding");
+    let wire = resp.bytes().await.unwrap();
+    assert!(
+        wire.len() * 3 < binary.len(),
+        "gzip wire {} vs raw {}",
+        wire.len(),
+        binary.len()
+    );
+    let mut decoded = Vec::new();
+    GzDecoder::new(&wire[..]).read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, binary, "解压结果必须是签名时的那份原文");
+    sk.verifying_key()
+        .verify_strict(&decoded, &raw_sig)
+        .expect("decompressed body must verify against the raw-byte signature");
+
+    // 3) reqwest 开了 gzip feature 的默认客户端(agent 自升级通道):透明解压。
+    let auto = client().get(&url).send().await.unwrap();
+    assert_eq!(auto.bytes().await.unwrap().as_ref(), &binary[..]);
+
+    // 4) `.sig` 仍是裸 64 字节签名,不参与压缩。
+    let resp = raw
+        .get(format!("{url}.sig"))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.headers().get("content-encoding").is_none(), "signature must stay raw");
+    assert_eq!(resp.bytes().await.unwrap().len(), 64);
+}
+
+/// CORS 层只能在 Vary 上追加 origin,不能覆盖 Accept-Encoding:跨域面板
+/// 的下载 URL 同时存在 gzip 与原文两种表示,任一响应丢了 Vary,共享缓存
+/// 就会把错误的表示发给另一类客户端。
+#[tokio::test]
+async fn cors_download_keeps_vary_for_both_gzip_and_plain_representations() {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let sk = SigningKey::generate(&mut rand::rng());
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let hub = start_hub_with_origin(
+        "cors-vary",
+        Some(format!("ed25519:{}", b64.encode(sk.verifying_key().to_bytes()))),
+        rooster_hub::config::HubTls::default(),
+        None,
+        vec!["https://panel.example".into()],
+    )
+    .await;
+
+    let mut binary = Vec::new();
+    for i in 0..4000 {
+        binary.extend_from_slice(format!("rooster-cors::vary::{i}\0").as_bytes());
+    }
+    assert!(binary.len() > 64 * 1024, "must cross the compression threshold");
+    let resp = client()
+        .post(format!("{}/v0/upgrades", hub.base))
+        .bearer_auth(login(&hub).await)
+        .header("x-rooster-version", "0.9.1-x86_64")
+        .header("x-rooster-signature", b64.encode(sk.sign(&binary).to_bytes()))
+        .body(binary.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload rejected: {:?}", resp.text().await.ok());
+
+    let raw = reqwest::Client::builder().no_proxy().gzip(false).build().unwrap();
+    let url = format!("{}/v0/downloads/rooster-x86_64", hub.base);
+    let vary_has = |resp: &reqwest::Response, token: &str| {
+        resp.headers()
+            .get("vary")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+            .unwrap_or(false)
+    };
+
+    // 原文表示(未声明 gzip):ACAO 放行 + Vary 同时声明 origin 与 Accept-Encoding。
+    let plain = raw
+        .get(&url)
+        .header("origin", "https://panel.example")
+        .header("accept-encoding", "identity")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(plain.status(), 200);
+    assert_eq!(
+        plain.headers().get("access-control-allow-origin").unwrap(),
+        "https://panel.example"
+    );
+    assert!(plain.headers().get("content-encoding").is_none(), "identity must get raw bytes");
+    assert!(vary_has(&plain, "origin"), "vary: {:?}", plain.headers().get("vary"));
+    assert!(vary_has(&plain, "accept-encoding"), "vary: {:?}", plain.headers().get("vary"));
+    assert_eq!(plain.bytes().await.unwrap().as_ref(), &binary[..]);
+
+    // gzip 表示:CORS 的 origin 追加不能把 Accept-Encoding 抹掉。
+    let gz = raw
+        .get(&url)
+        .header("origin", "https://panel.example")
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gz.status(), 200);
+    assert_eq!(gz.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(
+        gz.headers().get("access-control-allow-origin").unwrap(),
+        "https://panel.example"
+    );
+    assert!(vary_has(&gz, "origin"), "vary: {:?}", gz.headers().get("vary"));
+    assert!(vary_has(&gz, "accept-encoding"), "vary: {:?}", gz.headers().get("vary"));
+    assert!(gz.bytes().await.unwrap().len() * 3 < binary.len());
+}
+
+/// 冷缓存风暴:同一正文的多个并发匿名下载必须全部成功、拿到同一 gzip 块、
+/// 且解压后逐字节等于原文(压缩去重不能改变签名针对原文的字节语义)。
+#[tokio::test]
+async fn concurrent_cold_cache_downloads_share_one_gzip_block() {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let sk = SigningKey::generate(&mut rand::rng());
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let hub = start_hub_with_key(
+        "cold-storm",
+        Some(format!("ed25519:{}", b64.encode(sk.verifying_key().to_bytes()))),
+    )
+    .await;
+
+    let mut binary = Vec::new();
+    for i in 0..4000 {
+        binary.extend_from_slice(format!("rooster-storm::cold::{i}\0").as_bytes());
+    }
+    let raw_sig = sk.sign(&binary);
+    let resp = client()
+        .post(format!("{}/v0/upgrades", hub.base))
+        .bearer_auth(login(&hub).await)
+        .header("x-rooster-version", "0.9.2-x86_64")
+        .header("x-rooster-signature", b64.encode(raw_sig.to_bytes()))
+        .body(binary.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "upload rejected: {:?}", resp.text().await.ok());
+
+    let url = format!("{}/v0/downloads/rooster-x86_64", hub.base);
+    let mut jobs = Vec::new();
+    for _ in 0..8 {
+        let raw = reqwest::Client::builder().no_proxy().gzip(false).build().unwrap();
+        let url = url.clone();
+        jobs.push(tokio::spawn(async move {
+            let resp = raw
+                .get(&url)
+                .header("accept-encoding", "gzip")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            assert_eq!(resp.headers().get("content-encoding").unwrap(), "gzip");
+            resp.bytes().await.unwrap().to_vec()
+        }));
+    }
+    let mut wires = Vec::new();
+    for j in jobs {
+        wires.push(j.await.unwrap());
+    }
+    assert!(
+        wires.iter().all(|w| *w == wires[0]),
+        "同一正文的所有并发请求必须拿到同一 gzip 块: {:?}",
+        wires.iter().map(|w| w.len()).collect::<Vec<_>>()
+    );
+    let mut decoded = Vec::new();
+    GzDecoder::new(&wires[0][..]).read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, binary, "解压结果必须是签名时的那份原文");
+    sk.verifying_key()
+        .verify_strict(&decoded, &raw_sig)
+        .expect("decompressed body must verify against the raw-byte signature");
+}
+
 /// agent 二进制链接了 wasmtime,体积远超 axum 默认 2MiB 请求体上限;
 /// 上传路由必须单独放宽,否则真实发布包一律 413。
 #[tokio::test]
@@ -819,13 +1064,22 @@ async fn upgrade_upload_accepts_multi_megabyte_package() {
     );
 
     // 放宽只在上传路由:其他路由仍受默认上限约束(未鉴权也不能灌大 body)。
-    let resp = client()
-        .post(format!("{}/v0/auth/login", hub.base))
-        .header("content-type", "application/json")
-        .body(vec![b'x'; 4 * 1024 * 1024])
-        .send()
-        .await
-        .unwrap();
+    // An early 413 can close the socket before reqwest finishes sending the body.
+    let mut attempts = 0;
+    let resp = loop {
+        attempts += 1;
+        match client()
+            .post(format!("{}/v0/auth/login", hub.base))
+            .header("content-type", "application/json")
+            .body(vec![b'x'; 4 * 1024 * 1024])
+            .send()
+            .await
+        {
+            Ok(r) => break r,
+            Err(e) if e.is_request() && attempts < 2 => continue,
+            Err(e) => panic!("oversized login request failed unexpectedly: {e}"),
+        }
+    };
     assert_eq!(resp.status(), 413, "non-upload routes must keep the default body limit");
 }
 

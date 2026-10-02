@@ -67,7 +67,14 @@ docker(){
 curl(){
   printf '%s\n' "$*" >> "$COMMAND_LOG"
   [ "${FAIL_COMPOSE_DOWNLOAD:-}" != yes ] || return 22
-  local url="$2" output="$4"
+  local url="" output=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -o) output="$2"; shift 2;;
+      https://*|http://*) url="$1"; shift;;
+      *) shift;;
+    esac
+  done
   cp "$COMPOSE_ROOT/${url##*/}" "$output"
 }
 wait_hub(){ printf 'PROBE <%s> <%s> <%s> <%s>\n' "$@"; }

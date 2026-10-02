@@ -11,6 +11,7 @@ axum.workspace = true
 base64 = "0.22"
 bcrypt.workspace = true
 ed25519-dalek.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 humantime-serde.workspace = true
 hyper.workspace = true
@@ -35,6 +36,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 bcrypt.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 rcgen.workspace = true
 reqwest.workspace = true

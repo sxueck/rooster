@@ -204,7 +204,31 @@ fn apply_cors(h: &mut header::HeaderMap, origin: Option<&str>) {
             "authorization, content-type, if-match, x-rooster-version, x-rooster-signature, x-rooster-name",
         ),
     );
-    h.insert(header::VARY, header::HeaderValue::from_static("origin"));
+    merge_vary_origin(h);
+}
+
+/// Vary 只能合并不能覆盖:下载响应已带 `Vary: Accept-Encoding`,直接
+/// insert `origin` 会把它抹掉,共享缓存就会把 gzip 表示发给声明了 identity
+/// 的客户端(或反之)。取首条 Vary 行合并即可 —— 本服务所有响应都只有单条。
+fn merge_vary_origin(h: &mut header::HeaderMap) {
+    let existing = h
+        .get(header::VARY)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let merged = if existing.trim().is_empty() {
+        "origin".to_owned()
+    } else if existing
+        .split(',')
+        .any(|t| t.trim().eq_ignore_ascii_case("origin"))
+    {
+        existing
+    } else {
+        format!("{existing}, origin")
+    };
+    if let Ok(v) = header::HeaderValue::from_str(&merged) {
+        h.insert(header::VARY, v);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -368,11 +392,7 @@ async fn create_register_token(
     ConnectInfo(_): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1:9443");
-    let base = match state.cfg.hub_base(host) {
+    let base = match state.cfg.hub_base(request_host(&headers)) {
         Ok(base) => base,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
@@ -1212,6 +1232,7 @@ async fn rollout_upgrade(
 
 // ---------------------------------------------------------------------------
 // 下载(升级包 / sig / wasm):Bearer 会话或 HMAC 签名 URL
+// 大正文可按 Accept-Encoding 走 gzip:签名与入库字节仍是原文,压缩只在传输层。
 
 async fn download(
     State(state): State<Arc<HubState>>,
@@ -1247,18 +1268,11 @@ async fn download(
         )
             .into_response();
     }
+    let gzip = crate::compress::accepts_gzip(&headers);
 
     if let Some(name) = rest.strip_prefix("wasm/") {
         return match state.store.get_wasm(name) {
-            Ok(Some(bytes)) => (
-                StatusCode::OK,
-                [(
-                    header::CONTENT_TYPE,
-                    header::HeaderValue::from_static("application/wasm"),
-                )],
-                bytes,
-            )
-                .into_response(),
+            Ok(Some(bytes)) => crate::compress::encode(bytes, "application/wasm", gzip).await,
             _ => (StatusCode::NOT_FOUND, "not found").into_response(),
         };
     }
@@ -1296,20 +1310,10 @@ async fn download(
         };
     }
     match state.store.get_upgrade(&lookup) {
-        Ok(Some(bytes)) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, header::HeaderValue::from_static("application/octet-stream"))],
-            bytes,
-        )
-            .into_response(),
+        Ok(Some(bytes)) => crate::compress::encode(bytes, "application/octet-stream", gzip).await,
         // 同架构兜底:hub 自身的可执行文件(未签名,需 --allow-unsigned)。
         Ok(None) if lookup == "rooster" => match hub_self_binary() {
-            Some(bytes) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, header::HeaderValue::from_static("application/octet-stream"))],
-                bytes,
-            )
-                .into_response(),
+            Some(bytes) => crate::compress::encode(bytes, "application/octet-stream", gzip).await,
             None => (StatusCode::NOT_FOUND, "hub executable not readable").into_response(),
         },
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -1500,12 +1504,13 @@ fn ca_fingerprint(path: &std::path::Path) -> Result<String, String> {
     Ok(Sha256::digest(cert.as_ref()).iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// 注册/安装入口从请求取 Host:调用方用哪个地址访问 hub,agent 就拨哪个地址。
+fn request_host(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::HOST).and_then(|v| v.to_str().ok())
+}
+
 async fn install_script(State(state): State<Arc<HubState>>, headers: HeaderMap) -> Response {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("127.0.0.1:9443");
-    let base = match state.cfg.hub_base(host) {
+    let base = match state.cfg.hub_base(request_host(&headers)) {
         Ok(base) => base,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
@@ -1558,6 +1563,36 @@ mod tests {
         }
         assert_eq!(uniq.len(), ids.len(), "same-second run ids must be pairwise distinct");
         assert!(new_run_id("u").starts_with('u'));
+    }
+
+    #[test]
+    fn cors_merges_vary_instead_of_overwriting_it() {
+        let mut h = header::HeaderMap::new();
+        h.insert(header::VARY, header::HeaderValue::from_static("Accept-Encoding"));
+        apply_cors(&mut h, Some("https://panel.example"));
+        let tokens: Vec<String> = h
+            .get(header::VARY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(',')
+            .map(|t| t.trim().to_ascii_lowercase())
+            .collect();
+        assert!(tokens.iter().any(|t| t == "origin"), "Vary: {:?}", tokens);
+        assert!(tokens.iter().any(|t| t == "accept-encoding"), "Vary: {:?}", tokens);
+        assert_eq!(
+            h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://panel.example"
+        );
+
+        // 无既有 Vary → 只写 origin;已有 origin → 不重复追加。
+        let mut h = header::HeaderMap::new();
+        apply_cors(&mut h, None);
+        assert_eq!(h.get(header::VARY).unwrap(), "origin");
+        let mut h = header::HeaderMap::new();
+        h.insert(header::VARY, header::HeaderValue::from_static("origin"));
+        apply_cors(&mut h, None);
+        assert_eq!(h.get(header::VARY).unwrap(), "origin");
     }
 
     #[test]
