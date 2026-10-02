@@ -141,6 +141,24 @@ gen_tls() (
   openssl verify -CAfile "$dir/ca.crt" "$dir/hub.crt" >/dev/null
 )
 
+# gen_release_key DIR -> prints the `ed25519:<base64>` upgrade public key.
+# Writes release-ed25519.key (0600, kept next to hub.yaml) for offline
+# package signing. Whoever holds this key can push binaries to every agent,
+# so it must stay on the operator machine — never in git or on the hub's
+# panel-visible surface.
+gen_release_key() (
+  umask 077
+  local dir="$1" raw
+  # 不能与 dir 同行声明:set -u 下同一 local 语句的展开先于赋值
+  local key="$dir/release-ed25519.key"
+  [ -f "$key" ] || openssl genpkey -algorithm ed25519 -out "$key" 2>/dev/null
+  chmod 600 "$key"
+  # raw 32-byte public key: DER drops the fixed 12-byte SPKI prefix
+  raw="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w0)"
+  [ -n "$raw" ] || die "release keypair generation failed"
+  printf 'ed25519:%s' "$raw"
+)
+
 certificate_host() {
   openssl x509 -in "$1" -noout -ext subjectAltName |
     awk -F ',[[:space:]]*' '/DNS:|IP Address:/ {for (i=1; i<=NF; i++) {
@@ -152,7 +170,7 @@ certificate_host() {
 
 write_hub_config() {
   local file="$1" secret="$2" mode="${3:-static}" port="${4:-9443}"
-  local panel="${5:-web/dist}" ca="${6:-yes}" public="${7:-}" s
+  local panel="${5:-web/dist}" ca="${6:-yes}" public="${7:-}" upgrade_pub="${8:-}" s
   # YAML double-quoted style: escape backslash and quote (printf, not heredoc,
   # so the secret never undergoes shell expansion)
   s=${secret//\\/\\\\}; s=${s//\"/\\\"}
@@ -185,6 +203,7 @@ write_hub_config() {
     printf 'panel-dir: %s\n' "$panel"
     printf '%s\n' 'auto-confirm-delay-secs: 10'
     printf '%s\n' 'audit-retention: 180d'
+    [ -z "$upgrade_pub" ] || printf 'upgrade-public-key: "%s"\n' "$upgrade_pub"
   } > "$file"
   chmod 600 "$file"
 }
@@ -338,7 +357,9 @@ deploy_hub_docker() (
   [ "$hubmode" != plain ] || publicport="$pubport"
   local cfg_mode="$hubmode"
   [ "$hubmode" = "plain" ] && cfg_mode="plain-docker"
-  write_hub_config "$stage/hub.yaml" "$secret" "$cfg_mode" "$bindport" web/dist "$ca_config" "https://$publichost:$publicport"
+  local rel_pub
+  rel_pub="$(gen_release_key "$stage")"
+  write_hub_config "$stage/hub.yaml" "$secret" "$cfg_mode" "$bindport" web/dist "$ca_config" "https://$publichost:$publicport" "$rel_pub"
   fi
   tlsdir="$stage/tls"
   [ ! -f "$tlsdir/ca.crt" ] || ca="$tlsdir/ca.crt"
@@ -363,8 +384,17 @@ deploy_hub_docker() (
     install -m600 "$stage/hub.yaml" "$dir/.hub.yaml.new"
     mv -f "$dir/.hub.yaml.new" "$dir/hub.yaml"
     cp -a "$stage/tls" "$dir/"
+    install -m600 "$stage/release-ed25519.key" "$dir/release-ed25519.key"
     save_password "$dir/.env.passwd" "$secret"
     say "  password: $dir/.env.passwd (keep private)"
+  else
+    # pre-keyed installs keep their existing release keypair; older
+    # deployments upgrade in place by appending the line once
+    if ! grep -q '^upgrade-public-key:' "$dir/hub.yaml"; then
+      local rel_pub
+      rel_pub="$(gen_release_key "$dir")"
+      printf 'upgrade-public-key: "%s"\n' "$rel_pub" >> "$dir/hub.yaml"
+    fi
   fi
   tlsdir="$dir/tls"; ca=""
   [ ! -f "$tlsdir/ca.crt" ] || ca="$tlsdir/ca.crt"
@@ -413,7 +443,9 @@ deploy_hub_docker() (
     [ "$selfsigned" = "yes" ] && say "  ${DIM}self-signed CA: use the panel's fingerprint-verified enrollment command.${N}"
     join_hint "$host" "$port" "$selfsigned"
   fi
-  say "  ${DIM}Signed agent installs: configure upgrade-public-key in hub.yaml, restart the hub, then upload a signed rooster-VERSION-ARCH package in the panel. Never use --allow-unsigned implicitly.${N}"
+  say "  ${DIM}Release keypair: $dir/release-ed25519.key (keep private, offline). Sign packages with:${N}"
+  say "  ${DIM}  openssl pkeyutl -sign -inkey $dir/release-ed25519.key -rawin -in rooster-VERSION-ARCH -out sig.raw${N}"
+  say "  ${DIM}then upload package + base64 signature in the panel. Never use --allow-unsigned implicitly.${N}"
 )
 
 # ---------------- hub: source + systemd ----------------
@@ -483,7 +515,9 @@ deploy_hub_native() (
   local publichost="$host" publicport="$port" backup
   [[ "$publichost" != *:* ]] || publichost="[$publichost]"
   [ "$hubmode" != plain ] || publicport="$pubport"
-  write_hub_config "$work/hub.yaml" "$secret" "$hubmode" "$port" /usr/share/rooster/web/dist "$ca_config" "https://$publichost:$publicport"
+  local rel_pub
+  rel_pub="$(gen_release_key "$work")"
+  write_hub_config "$work/hub.yaml" "$secret" "$hubmode" "$port" /usr/share/rooster/web/dist "$ca_config" "https://$publichost:$publicport" "$rel_pub"
   step "installing binary, panel and systemd service (existing files backed up)"
   as_root mkdir -p "$dir"
   backup="$(as_root mktemp -d "$dir/install-backup.XXXXXXXX")"
@@ -501,10 +535,16 @@ deploy_hub_native() (
     as_root install -m600 "$work/hub.yaml" "$dir/hub.yaml"
     save_password "$work/.env.passwd" "$secret"
     as_root install -m600 "$work/.env.passwd" "$dir/.env.passwd"
+    as_root install -m600 "$work/release-ed25519.key" "$dir/release-ed25519.key"
     say "  password: $dir/.env.passwd (keep private)"
   else
     as_root cp "$dir/hub.yaml" "$work/hub.yaml"
     as_root chown "$(id -u)" "$work/hub.yaml"
+    if ! as_root grep -q '^upgrade-public-key:' "$dir/hub.yaml"; then
+      local rel_pub
+      rel_pub="$(gen_release_key "$work")"
+      printf 'upgrade-public-key: "%s"\n' "$rel_pub" | as_root tee -a "$dir/hub.yaml" >/dev/null
+    fi
     hubmode=static
     grep -Eq '^[[:space:]]*mode:[[:space:]]*none' "$work/hub.yaml" && hubmode=plain
     port="$(awk '/^listen:/ {n=split($2,a,":"); print a[n]}' "$work/hub.yaml")"
@@ -534,7 +574,8 @@ EOF
   as_root systemctl daemon-reload
   as_root systemctl enable rooster-hub
   as_root systemctl restart rooster-hub
-  say "${DIM}Signed agent installs require upgrade-public-key in hub.yaml and a signed architecture package uploaded through the panel.${N}"
+  say "${DIM}Release keypair: $dir/release-ed25519.key (keep private, offline); upgrade-public-key is in hub.yaml. Sign with${N}"
+  say "${DIM}openssl pkeyutl -sign -inkey $dir/release-ed25519.key -rawin, then upload in the panel.${N}"
 
   wait_hub "$port" "$hubmode" "$host" "$ca"
 
