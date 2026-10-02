@@ -235,6 +235,12 @@ pub struct ForwardRuntime {
     inner: Arc<RuntimeInner>,
 }
 
+impl Default for ForwardRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ForwardRuntime {
     pub fn new() -> Self {
         Self {

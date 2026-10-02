@@ -174,7 +174,7 @@ async fn tcp_basic() {
     assert_eq!(echoed, b"hello rooster", "payload must round-trip");
     // 等待规则计数赶上(连接任务退出后 conns_active 归零)。
     wait_until("stats drained", || {
-        stat_for(&rt, "t1").map_or(false, |s| {
+        stat_for(&rt, "t1").is_some_and(|s| {
             s.listening && s.conns_total == 1 && s.conns_active == 0 && s.bytes_in > 0 && s.bytes_out > 0
         })
     })
@@ -203,7 +203,7 @@ async fn proxy_v1_sent() {
             assert!(buf.len() <= 108, "v1 header longer than 108 bytes");
         }
         let line = String::from_utf8(buf.clone()).expect("ascii header");
-        let toks: Vec<&str> = line.trim_end().split_whitespace().collect();
+        let toks: Vec<&str> = line.split_whitespace().collect();
         assert_eq!(toks.len(), 6, "v1 header must have 6 fields: {line:?}");
         assert_eq!(toks[0], "PROXY");
         assert_eq!(toks[1], "TCP4");
@@ -343,7 +343,7 @@ async fn acl_deny() {
         Err(_) => panic!("denied conn must close quickly, still open after 2s"),
     }
     wait_until("no counters for denied conn", || {
-        stat_for(&rt, "a2").map_or(false, |s| s.conns_total == 0 && s.conns_active == 0)
+        stat_for(&rt, "a2").is_some_and(|s| s.conns_total == 0 && s.conns_active == 0)
     })
     .await;
 }
@@ -490,7 +490,7 @@ async fn udp_roundtrip() {
     assert_eq!(from, fwd, "reply must come from the forward listen addr");
 
     wait_until("udp stats", || {
-        stat_for(&rt, "u1").map_or(false, |s| {
+        stat_for(&rt, "u1").is_some_and(|s| {
             s.udp_sessions >= 1 && s.conns_total >= 1 && s.bytes_in > 0 && s.bytes_out > 0
         })
     })
@@ -520,7 +520,7 @@ async fn udp_idle_reap() {
     assert_eq!(&buf[..n], b"once");
 
     wait_until("udp session reaped after idle", || {
-        stat_for(&rt, "u2").map_or(false, |s| s.udp_sessions == 0)
+        stat_for(&rt, "u2").is_some_and(|s| s.udp_sessions == 0)
     })
     .await;
 }
@@ -554,7 +554,7 @@ async fn conn_rate_limit() {
         Err(_) => panic!("rate-limited conn must be dropped quickly"),
     }
     wait_until("third conn not counted", || {
-        stat_for(&rt, "c1").map_or(false, |s| s.conns_total == 2 && s.conns_active == 0)
+        stat_for(&rt, "c1").is_some_and(|s| s.conns_total == 2 && s.conns_active == 0)
     })
     .await;
 }
@@ -599,7 +599,7 @@ async fn tcp_udp_merged_and_shutdown() {
 
     // 合并统计:TCP 并发与 UDP 会话分别计数,字节数两侧都在涨。
     wait_until("merged stats", || {
-        stat_for(&rt, "x1").map_or(false, |s| {
+        stat_for(&rt, "x1").is_some_and(|s| {
             s.conns_active >= 1 && s.udp_sessions >= 1 && s.bytes_in > 0 && s.bytes_out > 0
         })
     })
@@ -724,7 +724,7 @@ async fn l4_accept_plugin_denies_peer_on_forward_path_b6() {
 
     // 只有放行连接计数并到达上游;被拒连接不计数、不留数据。
     wait_until("denied conn not counted", || {
-        stat_for(&rt, "w6").map_or(false, |s| s.conns_total == 1 && s.conns_active == 0)
+        stat_for(&rt, "w6").is_some_and(|s| s.conns_total == 1 && s.conns_active == 0)
     })
     .await;
     assert_eq!(

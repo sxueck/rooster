@@ -10,7 +10,6 @@ use rooster_nft::{BanEntry, BanManager, BanScope, NftError};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 const SECRET: &str = "it-password";
 

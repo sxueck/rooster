@@ -181,6 +181,12 @@ fn parse_memory_limit(s: Option<&str>) -> usize {
     .unwrap_or(DEFAULT_MEMORY_BYTES)
 }
 
+impl Default for WasmRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WasmRuntime {
     pub fn new() -> Self {
         let mut cfg = wasmtime::Config::new();
@@ -498,14 +504,14 @@ fn run_hook(plugin: &mut LoadedPlugin, hook: &str) -> (i32, Vec<String>) {
     plugin.store.set_epoch_deadline(plugin.timeout_ms);
     match call_hook(plugin, hook) {
         Ok(code) => {
-            let events = plugin.store.data_mut().req.events.drain(..).collect();
+            let events = std::mem::take(&mut plugin.store.data_mut().req.events);
             (code, events)
         }
         Err(e) => {
             // panic/超时:按配置 fail-open / fail-closed。
             tracing::warn!(plugin = %plugin.spec.id, hook, error = e, "wasm hook failed");
             let code = if plugin.on_error_fail_closed { 1 } else { 0 };
-            let events = plugin.store.data_mut().req.events.drain(..).collect();
+            let events = std::mem::take(&mut plugin.store.data_mut().req.events);
             (code, events)
         }
     }

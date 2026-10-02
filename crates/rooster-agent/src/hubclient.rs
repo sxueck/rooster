@@ -555,7 +555,7 @@ where
     let Some(outbox) = state.hub_outbox.lock().unwrap().clone() else {
         return;
     };
-    let last_acked = state.outbox_acked.lock().unwrap().clone();
+    let last_acked = *state.outbox_acked.lock().unwrap();
     let pending = match outbox.pending(last_acked, 500) {
         Ok(p) => p,
         Err(e) => {

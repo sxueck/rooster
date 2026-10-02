@@ -101,8 +101,7 @@ impl DnsCache {
             Ok(lookup) => {
                 let addrs: Vec<IpAddr> = lookup.iter().collect();
                 if addrs.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         format!("dns lookup for {host} returned no addresses"),
                     ));
                 }
@@ -145,8 +144,7 @@ impl DnsCache {
                     tracing::warn!(host = %host, error = %e, "dns refresh failed, using stale cache");
                     return Ok(addrs);
                 }
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
+                Err(io::Error::other(
                     format!("dns lookup for {host} failed: {e}"),
                 ))
             }
@@ -180,8 +178,7 @@ pub(crate) async fn connect_upstream(
             }
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::Other,
+    Err(io::Error::other(
         format!(
             "all upstream addresses for {host}:{port} failed: {}",
             last_err.unwrap_or_else(|| "no addresses".to_string())

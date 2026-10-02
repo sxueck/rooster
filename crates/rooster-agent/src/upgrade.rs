@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(direct.unwrap_err().raw_os_error(), Some(26), "expected ETXTBSY");
 
         // tmp+rename:成功替换运行中 exe 的内容,并保持 0755。
-        assert_eq!(restore_into(&prev, &exe).unwrap(), true);
+        assert!(restore_into(&prev, &exe).unwrap());
         assert_eq!(std::fs::read(&exe).unwrap(), b"previous-binary");
         #[cfg(unix)]
         {

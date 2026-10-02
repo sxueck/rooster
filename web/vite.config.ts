@@ -17,7 +17,7 @@ const proxy = {
 
 export default defineConfig({
   plugins: [vue()],
-  server: { proxy },
+  server: { proxy, host: true },
   preview: { proxy },
   build: {
     outDir: 'dist',
