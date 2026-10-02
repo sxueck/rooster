@@ -92,4 +92,4 @@ jobs:
             --title "rooster ${tag#v}" \
             --notes 'Compressed rooster binaries (-x86_64 / -aarch64) plus SHA256SUMS. Decompress, sign with your Ed25519 upgrade key, then upload through the panel as version <ver>-<arch>.' \
             --verify-tag
-          gh release upload "$tag" release/* --clobber
+          gh release upload "$tag" release/* --clobber --repo "$GITHUB_REPOSITORY"
