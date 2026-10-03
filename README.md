@@ -139,6 +139,16 @@ automatically; existing configurations retained on reinstall must add it manuall
 Neither internal plaintext mode nor untrusted forwarded headers determine the
 external protocol when `public-url` is set.
 
+Agents that reach the hub through a dedicated L4-passthrough port must set
+`agent-url` to that origin (for example `https://hub.example.com:9443`). The
+agent's client certificate authenticates it at the hub's own TLS listener, so an
+L7 terminator on 443 discards it and `/agent/ws` fails with `client certificate
+required`; the passthrough port is also not recoverable from a proxied `Host`
+header, which carries no port. When `agent-url` is set, `/install.sh` and the
+panel's enroll command embed it verbatim instead of deriving the origin from the
+request. `deploy.sh` writes it for `tls.mode: static`; in `none` mode (TLS
+terminated upstream) the agent origin keeps following the request `Host`.
+
 Signed agent installation requires an Ed25519 signing key kept outside the hub.
 Set `upgrade-public-key: "ed25519:<base64-public-key>"` in `hub.yaml`, restart the
 hub, then upload a signed `rooster-VERSION-ARCH` package through the panel

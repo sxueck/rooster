@@ -231,6 +231,8 @@ class DeployTests(unittest.TestCase):
         output = self.ok(bash(DOCKER + "\ndeploy_hub_docker", answers, env=self.env))
         self.assertIn("PROBE <10443> <static> <hub.example> <>", output)
         self.assertIn("listen: 0.0.0.0:9443", (config / "hub.yaml").read_text())
+        # static 模式:面板/安装脚本写死 agent 直拨端口(宿主机侧 10443,不是容器内 9443)
+        self.assertIn('agent-url: "https://hub.example:10443"', (config / "hub.yaml").read_text())
         self.assertNotIn("  ca:", (config / "hub.yaml").read_text())
         commands = Path(self.env["COMMAND_LOG"]).read_text()
         self.assertIn("/main/compose.yaml", commands)
@@ -257,6 +259,8 @@ class DeployTests(unittest.TestCase):
         output = self.ok(bash(DOCKER + "\ndeploy_hub_docker", answers, env=self.env))
         self.assertIn("listen: 127.0.0.1:10443", (config / "hub.yaml").read_text())
         self.assertIn('public-url: "https://hub.example:8443"', (config / "hub.yaml").read_text())
+        # 反代终止 TLS:不写 agent-url,origin 继续跟着请求 Host 走
+        self.assertNotIn("agent-url", (config / "hub.yaml").read_text())
         self.assertIn("PROBE <10443> <plain>", output)
         self.assertIn("listen 8443 ssl;", output)
         self.assertIn("proxy_pass http://127.0.0.1:10443;", output)
@@ -322,6 +326,7 @@ class DeployTests(unittest.TestCase):
         system = Path(self.env["SANDBOX"])
         config = system / "etc/rooster/hub.yaml"
         self.assertIn("listen: 0.0.0.0:10443", config.read_text())
+        self.assertIn('agent-url: "https://hub.example:10443"', config.read_text())
         self.assertIn("panel-dir: /usr/share/rooster/web/dist", config.read_text())
         self.assertEqual(config.stat().st_mode & 0o777, 0o600)
         self.assertEqual((system / "usr/share/rooster/web/dist/index.html").read_text(), "panel-from-build")
@@ -338,6 +343,7 @@ class DeployTests(unittest.TestCase):
         config = (system / "etc/rooster/hub.yaml").read_text()
         self.assertIn("listen: 127.0.0.1:10443", config)
         self.assertIn("mode: none", config)
+        self.assertNotIn("agent-url", config)
         self.assertFalse((system / "etc/rooster/tls").exists())
         self.assertIn("PROBE <10443> <plain> <hub.example> <>", output)
         self.assertIn("listen 8443 ssl;", output)

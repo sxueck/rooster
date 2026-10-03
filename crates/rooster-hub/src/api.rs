@@ -392,7 +392,7 @@ async fn create_register_token(
     ConnectInfo(_): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let base = match state.cfg.hub_base(request_host(&headers)) {
+    let base = match state.cfg.agent_base(request_host(&headers)) {
         Ok(base) => base,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
@@ -1547,13 +1547,14 @@ fn ca_fingerprint(path: &std::path::Path) -> Result<String, String> {
     Ok(Sha256::digest(cert.as_ref()).iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// 注册/安装入口从请求取 Host:调用方用哪个地址访问 hub,agent 就拨哪个地址。
+/// 注册/安装入口从请求取 Host:调用方用哪个地址访问 hub,agent 就拨哪个地址
+/// (仅在没有显式 `agent-url` 时生效,见 `HubConfig::agent_base`)。
 fn request_host(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::HOST).and_then(|v| v.to_str().ok())
 }
 
 async fn install_script(State(state): State<Arc<HubState>>, headers: HeaderMap) -> Response {
-    let base = match state.cfg.hub_base(request_host(&headers)) {
+    let base = match state.cfg.agent_base(request_host(&headers)) {
         Ok(base) => base,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };

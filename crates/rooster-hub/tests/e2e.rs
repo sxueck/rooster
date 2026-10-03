@@ -49,7 +49,7 @@ async fn start_hub_with_tls(
     upgrade_public_key: Option<String>,
     tls: rooster_hub::config::HubTls,
 ) -> HubServer {
-    start_hub_with_origin(tag, upgrade_public_key, tls, None, vec![]).await
+    start_hub_with_origin(tag, upgrade_public_key, tls, None, vec![], None).await
 }
 
 async fn start_hub_with_origin(
@@ -58,6 +58,7 @@ async fn start_hub_with_origin(
     tls: rooster_hub::config::HubTls,
     public_url: Option<String>,
     cors_allowed_origins: Vec<String>,
+    agent_url: Option<String>,
 ) -> HubServer {
     let dir = std::env::temp_dir().join(format!("rooster-hub-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -67,6 +68,7 @@ async fn start_hub_with_origin(
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         data_dir: dir.clone(),
         public_url,
+        agent_url,
         tls,
         secret_key: Some(bcrypt::hash("hub-secret", 4).unwrap()),
         cors_allowed_origins,
@@ -553,7 +555,7 @@ async fn enrollment_uses_request_host_origin_and_verified_ca_fingerprint() {
     // public-url 只是兑底:请求 Host 不同时必须赢过它
     let hub = start_hub_with_origin("public-origin", None, rooster_hub::config::HubTls {
         ca: Some(ca), ..Default::default()
-    }, Some("https://fallback.example:8443".into()), vec![]).await;
+    }, Some("https://fallback.example:8443".into()), vec![], None).await;
     let token = login(&hub).await;
     let resp = client().post(format!("{}/v0/nodes/register-tokens", hub.base))
         .header("host", "hub.example:8443")
@@ -704,6 +706,48 @@ async fn agent_can_renew_its_certificate_over_ws() {
 
 /// 安装链路的验签环节:脚本匿名取回 二进制 + 裸 Ed25519 签名 + SPKI 公钥,
 /// 交给真 openssl 校验;篡改一个字节必须验不过。
+/// 反代把端口从 Host 里抹掉时,请求 Host 推不出 Agent 的 mTLS 地址:
+/// `agent-url` 必须同时接管面板 install_cmd 与 /install.sh 写死的 origin。
+#[tokio::test]
+async fn agent_url_overrides_proxied_host_in_install_artifacts() {
+    let hub = start_hub_with_origin(
+        "agent-url",
+        None,
+        rooster_hub::config::HubTls::default(),
+        None,
+        vec![],
+        Some("https://hub.example:9443".into()),
+    )
+    .await;
+
+    // nginx `proxy_set_header Host $host` 只带域名,不带 9443。
+    let resp = client()
+        .post(format!("{}/v0/nodes/register-tokens", hub.base))
+        .header("host", "hub.example")
+        .bearer_auth(login(&hub).await)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await.ok());
+    let cmd: serde_json::Value = resp.json().await.unwrap();
+    let cmd = cmd["install_cmd"].as_str().unwrap();
+    assert!(cmd.contains("--hub https://hub.example:9443 "), "install_cmd must dial the agent origin: {cmd}");
+    assert!(!cmd.contains("--hub https://hub.example --"), "panel Host must not leak into install_cmd: {cmd}");
+
+    let installer = client()
+        .get(format!("{}/install.sh", hub.base))
+        .header("host", "hub.example")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // install.sh 由 HUB 派生 WS_URL,端口在 HUB 里就保住了 wss://…:9443/agent/ws。
+    assert!(installer.contains("HUB='https://hub.example:9443'"), "install.sh must embed the agent origin");
+}
+
 #[tokio::test]
 async fn install_artifacts_verify_with_openssl() {
     use base64::Engine as _;
@@ -899,6 +943,7 @@ async fn cors_download_keeps_vary_for_both_gzip_and_plain_representations() {
         rooster_hub::config::HubTls::default(),
         None,
         vec!["https://panel.example".into()],
+        None,
     )
     .await;
 

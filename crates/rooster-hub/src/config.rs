@@ -18,6 +18,11 @@ pub struct HubConfig {
     /// External origin, independent of the internal TLS listener behind a proxy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
+    /// Origin the Agent dials (控制通道 wss + register/downloads REST).
+    /// 显式配置时优先于请求 Host:L7 反代(`proxy_set_header Host $host`)会抹掉
+    /// 端口,而 Agent 的 mTLS 必须落在直通 Hub 的端口上,从 Host 推不出来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_url: Option<String>,
     #[serde(default)]
     pub tls: HubTls,
     /// bcrypt 哈希;明文首启回写。
@@ -140,16 +145,32 @@ impl HubConfig {
                 .clone()
                 .unwrap_or_else(|| format!("{}://127.0.0.1:9443", scheme("127.0.0.1:9443"))),
         };
-        let uri: axum::http::Uri = base.parse().map_err(|_| "invalid public Host/public-url".to_string())?;
-        let authority = uri.authority().ok_or("public Host/public-url must include a host")?;
+        Self::validated_origin(&base, "public Host/public-url")
+    }
+
+    /// install.sh 与面板 enroll 命令里写死的 Agent origin:`agent-url` 一旦配置就
+    /// 完全接管(不看请求 Host),因为反代后的 Host 只反映面板入口,不反映
+    /// Agent 能建立 mTLS 的那个地址。未配置时沿用 [`Self::hub_base`]。
+    pub fn agent_base(&self, host: Option<&str>) -> Result<String, String> {
+        match self.agent_url.as_deref().map(str::trim) {
+            Some(url) if !url.is_empty() => Self::validated_origin(url, "agent-url"),
+            _ => self.hub_base(host),
+        }
+    }
+
+    /// 公开 origin 的归一化校验:`what` 只用于把报错指回真正的来源。
+    fn validated_origin(base: &str, what: &str) -> Result<String, String> {
+        let uri: axum::http::Uri =
+            base.parse().map_err(|_| format!("invalid {what}"))?;
+        let authority = uri.authority().ok_or_else(|| format!("{what} must include a host"))?;
         if !matches!(uri.scheme_str(), Some("http" | "https"))
             || !authority.as_str().bytes().all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
             || uri.path_and_query().is_some_and(|p| p.as_str() != "/")
         {
-            return Err("public origin must be an http(s) host without credentials, path or query".into());
+            return Err(format!("{what} must be an http(s) host without credentials, path or query"));
         }
         if uri.scheme_str() == Some("http") && !matches!(authority.host(), "localhost" | "127.0.0.1" | "[::1]") {
-            return Err("public origin must use HTTPS outside loopback".into());
+            return Err(format!("{what} must use HTTPS outside loopback"));
         }
         Ok(base.trim_end_matches('/').to_string())
     }
@@ -182,6 +203,7 @@ pub fn default_hub_config_template() -> String {
 listen: 127.0.0.1:9443
 data-dir: /var/lib/rooster-hub
 # public-url: https://hub.example.com:443   # fallback used only when a request carries no Host header
+# agent-url: https://hub.example.com:9443   # origin agents dial (L4-passthrough port); when set it wins over the request Host, which an L7 proxy strips of its port
 tls:
   # static: 使用下方 cert/key(对外服务用这个)
   # none:   明文,仅允许 listen 为 127.0.0.1(开发/本机反代终止 TLS)
@@ -232,11 +254,45 @@ mod tests {
         assert!(cfg.hub_base(Some("bad;host")).is_err());
     }
 
+    /// 反代(nginx `proxy_set_header Host $host`)会把端口从 Host 抹掉,
+    /// 而 Agent 的 mTLS 只能落在直通 Hub 的端口上:agent-url 一旦配置就
+    /// 必须赢过请求 Host 与 public-url,且不接受 path/凭据/非回环 http。
+    #[test]
+    fn agent_url_overrides_host_and_public_url() {
+        let mut cfg: HubConfig = serde_norway::from_str(&default_hub_config_template()).unwrap();
+        cfg.tls.mode = Some(HubTlsMode::Static);
+        cfg.public_url = Some("https://panel.example".into());
+        // 未配置:行为与 hub_base 一致(请求 Host 优先)。
+        assert_eq!(cfg.agent_base(Some("hub.example")).unwrap(), "https://hub.example");
+        cfg.agent_url = Some("https://hub.example:9443/".into());
+        assert_eq!(cfg.agent_base(Some("hub.example")).unwrap(), "https://hub.example:9443");
+        assert_eq!(cfg.agent_base(None).unwrap(), "https://hub.example:9443");
+        // 空/空白 = 未配置,回到 Host 推导。
+        cfg.agent_url = Some("  ".into());
+        assert_eq!(cfg.agent_base(Some("plain.example:8443")).unwrap(), "https://plain.example:8443");
+        for invalid in [
+            "https://agent.example/agent/ws",
+            "http://agent.example:9443",
+            "https://user@agent.example:9443",
+            "https://agent.example?x=1",
+            "not a url",
+        ] {
+            cfg.agent_url = Some(invalid.into());
+            let err = cfg.agent_base(Some("hub.example")).unwrap_err();
+            assert!(err.contains("agent-url"), "{invalid} -> {err}");
+        }
+        // 回环明文在 plain 模式下合法。
+        cfg.tls.mode = None;
+        cfg.agent_url = Some("http://127.0.0.1:9443".into());
+        assert_eq!(cfg.agent_base(Some("hub.example")).unwrap(), "http://127.0.0.1:9443");
+    }
+
     #[test]
     fn parses_example_config() {
         let cfg: HubConfig = serde_norway::from_str(&default_hub_config_template()).unwrap();
         assert_eq!(cfg.listen.port(), 9443);
         assert!(matches!(cfg.tls_mode(), HubTlsMode::None));
+        assert_eq!(cfg.agent_url, None);
         assert_eq!(cfg.session_ttl(), Duration::from_secs(12 * 3600));
         assert_eq!(cfg.audit_retention(), Duration::from_secs(180 * 24 * 3600));
         assert_eq!(cfg.global_ban_policies.len(), 1);

@@ -170,7 +170,7 @@ certificate_host() {
 
 write_hub_config() {
   local file="$1" secret="$2" mode="${3:-static}" port="${4:-9443}"
-  local panel="${5:-web/dist}" ca="${6:-yes}" public="${7:-}" upgrade_pub="${8:-}" s
+  local panel="${5:-web/dist}" ca="${6:-yes}" public="${7:-}" upgrade_pub="${8:-}" agent="${9:-}" s
   # YAML double-quoted style: escape backslash and quote (printf, not heredoc,
   # so the secret never undergoes shell expansion)
   s=${secret//\\/\\\\}; s=${s//\"/\\\"}
@@ -198,6 +198,7 @@ write_hub_config() {
       if [ "$ca" = "yes" ]; then printf '%s\n' '  ca: /etc/rooster/tls/ca.crt'; fi
     fi
     [ -z "$public" ] || printf 'public-url: "%s"\n' "$public"
+    [ -z "$agent" ] || printf 'agent-url: "%s"\n' "$agent"
     printf 'secret-key: "%s"\n' "$s"
     printf '%s\n' 'session-ttl: 12h'
     printf 'panel-dir: %s\n' "$panel"
@@ -206,6 +207,16 @@ write_hub_config() {
     [ -z "$upgrade_pub" ] || printf 'upgrade-public-key: "%s"\n' "$upgrade_pub"
   } > "$file"
   chmod 600 "$file"
+}
+
+# static 模式下 Agent 必须拨 Hub 自己的 TLS 端口(客户端证书得端到端到达
+# hub);L7 反代的 Host 头不带端口,推不出这个地址。这里的 port 是宿主机侧
+# 暴露的端口(docker 映射后的 host 端口,不是容器内 9443)。plain 模式不写:
+# 那里 TLS 在上游终止,origin 本就该跟着请求走。
+agent_origin() {
+  local mode="$1" host="$2" port="$3"
+  [ "$mode" = "static" ] || return 0
+  printf 'https://%s:%s' "$host" "$port"
 }
 
 wait_hub() {
@@ -359,7 +370,7 @@ deploy_hub_docker() (
   [ "$hubmode" = "plain" ] && cfg_mode="plain-docker"
   local rel_pub
   rel_pub="$(gen_release_key "$stage")"
-  write_hub_config "$stage/hub.yaml" "$secret" "$cfg_mode" "$bindport" web/dist "$ca_config" "https://$publichost:$publicport" "$rel_pub"
+  write_hub_config "$stage/hub.yaml" "$secret" "$cfg_mode" "$bindport" web/dist "$ca_config" "https://$publichost:$publicport" "$rel_pub" "$(agent_origin "$cfg_mode" "$publichost" "$port")"
   fi
   tlsdir="$stage/tls"
   [ ! -f "$tlsdir/ca.crt" ] || ca="$tlsdir/ca.crt"
@@ -517,7 +528,7 @@ deploy_hub_native() (
   [ "$hubmode" != plain ] || publicport="$pubport"
   local rel_pub
   rel_pub="$(gen_release_key "$work")"
-  write_hub_config "$work/hub.yaml" "$secret" "$hubmode" "$port" /usr/share/rooster/web/dist "$ca_config" "https://$publichost:$publicport" "$rel_pub"
+  write_hub_config "$work/hub.yaml" "$secret" "$hubmode" "$port" /usr/share/rooster/web/dist "$ca_config" "https://$publichost:$publicport" "$rel_pub" "$(agent_origin "$hubmode" "$publichost" "$port")"
   step "installing binary, panel and systemd service (existing files backed up)"
   as_root mkdir -p "$dir"
   backup="$(as_root mktemp -d "$dir/install-backup.XXXXXXXX")"
