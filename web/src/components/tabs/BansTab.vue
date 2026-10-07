@@ -11,14 +11,17 @@ import {
   useMessage,
   type RColumn,
 } from '../../ui'
-import { addNodeBan, deleteNodeBan, getNodeBans, getNodeStats } from '../../api/client'
-import { ApiError, type BanEngineStatus, type BanEntry } from '../../api/types'
+import { addNodeBan, deleteNodeBan, getNodeBanHistory, getNodeBans, getNodeHoneypotHistory, getNodeStats } from '../../api/client'
+import { ApiError, type BanEngineStatus, type BanEntry, type NodeBanHistoryRecord } from '../../api/types'
 import { errMsg, fmtDuration, fmtTime } from '../../utils/format'
 
 const props = defineProps<{ nodeId: string }>()
 const message = useMessage()
 
 const bans = ref<BanEntry[]>([])
+type BanHistoryRow = NodeBanHistoryRecord & { id: string }
+const history = ref<BanHistoryRow[]>([])
+const honeypotHits = ref<{ id: string; ip: string; port: number; protocol: string; ts: number }[]>([])
 const form = ref({ ip: '', ttl_secs: 3600, reason: '' })
 const adding = ref(false)
 
@@ -37,8 +40,24 @@ function banEngineOf(e: unknown): BanEngineStatus | null {
   return null
 }
 
+const honeypotCols: RColumn<(typeof honeypotHits.value)[number]>[] = [
+  { title: 'IP', key: 'ip', width: 150, mono: true },
+  { title: 'PORT', key: 'port', width: 90 },
+  { title: 'PROTOCOL', key: 'protocol', width: 100 },
+  { title: 'HIT AT', key: 'ts', width: 170, render: (r) => fmtTime(r.ts) },
+]
+
+const historyCols: RColumn<NodeBanHistoryRecord>[] = [
+  { title: 'IP', key: 'ip', width: 150, mono: true },
+  { title: 'REASON', key: 'reason' },
+  { title: 'SOURCE', key: 'plugin', width: 100 },
+  { title: 'BANNED AT', key: 'started_at', width: 170, render: (r) => r.started_at == null ? '未知（旧 Agent）' : fmtTime(r.started_at) },
+  { title: 'UNBANNED AT', key: 'removed_at', width: 170, render: (r) => r.removed_at == null ? '待确认（记录已保存）' : fmtTime(r.removed_at) },
+]
+
 const cols: RColumn<BanEntry>[] = [
   { title: 'IP', key: 'ip', width: 150, mono: true },
+  { title: '属地', key: 'country', width: 130, render: (r) => r.country || '未知' },
   { title: 'REASON', key: 'reason' },
   { title: 'SOURCE', key: 'plugin', width: 100 },
   { title: 'SCOPE', key: 'scope', width: 80 },
@@ -62,10 +81,23 @@ async function load() {
     bans.value = (await getNodeBans(props.nodeId)).bans
   } catch (e) {
     const be = banEngineOf(e)
-    if (be) {
-      banEngine.value = be
-      return
-    }
+    if (be) banEngine.value = be
+    else message.error(errMsg(e))
+  }
+  try {
+    const [banHistory, honeypotHistory] = await Promise.all([
+      getNodeBanHistory(props.nodeId),
+      getNodeHoneypotHistory(props.nodeId),
+    ])
+    history.value = banHistory.records.map((record, index) => ({
+      ...record,
+      id: `${record.node_id}-${record.ip}-${record.removed_at}-${index}`,
+    }))
+    honeypotHits.value = honeypotHistory.hits.map((hit) => ({
+      ...hit,
+      id: `${hit.ts}-${hit.ip}-${hit.port}`,
+    }))
+  } catch (e) {
     message.error(errMsg(e))
   }
 }
@@ -148,6 +180,24 @@ onMounted(async () => {
         :rows="bans"
         :row-key="(r: BanEntry) => r.ip"
         empty-text="NO BANS · 暂无封禁"
+      />
+    </RPanel>
+
+    <RPanel title="解封记录" kicker="UNBAN HISTORY" flush style="margin-top: 16px">
+      <RTable
+        :columns="historyCols"
+        :rows="history"
+        :row-key="(r: BanHistoryRow) => r.id"
+        empty-text="暂无已解除封禁记录"
+      />
+    </RPanel>
+
+    <RPanel title="蜜罐命中详情" kicker="HONEYPOT HITS" flush style="margin-top: 16px">
+      <RTable
+        :columns="honeypotCols"
+        :rows="honeypotHits"
+        :row-key="(r: (typeof honeypotHits)[number]) => r.id"
+        empty-text="暂无蜜罐命中；仅保存来源 IP、目标端口、协议和时间，不记录原始流量（每节点保留最近 1000 条）"
       />
     </RPanel>
   </div>

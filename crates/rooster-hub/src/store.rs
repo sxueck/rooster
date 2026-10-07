@@ -138,12 +138,39 @@ pub struct UpgradeRecord {
     pub uploaded_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NodeBanHistoryRecord {
+    pub node_id: String,
+    pub ip: String,
+    pub reason: String,
+    pub plugin: String,
+    pub scope: String,
+    pub started_at: Option<u64>,
+    pub expires_at: u64,
+    // None preserves the snapshot without claiming the remote DELETE succeeded.
+    pub removed_at: Option<u64>,
+    pub removed_by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct NodeHoneypotHitRecord {
+    pub node_id: String,
+    pub ts: u64,
+    pub ip: String,
+    pub port: u16,
+    pub protocol: String,
+}
+
 // -----------
 
 const NODES: TableDefinition<&str, String> = TableDefinition::new("nodes");
 const TOKENS: TableDefinition<&str, String> = TableDefinition::new("tokens");
 const REVOKED: TableDefinition<&str, ()> = TableDefinition::new("revoked_certs");
 const GLOBAL_BANS: TableDefinition<&str, String> = TableDefinition::new("global_bans");
+const NODE_BAN_HISTORY: TableDefinition<&str, String> = TableDefinition::new("node_ban_history");
+const NODE_HONEYPOT_HITS: TableDefinition<&str, String> = TableDefinition::new("node_honeypot_hits");
 const TEMPLATES: TableDefinition<&str, String> = TableDefinition::new("templates");
 const ROLLOUTS: TableDefinition<&str, String> = TableDefinition::new("rollouts");
 const SESSIONS: TableDefinition<&str, u64> = TableDefinition::new("sessions");
@@ -167,6 +194,8 @@ pub fn open(path: &Path) -> Result<Database, String> {
     let _ = tables.open_table(TOKENS).map_err(json_err)?;
     let _ = tables.open_table(REVOKED).map_err(json_err)?;
     let _ = tables.open_table(GLOBAL_BANS).map_err(json_err)?;
+    let _ = tables.open_table(NODE_BAN_HISTORY).map_err(json_err)?;
+    let _ = tables.open_table(NODE_HONEYPOT_HITS).map_err(json_err)?;
     let _ = tables.open_table(TEMPLATES).map_err(json_err)?;
     let _ = tables.open_table(ROLLOUTS).map_err(json_err)?;
     let _ = tables.open_table(SESSIONS).map_err(json_err)?;
@@ -368,6 +397,92 @@ impl Store {
             w.commit().map_err(json_err)?;
         }
         out.sort_by(|a, b| a.ip.cmp(&b.ip));
+        Ok(out)
+    }
+
+    pub fn archive_node_ban(&self, rec: &NodeBanHistoryRecord) -> Result<String, String> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let key = format!("{}:{}:{unique}", rec.node_id, rec.ip);
+        let w = self.db.begin_write().map_err(json_err)?;
+        {
+            let mut t = w.open_table(NODE_BAN_HISTORY).map_err(json_err)?;
+            t.insert(key.as_str(), serde_json::to_string(rec).map_err(json_err)?)
+                .map_err(json_err)?;
+        }
+        w.commit().map_err(json_err)?;
+        Ok(key)
+    }
+
+    pub fn confirm_node_unban(&self, key: &str, removed_at: u64) -> Result<(), String> {
+        let w = self.db.begin_write().map_err(json_err)?;
+        {
+            let mut t = w.open_table(NODE_BAN_HISTORY).map_err(json_err)?;
+            let mut rec: NodeBanHistoryRecord = {
+                let row = t.get(key).map_err(json_err)?.ok_or("unban snapshot missing")?;
+                serde_json::from_str(&row.value()).map_err(json_err)?
+            };
+            rec.removed_at = Some(removed_at);
+            t.insert(key, serde_json::to_string(&rec).map_err(json_err)?).map_err(json_err)?;
+        }
+        w.commit().map_err(json_err)
+    }
+
+    pub fn list_node_ban_history(&self, node_id: &str, limit: usize) -> Result<Vec<NodeBanHistoryRecord>, String> {
+        let r = self.db.begin_read().map_err(json_err)?;
+        let t = r.open_table(NODE_BAN_HISTORY).map_err(json_err)?;
+        let mut out = Vec::new();
+        for row in t.iter().map_err(json_err)? {
+            let (_, value) = row.map_err(json_err)?;
+            let rec: NodeBanHistoryRecord = serde_json::from_str(&value.value()).map_err(json_err)?;
+            if rec.node_id == node_id {
+                out.push(rec);
+            }
+        }
+        out.sort_by_key(|rec| std::cmp::Reverse(rec.removed_at.unwrap_or(u64::MAX)));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    pub fn archive_honeypot_hit(&self, rec: &NodeHoneypotHitRecord) -> Result<(), String> {
+        let key = format!("{}:{}:{}:{}", rec.node_id, rec.ts, rec.ip, rec.port);
+        let w = self.db.begin_write().map_err(json_err)?;
+        {
+            let mut t = w.open_table(NODE_HONEYPOT_HITS).map_err(json_err)?;
+            t.insert(key.as_str(), serde_json::to_string(rec).map_err(json_err)?)
+                .map_err(json_err)?;
+            let mut rows = Vec::new();
+            for row in t.iter().map_err(json_err)? {
+                let (k, value) = row.map_err(json_err)?;
+                let hit: NodeHoneypotHitRecord = serde_json::from_str(&value.value()).map_err(json_err)?;
+                if hit.node_id == rec.node_id {
+                    rows.push((k.value().to_string(), hit.ts));
+                }
+            }
+            rows.sort_by_key(|(_, ts)| *ts);
+            let excess = rows.len().saturating_sub(1000);
+            for (key, _) in rows.into_iter().take(excess) {
+                let _ = t.remove(key.as_str());
+            }
+        }
+        w.commit().map_err(json_err)
+    }
+
+    pub fn list_node_honeypot_hits(&self, node_id: &str, limit: usize) -> Result<Vec<NodeHoneypotHitRecord>, String> {
+        let r = self.db.begin_read().map_err(json_err)?;
+        let t = r.open_table(NODE_HONEYPOT_HITS).map_err(json_err)?;
+        let mut out = Vec::new();
+        for row in t.iter().map_err(json_err)? {
+            let (_, value) = row.map_err(json_err)?;
+            let rec: NodeHoneypotHitRecord = serde_json::from_str(&value.value()).map_err(json_err)?;
+            if rec.node_id == node_id {
+                out.push(rec);
+            }
+        }
+        out.sort_by(|a, b| b.ts.cmp(&a.ts));
+        out.truncate(limit);
         Ok(out)
     }
 
@@ -753,6 +868,40 @@ mod tests {
         })
         .unwrap();
         assert!(s.list_global_bans().unwrap().is_empty());
+    }
+
+    #[test]
+    fn node_ban_history_is_persisted_and_scoped() {
+        let s = tmp_store();
+        let rec = NodeBanHistoryRecord {
+            node_id: "node-a".into(),
+            ip: "203.0.113.7".into(),
+            reason: "honeypot".into(),
+            plugin: "honeypot".into(),
+            scope: "local".into(),
+            started_at: Some(10),
+            expires_at: 70,
+            removed_at: Some(20),
+            removed_by: "panel".into(),
+        };
+        s.archive_node_ban(&rec).unwrap();
+        assert_eq!(s.list_node_ban_history("node-a", 10).unwrap(), vec![rec]);
+        assert!(s.list_node_ban_history("node-b", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn honeypot_hits_are_persisted_and_scoped() {
+        let s = tmp_store();
+        let hit = NodeHoneypotHitRecord {
+            node_id: "node-a".into(),
+            ts: 30,
+            ip: "203.0.113.8".into(),
+            port: 2222,
+            protocol: "tcp".into(),
+        };
+        s.archive_honeypot_hit(&hit).unwrap();
+        assert_eq!(s.list_node_honeypot_hits("node-a", 10).unwrap(), vec![hit]);
+        assert!(s.list_node_honeypot_hits("node-b", 10).unwrap().is_empty());
     }
 
     #[test]

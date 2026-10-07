@@ -97,6 +97,11 @@ pub enum Event {
         scope: String,
         ttl_secs: u64,
     },
+    HoneypotHit {
+        ip: String,
+        port: u16,
+        protocol: String,
+    },
     Block {
         ip: String,
         rule_id: String,
@@ -160,7 +165,7 @@ impl Event {
     /// 事件主语 IP(封禁/拦截类),用于联动策略按 IP 聚合。
     pub fn subject_ip(&self) -> Option<&str> {
         match self {
-            Event::Ban { ip, .. } | Event::Block { ip, .. } => Some(ip),
+            Event::Ban { ip, .. } | Event::HoneypotHit { ip, .. } | Event::Block { ip, .. } => Some(ip),
             _ => None,
         }
     }
@@ -177,6 +182,7 @@ impl Event {
     pub fn source_plugin(&self) -> Option<&str> {
         match self {
             Event::Ban { plugin, .. } => Some(plugin),
+            Event::HoneypotHit { .. } => Some("honeypot"),
             Event::Block { .. } => Some("http-guard"),
             _ => None,
         }
@@ -186,6 +192,7 @@ impl Event {
     pub fn kind_name(&self) -> &'static str {
         match self {
             Event::Ban { .. } => "ban",
+            Event::HoneypotHit { .. } => "honeypot_hit",
             Event::Block { .. } => "block",
             Event::ConfigChanged { .. } => "config_changed",
             Event::ConfigInvalid { .. } => "config_invalid",
@@ -326,6 +333,14 @@ mod tests {
         assert_eq!(e.subject_ip(), Some("1.2.3.4"));
         assert_eq!(e.source_plugin(), Some("ssh-guard"));
         assert_eq!(e.kind_name(), "ban");
+        let hit = Event::HoneypotHit {
+            ip: "203.0.113.8".into(),
+            port: 2222,
+            protocol: "tcp".into(),
+        };
+        assert_eq!(hit.subject_ip(), Some("203.0.113.8"));
+        assert_eq!(hit.source_plugin(), Some("honeypot"));
+        assert_eq!(hit.kind_name(), "honeypot_hit");
         assert!(Event::ConfigChanged { hash: String::new() }.subject_ip().is_none());
     }
 }

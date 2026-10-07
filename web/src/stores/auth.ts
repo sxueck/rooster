@@ -3,8 +3,8 @@ import { login as apiLogin, getHub, getToken, setToken } from '../api/client'
 import { useEventsStore } from './events'
 
 /**
- * hub origin persisted in localStorage, token kept in sessionStorage
- * (cleared when the tab closes), secret_key never stored anywhere.
+ * hub origin and token persisted in localStorage (expiry is the hub-side
+ * session-ttl, not the storage), secret_key never stored anywhere.
  */
 export const useAuthStore = defineStore('auth', {
   state: () => ({

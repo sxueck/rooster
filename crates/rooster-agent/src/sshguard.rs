@@ -273,6 +273,7 @@ impl Pipeline {
             plugin: "ssh-guard".to_string(),
             node: self.node.clone(),
             scope: BanScope::Local,
+            started_at: None,
             expires_at: None,
         };
         match self.bans.apply_ban(&entry) {

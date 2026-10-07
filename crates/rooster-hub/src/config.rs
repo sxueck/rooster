@@ -30,6 +30,7 @@ pub struct HubConfig {
     pub secret_key: Option<String>,
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+    /// 面板会话有效期(默认 30 天)。token 落 redb,Hub 重启不丢会话。
     #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
     pub session_ttl: Option<Duration>,
     /// 面板静态文件目录;不存在时仅提供 API。
@@ -176,7 +177,7 @@ impl HubConfig {
     }
 
     pub fn session_ttl(&self) -> Duration {
-        self.session_ttl.unwrap_or(Duration::from_secs(12 * 3600))
+        self.session_ttl.unwrap_or(Duration::from_secs(30 * 24 * 3600))
     }
 
     pub fn audit_retention(&self) -> Duration {
@@ -213,7 +214,8 @@ tls:
   # ca: /etc/rooster/hub-ca.crt   # 自签/私有 CA 时公开给 install.sh 的信任锚
 secret-key: ""            # 明文会在首次启动时自动哈希
 cors-allowed-origins: []
-session-ttl: 12h
+# 面板会话有效期;会话存 redb(绝对过期时间戳),Hub 重启不失效。
+session-ttl: 30d
 panel-dir: web/dist
 auto-confirm-delay-secs: 10
 # upgrade-public-key: "ed25519:<base64>"
@@ -293,7 +295,7 @@ mod tests {
         assert_eq!(cfg.listen.port(), 9443);
         assert!(matches!(cfg.tls_mode(), HubTlsMode::None));
         assert_eq!(cfg.agent_url, None);
-        assert_eq!(cfg.session_ttl(), Duration::from_secs(12 * 3600));
+        assert_eq!(cfg.session_ttl(), Duration::from_secs(30 * 24 * 3600));
         assert_eq!(cfg.audit_retention(), Duration::from_secs(180 * 24 * 3600));
         assert_eq!(cfg.global_ban_policies.len(), 1);
         assert_eq!(cfg.global_ban_policies[0].min_nodes, Some(1));

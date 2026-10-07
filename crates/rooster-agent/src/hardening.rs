@@ -164,13 +164,20 @@ mod scan_threshold_tests {
     }
 }
 
+fn honeypot_window(h: &HardeningConfig) -> Duration {
+    h.honeypot.as_ref()
+        .map(|cfg| cfg.hit_window_or_default())
+        .unwrap_or_default()
+        .max(Duration::from_secs(60))
+}
+
 /// 提升器轮询间隔:基础 2s;扫描/蜜罐窗口更短时收紧到窗口的一半,
 /// 保证任一暂存元素在过期前至少被一轮轮询看到。蜜罐 TTL 在
 /// [`build_spec`] 钳到 ≥60s,所以只有扫描 find-time 能把间隔压下来。
 fn promoter_tick(h: &HardeningConfig) -> Duration {
     let mut tick = POLL_INTERVAL;
-    if let Some(hp) = h.honeypot.as_ref().filter(|c| c.enabled) {
-        tick = tick.min(hp.hit_window_or_default().max(Duration::from_secs(60)) / 2);
+    if h.honeypot.as_ref().is_some_and(|c| c.enabled) {
+        tick = tick.min(honeypot_window(h) / 2);
     }
     if let Some(pg) = h.port_guard.as_ref().filter(|c| c.enabled) {
         tick = tick.min(pg.find_time_or_default() / 2);
@@ -228,6 +235,20 @@ mod tick_tests {
             ban_time: None,
         });
         assert_eq!(promoter_tick(&c), Duration::from_secs(2), "钳后 60s/2=30s > 2s");
+        let (spec, _) = super::build_spec(&c, &std::collections::HashSet::new());
+        let window = super::honeypot_window(&c);
+        let mut cooldown = std::collections::HashMap::new();
+        let key = ("203.0.113.8".to_string(), 2222);
+        let now = std::time::Instant::now();
+        assert!(super::record_honeypot_hit(&mut cooldown, key.clone(), now, window));
+        for seconds in [10, 20, 30, 40, 50, 59] {
+            assert!(!super::record_honeypot_hit(
+                &mut cooldown, key.clone(), now + Duration::from_secs(seconds), window,
+            ));
+        }
+        assert!(super::record_honeypot_hit(
+            &mut cooldown, key, now + Duration::from_millis(spec.honeypot_window_ms), window,
+        ));
     }
 }
 
@@ -326,13 +347,7 @@ fn build_spec(h: &HardeningConfig, real: &HashSet<u16>) -> (HardeningSpec, Vec<u
         spec.honeypot_on = true;
         // 暂存集 TTL 下限 60s:提升器最慢 2s 一轮,配置的窗口过短会让
         // 命中在被消费前就过期(等于静默关掉蜜罐)。
-        spec.honeypot_window_ms = dur_ms(
-            h.honeypot
-                .as_ref()
-                .map(|c| c.hit_window_or_default())
-                .unwrap_or_default()
-                .max(Duration::from_secs(60)),
-        );
+        spec.honeypot_window_ms = dur_ms(honeypot_window(h));
     }
     spec.open_ports = real.iter().copied().collect();
     if let Some(pg) = h.port_guard.as_ref().filter(|c| c.enabled) {
@@ -555,6 +570,7 @@ async fn promoter(
     nft: Arc<NftHandle>,
 ) {
     let mut cooldown: HashMap<(String, &'static str), Instant> = HashMap::new();
+    let mut hit_cooldown: HashMap<(String, u16), Instant> = HashMap::new();
     let mut tick = tokio::time::interval(promoter_tick(&hardening));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -565,6 +581,8 @@ async fn promoter(
             };
             if matches!(set, SET_SCANPORTS_V4 | SET_SCANPORTS_V6) {
                 promote_scan_set(&bans, &events, &node, &hardening, set, &nft, &mut cooldown, plugin, &reason, ttl).await;
+            } else if matches!(set, SET_HP_V4 | SET_HP_V6) {
+                promote_honeypot_set(&bans, &events, &node, &hardening, set, &nft, &mut cooldown, &mut hit_cooldown, plugin, &reason, ttl).await;
             } else {
                 promote_plain_set(&bans, &events, &node, set, &nft, &mut cooldown, plugin, &reason, ttl).await;
             }
@@ -572,6 +590,7 @@ async fn promoter(
         if cooldown.len() > 8192 {
             cooldown.retain(|_, t| *t > Instant::now());
         }
+        hit_cooldown.retain(|_, t| *t > Instant::now());
     }
 }
 
@@ -626,6 +645,7 @@ async fn promote_scan_set(
             plugin: plugin.to_string(),
             node: node.to_string(),
             scope: BanScope::Local,
+            started_at: None,
             expires_at: None,
         };
         match bans.apply_ban(&entry) {
@@ -649,7 +669,97 @@ async fn promote_scan_set(
     }
 }
 
-/// 纯 IP 命中集(蜜罐 / L4 超速)的提升:命中即封,消费后删位防重复报。
+fn record_honeypot_hit(
+    cooldown: &mut HashMap<(String, u16), Instant>,
+    key: (String, u16),
+    now: Instant,
+    window: Duration,
+) -> bool {
+    if cooldown.get(&key).is_some_and(|until| *until > now) {
+        return false;
+    }
+    cooldown.insert(key, now + window);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn promote_honeypot_set(
+    bans: &Arc<dyn BanManager>,
+    events: &UnboundedSender<Event>,
+    node: &str,
+    hardening: &HardeningConfig,
+    set: &'static str,
+    nft: &Arc<NftHandle>,
+    cooldown: &mut HashMap<(String, &'static str), Instant>,
+    hit_cooldown: &mut HashMap<(String, u16), Instant>,
+    plugin: &'static str,
+    reason: &str,
+    ttl: Duration,
+) {
+    let tuples = {
+        let nft = nft.clone();
+        match tokio::task::spawn_blocking(move || nft.list_scan_tuples(set)).await {
+            Ok(Ok(tuples)) => tuples,
+            Ok(Err(e)) => {
+                tracing::warn!(set, "honeypot tuple dump failed: {e}");
+                return;
+            }
+            Err(_) => return,
+        }
+    };
+    let window = honeypot_window(hardening);
+    for ((addr, port), remaining_ms) in tuples {
+        if remaining_ms == Some(0) {
+            continue;
+        }
+        let ip = addr.to_string();
+        if !promotable(&ip) {
+            continue;
+        }
+        let now = Instant::now();
+        let hit_key = (ip.clone(), port);
+        if !record_honeypot_hit(hit_cooldown, hit_key, now, window) {
+            continue;
+        }
+        let _ = events.send(Event::HoneypotHit {
+            ip: ip.clone(),
+            port,
+            protocol: "tcp".to_string(),
+        });
+
+        let ban_key = (ip.clone(), set);
+        if cooldown.get(&ban_key).is_some_and(|until| *until > now) {
+            continue;
+        }
+        let entry = BanEntry {
+            ip: ip.clone(),
+            ttl,
+            reason: reason.to_string(),
+            plugin: plugin.to_string(),
+            node: node.to_string(),
+            scope: BanScope::Local,
+            started_at: None,
+            expires_at: None,
+        };
+        match bans.apply_ban(&entry) {
+            Ok(()) => {
+                cooldown.insert(ban_key, now + ttl);
+                let _ = events.send(Event::Ban {
+                    ip,
+                    reason: reason.to_string(),
+                    plugin: plugin.to_string(),
+                    scope: "local".to_string(),
+                    ttl_secs: ttl.as_secs(),
+                });
+            }
+            Err(e) => {
+                tracing::debug!(ip, set, "honeypot ban not applied: {e}");
+                cooldown.insert(ban_key, now + Duration::from_secs(60));
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn promote_plain_set(
     bans: &Arc<dyn BanManager>,
@@ -701,6 +811,7 @@ async fn promote_plain_set(
                 plugin: plugin.to_string(),
                 node: node.to_string(),
                 scope: BanScope::Local,
+                started_at: None,
                 expires_at: None,
             };
             match bans.apply_ban(&entry) {

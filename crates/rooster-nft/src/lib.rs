@@ -58,6 +58,9 @@ pub struct BanEntry {
     pub plugin: String,
     pub node: String,
     pub scope: BanScope,
+    /// 首次封禁时间(unix 秒);旧账本按原始 TTL 还原。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub started_at: Option<u64>,
     /// 绝对到期时间(unix 秒);`list_bans` 填充,持久化时必填。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub expires_at: Option<u64>,

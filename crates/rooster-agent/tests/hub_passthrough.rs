@@ -413,6 +413,7 @@ async fn global_unban_only_lifts_global_scope_rows() {
                 plugin: "ssh-guard".into(),
                 node: String::new(),
                 scope: BanScope::Local,
+                started_at: None,
                 expires_at: None,
             },
             BanEntry {
@@ -422,6 +423,7 @@ async fn global_unban_only_lifts_global_scope_rows() {
                 plugin: "hub".into(),
                 node: "peer-1".into(),
                 scope: BanScope::Global,
+                started_at: None,
                 expires_at: None,
             },
         ]),

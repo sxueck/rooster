@@ -84,6 +84,8 @@ pub fn router(state: Arc<HubState>) -> Router {
         .route("/v0/nodes/{id}/labels", put(put_labels))
         .route("/v0/nodes/{id}", delete(revoke_node))
         .route("/v0/nodes/{id}/management/{*path}", any(passthrough))
+        .route("/v0/nodes/{id}/ban-history", get(node_ban_history))
+        .route("/v0/nodes/{id}/honeypot-history", get(node_honeypot_history))
         .route("/v0/templates", get(list_templates))
         .route("/v0/templates/{id}", put(put_template).delete(delete_template))
         .route("/v0/templates/{id}/preview", post(preview_template))
@@ -494,6 +496,26 @@ fn add_connection_ip(body: Vec<u8>, peer_ip: Option<std::net::IpAddr>) -> Vec<u8
     serde_json::to_vec(&value).unwrap_or(body)
 }
 
+async fn node_ban_history(
+    State(state): State<Arc<HubState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.list_node_ban_history(&id, 500) {
+        Ok(records) => Json(json!({"records": records})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
+}
+
+async fn node_honeypot_history(
+    State(state): State<Arc<HubState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.list_node_honeypot_hits(&id, 500) {
+        Ok(hits) => Json(json!({"hits": hits})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
+}
+
 async fn passthrough(
     State(state): State<Arc<HubState>>,
     Path((id, path)): Path<(String, String)>,
@@ -530,12 +552,56 @@ async fn passthrough(
         })
         .collect();
     let mgmt_path = format!("/v0/management/{path}");
+    let archive_key = if method == "DELETE" {
+        if let Some(ip) = path.strip_prefix("bans/") {
+            let body = match conn.api_request("GET", "/v0/management/bans", vec![], vec![], PASSTHROUGH_TIMEOUT).await {
+                Ok((200, _, body)) => body,
+                _ => return (StatusCode::BAD_GATEWAY, Json(json!({"error": "cannot read ban before unban; nothing was deleted"}))).into_response(),
+            };
+            let value = serde_json::from_slice::<serde_json::Value>(&body).ok();
+            let Some(rows) = value.as_ref().and_then(|v| v.get("bans")).and_then(|v| v.as_array()) else {
+                return (StatusCode::BAD_GATEWAY, Json(json!({"error": "invalid ban list; nothing was deleted"}))).into_response();
+            };
+            if let Some(row) = rows.iter().find(|row| row.get("ip").and_then(|v| v.as_str()) == Some(ip)) {
+                let snapshot = crate::store::NodeBanHistoryRecord {
+                    node_id: id.clone(),
+                    ip: ip.to_string(),
+                    reason: row.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    plugin: row.get("plugin").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    scope: row.get("scope").and_then(|v| v.as_str()).unwrap_or("local").to_string(),
+                    // Older agents expose only remaining TTL, which cannot recover the start time.
+                    started_at: row.get("started_at").and_then(|v| v.as_u64()),
+                    expires_at: row.get("expires_at").and_then(|v| v.as_u64()).unwrap_or(0),
+                    removed_at: None,
+                    removed_by: "panel".to_string(),
+                };
+                match state.store.archive_node_ban(&snapshot) {
+                    Ok(key) => Some(key),
+                    Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("cannot archive ban; nothing was deleted: {e}")}))).into_response(),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     match conn
         .api_request(&method, &mgmt_path, fwd_headers, body.to_vec(), PASSTHROUGH_TIMEOUT)
         .await
     {
         Ok((status, resp_headers, resp_body)) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            if status.is_success() {
+                if let Some(key) = archive_key {
+                    if let Err(e) = state.store.confirm_node_unban(&key, now_secs()) {
+                        tracing::error!(error = e, "unban succeeded; durable snapshot remains unconfirmed");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "unban succeeded but history confirmation failed; snapshot is retained"}))).into_response();
+                    }
+                }
+            }
             // 写操作记录审计。
             if method != "GET" && method != "HEAD" && method != "OPTIONS" {
                 state.audit("panel", Some(&id), &method, &mgmt_path, &body, status.as_u16());

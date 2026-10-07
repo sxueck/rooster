@@ -609,6 +609,71 @@ fn established_ack_passes_flag_guard_null_scan_dropped() {
     h.delete_table().expect("cleanup");
 }
 
+#[test]
+#[ignore = "isolated-netns only"]
+fn honeypot_upgrade_preserves_bans_and_replaces_legacy_keys() {
+    use rooster_nft::builders::{hardening_meter_sets, HP_CHAIN, PRE_CHAIN};
+    use rooster_nft::codec::*;
+    use rooster_nft::consts::*;
+
+    assert!(only_in_netns(), "requires an isolated network namespace");
+    let _g = table_lock();
+    let net = net().as_ref().expect("network fixture");
+    let h = fresh_table();
+    let mut seq = Seq::new();
+    let mut ops = Vec::new();
+    for (name, mut datatype, mut klen, id) in hardening_meter_sets() {
+        if name == SET_HP_V4 {
+            datatype = NFT_DATATYPE_IPADDR;
+            klen = 4;
+        } else if name == rooster_nft::builders::SET_HP_V6 {
+            datatype = NFT_DATATYPE_IP6ADDR;
+            klen = 16;
+        }
+        let pos = nf_msg_start(&mut ops, NFT_MSG_NEWSET, NFPROTO_INET,
+            rooster_nft::builders::F_CREATE, seq.get());
+        attr_str(&mut ops, NFTA_SET_TABLE, rooster_nft::TABLE);
+        attr_str(&mut ops, NFTA_SET_NAME, name);
+        attr_be32(&mut ops, NFTA_SET_KEY_TYPE, datatype);
+        attr_be32(&mut ops, NFTA_SET_KEY_LEN, klen);
+        attr_be32(&mut ops, NFTA_SET_ID, id);
+        if datatype != NFT_DATATYPE_INET_SERVICE {
+            attr_be32(&mut ops, NFTA_SET_FLAGS, NFT_SET_TIMEOUT | NFT_SET_EVAL);
+            attr_be64(&mut ops, NFTA_SET_TIMEOUT, 60_000);
+        }
+        nf_msg_end(&mut ops, pos);
+    }
+    h.ktest_send_batch(&wrap_batch(&ops, seq.get(), seq.get()), &[]).unwrap();
+    let chains: Vec<_> = hardening_chains().iter().map(|(name, _)| *name).collect();
+    h.ktest_send_batch(&build_hardening_chains_create(&mut seq, &chains), &[]).unwrap();
+    let spec = HardeningSpec {
+        honeypot_on: true,
+        honey_ports: vec![54321],
+        honeypot_window_ms: 60_000,
+        ..HardeningSpec::default()
+    };
+    h.ktest_send_batch(&rooster_nft::builders::build_replace_ports(&mut seq,
+        rooster_nft::builders::SET_HONEYPORTS, &[54321]), &[]).unwrap();
+    h.ktest_send_batch(&build_hardening_chain_rules(&mut seq, HP_CHAIN, &[], &spec), &[]).unwrap();
+    h.add_set_element(rooster_nft::SET_BLOCK_V4, "203.0.113.9", Some(Duration::from_secs(3600))).unwrap();
+    let raw = open_raw();
+    let scanner = Ipv4Addr::new(10, 9, 0, 200);
+    let dst = Ipv4Addr::new(10, 9, 0, 1);
+    net.inject4(scanner, 33333, dst, 54321, TCP_SYN, 1, 0);
+    assert!(!raw.expect(Duration::from_millis(300), |s, _, _, _| s == scanner));
+    assert!(h.list_set_elements(SET_HP_V4).unwrap().iter().any(|(ip, _)| ip == "10.9.0.200"));
+
+    h.set_hardening(&spec, &[54321], &[]).expect("upgrade legacy sets");
+    assert!(h.list_set_elements(rooster_nft::SET_BLOCK_V4).unwrap().iter().any(|(ip, _)| ip == "203.0.113.9"));
+    assert_eq!(h.ktest_rule_count(PRE_CHAIN).unwrap(), 6);
+    net.inject4(scanner, 33334, dst, 54321, TCP_SYN, 2, 0);
+    assert!(!raw.expect(Duration::from_millis(300), |s, _, _, _| s == scanner));
+    assert!(h.list_scan_tuples(SET_HP_V4).unwrap().iter().any(|((ip, port), _)|
+        ip.to_string() == "10.9.0.200" && *port == 54321));
+    h.set_hardening(&spec, &[54321], &[]).expect("idempotent reapply");
+    h.delete_table().expect("cleanup");
+}
+
 /// 蜜罐:向蜜罐端口的新建 SYN 被记录并丢弃;本机外连的 established 回程包
 /// (源端口=蜜罐端口)不得当蜜罐命中(ct state new 排除)。
 #[test]
@@ -641,11 +706,12 @@ fn honeypot_hits_new_syn_only_not_established_reply() {
         !raw.expect(Duration::from_millis(300), |s, _, _, _| s == scanner),
         "蜜罐 SYN 应被 drop"
     );
-    let hp = h.list_set_elements(SET_HP_V4).expect("hp dump");
-    let hit: Vec<_> = hp.iter().filter(|(a, _)| a == "10.9.0.200").collect();
+    let hp = h.list_scan_tuples(SET_HP_V4).expect("hp tuple dump");
+    let hit: Vec<_> = hp.iter().filter(|((ip, _), _)| ip.to_string() == "10.9.0.200").collect();
     assert_eq!(hit.len(), 1, "蜜罐命中: {hp:?}");
+    assert_eq!(hit[0].0.1, 54321, "记录命中的目标端口");
     let rem = hit[0].1.expect("命中带剩余超时");
-    assert!((4..=5).contains(&rem), "命中寿命 = 窗口 5s: {rem}s");
+    assert!((4_000..=5_000).contains(&rem), "命中寿命 = 窗口 5s: {rem}ms");
 
     // Reverse-direction traffic must never ban an outbound peer, including SYN-ACK.
     let local = Ipv4Addr::new(10, 9, 0, 1);
@@ -656,21 +722,21 @@ fn honeypot_hits_new_syn_only_not_established_reply() {
         s == peer && sp == 80 && dp == 54321 && fl == TCP_SYNACK
     }), "outbound SYN-ACK must be delivered");
     assert!(client.peer_addr().is_ok(), "real outbound handshake must complete");
-    let hp2 = h.list_set_elements(SET_HP_V4).expect("hp dump 2");
+    let hp2 = h.list_scan_tuples(SET_HP_V4).expect("hp tuple dump 2");
     assert!(
-        !hp2.iter().any(|(a, _)| a == "10.9.0.2"),
+        !hp2.iter().any(|((ip, _), _)| ip.to_string() == "10.9.0.2"),
         "first outbound reply must not hit the honeypot: {hp2:?}"
     );
     // established 阶段的数据回程:dport=蜜罐端口但 ct state established → 不得命中。
     net.inject4(peer, 80, local, 54321, TCP_PSHACK, 2001, seq.wrapping_add(1));
     net.inject4(peer, 80, local, 54321, TCP_ACK, 2001, seq.wrapping_add(1));
     net.inject4(peer, 80, local, 54321, TCP_FIN | TCP_ACK, 2001, seq.wrapping_add(1));
-    let hp3 = h.list_set_elements(SET_HP_V4).expect("hp dump 3");
+    let hp3 = h.list_scan_tuples(SET_HP_V4).expect("hp tuple dump 3");
     assert!(
-        !hp3.iter().any(|(a, _)| a == "10.9.0.2"),
+        !hp3.iter().any(|((ip, _), _)| ip.to_string() == "10.9.0.2"),
         "established 数据回程不得当蜜罐命中: {hp3:?}"
     );
-    assert_eq!(hp2.iter().filter(|(a, _)| a == "10.9.0.200").count(), 1);
+    assert_eq!(hp2.iter().filter(|((ip, _), _)| ip.to_string() == "10.9.0.200").count(), 1);
     drop(client);
     assert!(std::process::Command::new("ip").args(["route", "del", "10.9.0.2/32", "dev", "r1"]).status().unwrap().success());
     h.delete_table().expect("cleanup");

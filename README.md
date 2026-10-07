@@ -50,6 +50,10 @@ Hub:
 - Remote upgrades: Ed25519-signed binaries, staged rollout with observation
   window, automatic rollback on failure.
 - Vue 3 panel, audit log, `backup`/`restore` subcommands.
+- Panel unbans persist a ban snapshot before deleting it on the agent. Failed
+  snapshot reads/writes stop deletion; interrupted or failed remote operations
+  remain visible as unconfirmed records. Old agents without start timestamps
+  display an unknown ban start time. Automatic expiry is not archived.
 
 WASM plugins: wasmtime host (no WASI, memory cap, epoch timeout,
 fail-open/fail-closed per plugin) with a guest SDK and an example plugin

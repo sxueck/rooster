@@ -131,8 +131,6 @@ impl NftBanManager {
     fn put_row(&self, entry: &BanEntry, expires_at: u64) -> Result<(), NftError> {
         let mut stored = entry.clone();
         stored.expires_at = Some(expires_at);
-        let json = serde_json::to_string(&stored)
-            .map_err(|e| NftError::Netlink(format!("serialize ban: {e}")))?;
         let db = self.db.lock().unwrap();
         let txn = db
             .begin_write()
@@ -141,6 +139,17 @@ impl NftBanManager {
             let mut table = txn
                 .open_table(BANS)
                 .map_err(|e| redb_err("open table", e))?;
+            let previous = table.get(entry.ip.as_str())
+                .map_err(|e| redb_err("get", e))?
+                .and_then(|row| serde_json::from_str::<BanEntry>(&row.value()).ok());
+            let now = now_secs();
+            stored.started_at = previous
+                .filter(|ban| ban.expires_at.is_some_and(|expires| expires > now))
+                .and_then(|ban| ban.started_at.or_else(||
+                    ban.expires_at.map(|expires| expires.saturating_sub(ban.ttl.as_secs()))))
+                .or(Some(now));
+            let json = serde_json::to_string(&stored)
+                .map_err(|e| NftError::Netlink(format!("serialize ban: {e}")))?;
             table
                 .insert(entry.ip.as_str(), json)
                 .map_err(|e| redb_err("put", e))?;
@@ -206,6 +215,8 @@ impl BanManager for NftBanManager {
             match entry.expires_at {
                 Some(expires_at) if expires_at > now => {
                     // ttl 置为剩余秒数(展示用);expires_at 保持绝对时间
+                    entry.started_at = entry.started_at.or_else(||
+                        Some(expires_at.saturating_sub(entry.ttl.as_secs())));
                     entry.ttl = Duration::from_secs(expires_at - now);
                     live.push(entry);
                 }
@@ -262,6 +273,7 @@ mod tests {
             plugin: "ssh-guard".into(),
             node: "node-a".into(),
             scope: crate::BanScope::Local,
+            started_at: None,
             expires_at: None,
         }
     }
@@ -290,6 +302,7 @@ mod tests {
             plugin: "ssh-guard".into(),
             node: "node-a".into(),
             scope: crate::BanScope::Local,
+            started_at: None,
             expires_at: None,
         };
         let j = serde_json::to_string(&e).unwrap();
@@ -323,6 +336,7 @@ mod tests {
         let bans = mgr.list_bans().unwrap();
         assert_eq!(bans.len(), 1);
         assert_eq!(bans[0].ip, "203.0.113.7");
+        let started = bans[0].started_at.unwrap();
         let exp = bans[0].expires_at.unwrap();
         assert!(exp > now_secs(), "expires_at must be absolute unix secs");
         assert!(bans[0].ttl.as_secs() <= 3600 && bans[0].ttl.as_secs() > 3590);
@@ -333,10 +347,29 @@ mod tests {
         let bans = mgr.list_bans().unwrap();
         assert_eq!(bans.len(), 1);
         assert!(bans[0].expires_at.unwrap() >= exp);
+        assert_eq!(bans[0].started_at, Some(started));
 
         mgr.remove_ban("203.0.113.7").unwrap();
         assert!(mgr.list_bans().unwrap().is_empty());
         drop(mgr);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn legacy_start_time_survives_remaining_ttl_and_reopen() {
+        let db = temp_db("start-time");
+        let expires = now_secs() + 1800;
+        let mut legacy = entry("203.0.113.7", Duration::from_secs(3600));
+        legacy.expires_at = Some(expires);
+        seed_db(&db, &[legacy]);
+        for iteration in 0..2 {
+            let mgr = NftBanManager::new(NftHandle::with_socket(Box::new(MockSocket::default())), &db).unwrap();
+            let bans = mgr.list_bans().unwrap();
+            assert_eq!(bans[0].started_at, Some(expires - 3600));
+            assert!(bans[0].ttl.as_secs() <= if iteration == 0 { 1800 } else { 7200 });
+            mgr.apply_ban(&entry("203.0.113.7", Duration::from_secs(7200))).unwrap();
+            assert_eq!(mgr.list_bans().unwrap()[0].started_at, Some(expires - 3600));
+        }
         let _ = std::fs::remove_file(&db);
     }
 

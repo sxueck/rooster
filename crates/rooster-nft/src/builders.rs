@@ -503,8 +503,8 @@ pub fn hardening_meter_sets() -> [HardeningSetSpec; 10] {
     [
         (SET_HONEYPORTS, NFT_DATATYPE_INET_SERVICE, 2, 9),
         (SET_OPENPORTS, NFT_DATATYPE_INET_SERVICE, 2, 10),
-        (SET_HP_V4, NFT_DATATYPE_IPADDR, 4, 11),
-        (SET_HP_V6, NFT_DATATYPE_IP6ADDR, 16, 12),
+        (SET_HP_V4, concat_datatype(NFT_DATATYPE_IPADDR, NFT_DATATYPE_INET_SERVICE), 8, 11),
+        (SET_HP_V6, concat_datatype(NFT_DATATYPE_IP6ADDR, NFT_DATATYPE_INET_SERVICE), 20, 12),
         (SET_SCANPORTS_V4, concat_datatype(NFT_DATATYPE_IPADDR, NFT_DATATYPE_INET_SERVICE), 8, 13),
         (SET_SCANPORTS_V6, concat_datatype(NFT_DATATYPE_IP6ADDR, NFT_DATATYPE_INET_SERVICE), 20, 14),
         (SET_L4HIT_V4, NFT_DATATYPE_IPADDR, 4, 15),
@@ -628,6 +628,40 @@ pub fn build_hardening_ports_reset(seq: &mut Seq) -> Vec<u8> {
         op_msg(&mut ops, NFT_MSG_NEWSET, F_CREATE_EXCL, seq, NFPROTO_INET, |a| {
             hardening_newset(a, name, key_type, klen, id, None);
         });
+    }
+    wrap_batch(&ops, seq.get(), seq.get())
+}
+
+pub fn build_honeypot_set_migration(
+    seq: &mut Seq,
+    spec: &HardeningSpec,
+    legacy_sets: &[&str],
+    old_handles: &[u64],
+) -> Vec<u8> {
+    let mut ops = Vec::new();
+    for handle in old_handles {
+        op_msg(&mut ops, NFT_MSG_DELRULE, F_ACK_ONLY, seq, NFPROTO_INET, |a| {
+            attr_str(a, NFTA_RULE_TABLE, crate::TABLE);
+            attr_str(a, NFTA_RULE_CHAIN, HP_CHAIN);
+            attr_be64(a, NFTA_RULE_HANDLE, *handle);
+        });
+    }
+    for name in legacy_sets {
+        op_msg(&mut ops, NFT_MSG_DELSET, F_ACK_ONLY, seq, NFPROTO_INET, |a| {
+            attr_str(a, NFTA_SET_TABLE, crate::TABLE);
+            attr_str(a, NFTA_SET_NAME, name);
+        });
+    }
+    for (name, key_type, klen, id) in hardening_meter_sets() {
+        if legacy_sets.contains(&name) {
+            op_msg(&mut ops, NFT_MSG_NEWSET, F_CREATE, seq, NFPROTO_INET, |a| {
+                hardening_newset(a, name, key_type, klen, id, Some(spec.honeypot_window_ms.max(1000)));
+            });
+        }
+    }
+    if !old_handles.is_empty() {
+        let rules = build_hardening_chain_rules(seq, HP_CHAIN, &[], spec);
+        ops.extend_from_slice(&rules[20..rules.len() - 20]);
     }
     wrap_batch(&ops, seq.get(), seq.get())
 }
@@ -1046,7 +1080,7 @@ pub fn build_hardening_chain_rules(
                 // meta l4proto tcp + ct state new:蜜罐命中必须是「向蜜罐端口的
                 // 新建 TCP 连接」。不带 ct new 时,本机主动外连的回包(源端口
                 // 撞上蜜罐端口)会被当成蜜罐命中,把自己的客户封掉。
-                for (set, v6) in [(SET_HP_V4, false), (SET_HP_V6, true)] {
+                for (set, v6, dport_reg) in [(SET_HP_V4, false, 9u32), (SET_HP_V6, true, 2u32)] {
                     let mut exprs = Vec::with_capacity(640);
                     expr_meta_nfproto(&mut exprs, if v6 { NFPROTO_IPV6 } else { NFPROTO_IPV4 });
                     expr_meta_tcp(&mut exprs);
@@ -1055,7 +1089,24 @@ pub fn build_hardening_chain_rules(
                     expr_payload_dport(&mut exprs);
                     expr_lookup(&mut exprs, SET_HONEYPORTS, false);
                     expr_payload_saddr(&mut exprs, v6);
-                    expr_dynset(&mut exprs, set, Some(spec.honeypot_window_ms.max(1000)), None);
+                    {
+                        let e = nest_start(&mut exprs, NFTA_LIST_ELEM);
+                        let d = nest_start(&mut exprs, NFTA_EXPR_DATA);
+                        attr_be32(&mut exprs, NFTA_PAYLOAD_DREG, dport_reg);
+                        attr_be32(&mut exprs, NFTA_PAYLOAD_BASE, NFT_PAYLOAD_TRANSPORT_HEADER);
+                        attr_be32(&mut exprs, NFTA_PAYLOAD_OFFSET, 2);
+                        attr_be32(&mut exprs, NFTA_PAYLOAD_LEN, 2);
+                        nest_end(&mut exprs, d);
+                        attr_str(&mut exprs, NFTA_EXPR_NAME, "payload");
+                        nest_end(&mut exprs, e);
+                    }
+                    expr_dynset_inner(
+                        &mut exprs,
+                        set,
+                        NFT_DYNSET_OP_UPDATE,
+                        Some(spec.honeypot_window_ms.max(1000)),
+                        None,
+                    );
                     expr_verdict(&mut exprs, NF_DROP);
                     ops.extend_from_slice(&hardening_rule(seq, chain, &exprs));
                 }
@@ -2166,9 +2217,9 @@ mod tests {
                 "meta", "cmp",          // l4proto tcp(F-4:非 TCP 不得当蜜罐命中)
                 "ct", "bitwise", "cmp",
                 "ct", "cmp",
-                "payload", "lookup", "payload", "dynset", "immediate",
+                "payload", "lookup", "payload", "payload", "dynset", "immediate",
             ],
-            "nfproto→tcp→ct new→dport lookup→saddr→dynset→drop"
+            "nfproto→tcp→ct new→dport lookup→saddr+port tuple→dynset→drop"
         );
         assert_eq!(lookup_name(&exprs, 10), SET_HONEYPORTS);
         assert!(

@@ -592,6 +592,7 @@ fn apply_global_ban(state: &Arc<AgentState>, ip: &str, ttl_secs: u64, reason: &s
         node: source_node.to_string(),
         scope: rooster_nft::BanScope::Global,
         ttl: Duration::from_secs(ttl_secs.max(1)),
+        started_at: None,
         expires_at: None,
     };
     match bans.apply_ban(&entry) {

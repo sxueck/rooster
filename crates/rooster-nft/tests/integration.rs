@@ -163,6 +163,7 @@ fn ban_manager_round_trip() {
         plugin: "itest".into(),
         node: "local".into(),
         scope: rooster_nft::BanScope::Local,
+        started_at: None,
         expires_at: None,
     };
     mgr.apply_ban(&entry).expect("apply ban");

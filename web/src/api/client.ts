@@ -20,6 +20,8 @@ import {
   type Layers,
   type ForwardRule,
   type NodeBansResp,
+  type NodeBanHistoryResp,
+  type NodeHoneypotHistoryResp,
   type AllowlistResp,
   type NodeStats,
   type NodeNetwork,
@@ -62,12 +64,17 @@ export function getHub(): string {
 export function setHub(hub: string): void {
   localStorage.setItem(HUB_KEY, hub)
 }
+/**
+ * token 存 localStorage:有效期由 hub 的 session-ttl(30d)按绝对时间戳控制,
+ * 关浏览器与 Hub 重启(redb 落盘)都不必重新登录。代价是 token 明文留在
+ * 浏览器磁盘上(XSS / 共用机器可读);过期后的 401 会把它抹掉。
+ */
 export function getToken(): string {
-  return sessionStorage.getItem(TOKEN_KEY) ?? ''
+  return localStorage.getItem(TOKEN_KEY) ?? ''
 }
 export function setToken(token: string): void {
-  if (token) sessionStorage.setItem(TOKEN_KEY, token)
-  else sessionStorage.removeItem(TOKEN_KEY)
+  if (token) localStorage.setItem(TOKEN_KEY, token)
+  else localStorage.removeItem(TOKEN_KEY)
 }
 
 /** wss://<hub>/v0/ws?token=... — hub origin (https://) rewritten to ws(s)://. */
@@ -218,6 +225,12 @@ export function deleteForward(id: string, fwdId: string): Promise<null> {
 }
 export function getNodeBans(id: string): Promise<NodeBansResp> {
   return request<NodeBansResp>(`/nodes/${encodeURIComponent(id)}/management/bans`)
+}
+export function getNodeBanHistory(id: string): Promise<NodeBanHistoryResp> {
+  return request<NodeBanHistoryResp>(`/nodes/${encodeURIComponent(id)}/ban-history`)
+}
+export function getNodeHoneypotHistory(id: string): Promise<NodeHoneypotHistoryResp> {
+  return request<NodeHoneypotHistoryResp>(`/nodes/${encodeURIComponent(id)}/honeypot-history`)
 }
 export function addNodeBan(
   id: string,

@@ -1108,23 +1108,18 @@ async fn upgrade_upload_accepts_multi_megabyte_package() {
         Some(binary.len()),
     );
 
-    // 放宽只在上传路由:其他路由仍受默认上限约束(未鉴权也不能灌大 body)。
-    // An early 413 can close the socket before reqwest finishes sending the body.
-    let mut attempts = 0;
-    let resp = loop {
-        attempts += 1;
-        match client()
-            .post(format!("{}/v0/auth/login", hub.base))
+    // Assert the rejection through the real router: an early 413 may close a
+    // TCP upload before reqwest receives the response, making retries flaky.
+    use tower::ServiceExt;
+    let resp = rooster_hub::api::router(hub._state.clone()).oneshot(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v0/auth/login")
+            .extension(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
             .header("content-type", "application/json")
-            .body(vec![b'x'; 4 * 1024 * 1024])
-            .send()
-            .await
-        {
-            Ok(r) => break r,
-            Err(e) if e.is_request() && attempts < 2 => continue,
-            Err(e) => panic!("oversized login request failed unexpectedly: {e}"),
-        }
-    };
+            .body(axum::body::Body::from(vec![b'x'; 4 * 1024 * 1024]))
+            .unwrap(),
+    ).await.unwrap();
     assert_eq!(resp.status(), 413, "non-upload routes must keep the default body limit");
 }
 

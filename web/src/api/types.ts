@@ -123,15 +123,41 @@ export interface ForwardRule {
 }
 export interface BanEntry {
   ip: string
+  country?: string | null
   reason: string
   plugin: string
   node: string
   scope: 'local' | 'global'
+  started_at?: number | null
   expires_at: number
   ttl_secs: number
 }
 export interface NodeBansResp {
   bans: BanEntry[]
+}
+export interface NodeBanHistoryRecord {
+  node_id: string
+  ip: string
+  reason: string
+  plugin: string
+  scope: string
+  started_at: number | null
+  expires_at: number
+  removed_at: number | null
+  removed_by: string
+}
+export interface NodeBanHistoryResp {
+  records: NodeBanHistoryRecord[]
+}
+export interface NodeHoneypotHitRecord {
+  node_id: string
+  ts: number
+  ip: string
+  port: number
+  protocol: string
+}
+export interface NodeHoneypotHistoryResp {
+  hits: NodeHoneypotHitRecord[]
 }
 /** 生效白名单条目来源：admin=管理员配置，hub=Hub 地址豁免，local=节点本地（如 loopback）。 */
 export interface AllowlistEffectiveEntry {
@@ -274,6 +300,7 @@ export interface NodeWasmResp {
 // ---------------- events ----------------
 export type RoosterEvent =
   | { kind: 'ban'; ip: string; reason: string; plugin: string; scope: string; ttl_secs: number }
+  | { kind: 'honeypot_hit'; ip: string; port: number; protocol: string }
   | {
       kind: 'block'
       ip: string

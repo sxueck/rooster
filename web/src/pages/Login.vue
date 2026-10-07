@@ -12,7 +12,7 @@ const auth = useAuthStore()
 const events = useEventsStore()
 const message = useMessage()
 
-// hub 预填自 localStorage；secret_key 只在本次请求中使用，永不落盘。
+// hub 与 token 预填/持久于 localStorage；secret_key 只在本次请求中使用，永不落盘。
 const hub = ref(auth.hub)
 const secret = ref('')
 const error = ref('')
@@ -80,7 +80,7 @@ async function submit() {
       </div>
 
       <p class="muted note">
-        Hub 地址保存在本机 localStorage；token 保存在 sessionStorage；secret_key 仅用于本次登录，不会被存储。
+        Hub 地址与登录 token 保存在本机 localStorage，会话有效期 1 个月（Hub 重启不掉线）；secret_key 仅用于本次登录，不会被存储。
       </p>
     </RPanel>
   </div>

@@ -200,7 +200,7 @@ write_hub_config() {
     [ -z "$public" ] || printf 'public-url: "%s"\n' "$public"
     [ -z "$agent" ] || printf 'agent-url: "%s"\n' "$agent"
     printf 'secret-key: "%s"\n' "$s"
-    printf '%s\n' 'session-ttl: 12h'
+    printf '%s\n' 'session-ttl: 30d'
     printf 'panel-dir: %s\n' "$panel"
     printf '%s\n' 'auto-confirm-delay-secs: 10'
     printf '%s\n' 'audit-retention: 180d'

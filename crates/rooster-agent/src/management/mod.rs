@@ -609,22 +609,43 @@ fn with_bans<T>(
     }
 }
 
-fn ban_to_json(b: &rooster_nft::BanEntry) -> serde_json::Value {
+fn ban_country_reader(state: &AgentState) -> Option<maxminddb::Reader<Vec<u8>>> {
+    let eff = state.effective();
+    let geo = eff.plugins.http_guard.geoip.as_ref()?;
+    let path = crate::geoip::db_path(&eff.agent.data_dir(), &geo.database);
+    maxminddb::Reader::open_readfile(path).ok()
+}
+
+fn ban_country(reader: Option<&maxminddb::Reader<Vec<u8>>>, ip: &str) -> Option<String> {
+    let reader = reader?;
+    let ip = ip.parse::<std::net::IpAddr>().ok()?;
+    let country: maxminddb::geoip2::Country = reader.lookup(ip).ok()?;
+    let record = country.country?;
+    record
+        .names
+        .and_then(|names| names.get("zh-CN").or_else(|| names.get("en")).map(|name| (*name).to_string()))
+        .or_else(|| record.iso_code.map(str::to_string))
+}
+
+fn ban_to_json(b: &rooster_nft::BanEntry, country: Option<String>) -> serde_json::Value {
     json!({
         "ip": b.ip,
+        "country": country,
         "reason": b.reason,
         "plugin": b.plugin,
         "node": b.node,
         "scope": match b.scope { rooster_nft::BanScope::Local => "local", rooster_nft::BanScope::Global => "global" },
+        "started_at": b.started_at,
         "expires_at": b.expires_at,
         "ttl_secs": b.ttl.as_secs(),
     })
 }
 
 async fn list_bans(State(state): State<Arc<AgentState>>) -> Response {
+    let country_reader = ban_country_reader(&state);
     match with_bans(&state, |b| b.list_bans()) {
         Ok(bans) => Json(json!({
-            "bans": bans.iter().map(ban_to_json).collect::<Vec<_>>(),
+            "bans": bans.iter().map(|ban| ban_to_json(ban, ban_country(country_reader.as_ref(), &ban.ip))).collect::<Vec<_>>(),
         }))
         .into_response(),
         Err(resp) => resp,

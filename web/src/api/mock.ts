@@ -26,6 +26,8 @@ import {
   type ForwardRule,
   type BanEntry,
   type NodeBansResp,
+  type NodeBanHistoryRecord,
+  type NodeHoneypotHitRecord,
   type AllowlistResp,
   type NodeStats,
   type NodeNetwork,
@@ -89,6 +91,8 @@ interface MockNodeState {
   layersLocal: Record<string, string>
   forwards: ForwardRule[]
   bans: BanEntry[]
+  banHistory: NodeBanHistoryRecord[]
+  honeypotHits: NodeHoneypotHitRecord[]
   allowlist: string[]
   events: EventRecord[]
   stats: NodeStats
@@ -434,10 +438,12 @@ function buildNode(d: {
     const ttl = pick([300, 600, 3600, 86400])
     return {
       ip: `${pick([103, 185, 194])}.${rand(255)}.${rand(255)}.${rand(254) + 1}`,
+      country: pick(['中国', '美国', '德国']),
       reason: pick(REASONS),
       plugin: pick(['waf', 'ratelimit', 'geo-filter', 'auth']),
       node: d.id,
       scope: i === 0 ? 'global' : 'local',
+      started_at: nowSec() - i * 60,
       expires_at: secIn(ttl - i * 60),
       ttl_secs: ttl,
     }
@@ -469,6 +475,8 @@ function buildNode(d: {
     },
     forwards,
     bans,
+    banHistory: [],
+    honeypotHits: [{ node_id: d.id, ts: nowSec() - 120, ip: '198.51.100.24', port: 2222, protocol: 'tcp' }],
     allowlist: ['10.0.0.0/8', '127.0.0.1/32', '192.168.8.0/24'],
     events,
     banEngine: d.banEngine ?? { available: true, reason: null },
@@ -879,6 +887,12 @@ route('GET', /^\/nodes\/([^/]+)\/management\/bans$/, (m) => {
   requireBanEngine(st)
   return { bans: st.bans } satisfies NodeBansResp
 })
+route('GET', /^\/nodes\/([^/]+)\/ban-history$/, (m) => ({
+  records: state.nodes.find((n) => n.info.id === decodeURIComponent(m[1]))?.banHistory ?? [],
+}))
+route('GET', /^\/nodes\/([^/]+)\/honeypot-history$/, (m) => ({
+  hits: state.nodes.find((n) => n.info.id === decodeURIComponent(m[1]))?.honeypotHits ?? [],
+}))
 route('POST', /^\/nodes\/([^/]+)\/management\/bans$/, (m, opts) => {
   const id = decodeURIComponent(m[1])
   const st = requireOnline(id)
@@ -898,7 +912,20 @@ route('POST', /^\/nodes\/([^/]+)\/management\/bans$/, (m, opts) => {
 route('DELETE', /^\/nodes\/([^/]+)\/management\/bans\/([^/]+)$/, (m) => {
   const st = requireOnline(decodeURIComponent(m[1]))
   requireBanEngine(st)
-  st.bans = st.bans.filter((b) => b.ip !== decodeURIComponent(m[2]))
+  const ip = decodeURIComponent(m[2])
+  const ban = st.bans.find((b) => b.ip === ip)
+  if (ban) st.banHistory.unshift({
+    node_id: st.info.id,
+    ip: ban.ip,
+    reason: ban.reason,
+    plugin: ban.plugin,
+    scope: ban.scope,
+    started_at: ban.started_at ?? null,
+    expires_at: ban.expires_at,
+    removed_at: nowSec(),
+    removed_by: 'panel',
+  })
+  st.bans = st.bans.filter((b) => b.ip !== ip)
   return null // 204
 })
 route('GET', /^\/nodes\/([^/]+)\/management\/allowlist$/, (m) => {

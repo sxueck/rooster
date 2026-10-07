@@ -309,6 +309,41 @@ impl NftHandle {
         };
         self.request(&reset, &[EEXIST])
             .map_err(|e| annotate(e, "ports-ensure"))?;
+        let req = {
+            let mut seq = self.seq.lock().unwrap();
+            build_get_sets(&mut seq)
+        };
+        let mut legacy_sets = Vec::new();
+        for payload in self.dump(&req)? {
+            let Some(name) = find_attr(&payload, NFTA_SET_NAME) else { continue };
+            let name = String::from_utf8_lossy(name).trim_end_matches('\0').to_string();
+            if !matches!(name.as_str(), SET_HP_V4 | SET_HP_V6) {
+                continue;
+            }
+            let klen = find_attr(&payload, NFTA_SET_KEY_LEN)
+                .and_then(|v| <[u8; 4]>::try_from(v).ok())
+                .map(u32::from_be_bytes);
+            let expected = hardening_hit_set_klen(&name).map(|n| n as u32);
+            if klen != expected {
+                legacy_sets.push(name);
+            }
+        }
+        if !legacy_sets.is_empty() {
+            let chains = self.dump_chain_names()?;
+            let handles = if chains.iter().any(|chain| chain == HP_CHAIN) {
+                self.dump_rule_handles(HP_CHAIN)?
+            } else {
+                Vec::new()
+            };
+            let batch = {
+                let mut seq = self.seq.lock().unwrap();
+                let names: Vec<&str> = legacy_sets.iter().map(String::as_str).collect();
+                // Replace the referenced sets and their rules in one transaction;
+                // active bans and all other chains must survive an agent upgrade.
+                build_honeypot_set_migration(&mut seq, spec, &names, &handles)
+            };
+            self.request(&batch, &[]).map_err(|e| annotate(e, "honeypot-migrate"))?;
+        }
         let batch = {
             let mut seq = self.seq.lock().unwrap();
             build_hardening_sets_create(&mut seq, spec)

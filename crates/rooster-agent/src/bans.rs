@@ -360,6 +360,7 @@ pub fn manual_ban_entry(ip: &str, ttl_secs: u64, reason: &str, node: &str) -> Ba
         plugin: "manual".to_string(),
         node: node.to_string(),
         scope: rooster_nft::BanScope::Local,
+        started_at: None,
         expires_at: None,
     }
 }
