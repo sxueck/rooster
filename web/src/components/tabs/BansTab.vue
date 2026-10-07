@@ -192,12 +192,12 @@ onMounted(async () => {
       />
     </RPanel>
 
-    <RPanel title="蜜罐命中详情" kicker="HONEYPOT HITS" flush style="margin-top: 16px">
+    <RPanel title="高置信诱捕端口命中详情" kicker="PORT TRAP HITS" flush style="margin-top: 16px">
       <RTable
         :columns="honeypotCols"
         :rows="honeypotHits"
         :row-key="(r: (typeof honeypotHits)[number]) => r.id"
-        empty-text="暂无蜜罐命中；仅保存来源 IP、目标端口、协议和时间，不记录原始流量（每节点保留最近 1000 条）"
+        empty-text="暂无高置信诱捕端口命中；仅保存来源 IP、目标端口、协议和时间，不记录原始流量（每节点保留最近 1000 条）"
       />
     </RPanel>
   </div>

@@ -21,10 +21,10 @@ interface SectionDef {
 const SECTIONS: SectionDef[] = [
   {
     key: 'honeypot',
-    title: '蜜罐端口',
+    title: '高置信诱捕端口',
     fields: {
       properties: {
-        ports: { type: 'array', title: '端口清单', description: '逗号分隔;留空用内置高危端口表(23,135,137,139,445,…20 项)' },
+        ports: { type: 'array', title: '端口清单', description: '仅选择正常业务绝不会访问的端口；命中即封禁来源 IP。逗号分隔，留空使用内置端口表(23,135,137,139,445,…20 项)' },
         'hit-window': { type: 'string', title: '命中聚合窗口', default: '5m', description: '启用后未填写则用默认 5m' },
         'ban-time': { type: 'string', title: '封禁时长', default: '1h', description: '启用后未填写则用默认 1h' },
       },
