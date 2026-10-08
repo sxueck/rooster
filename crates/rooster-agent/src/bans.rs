@@ -274,7 +274,7 @@ async fn ensure_sshguard(state: &Arc<AgentState>, eff: &EffectiveConfig) {
     tracing::info!("ssh-guard started");
 }
 
-async fn ensure_httpguard(state: &Arc<AgentState>, eff: &EffectiveConfig) {
+pub(crate) async fn ensure_httpguard(state: &Arc<AgentState>, eff: &EffectiveConfig) {
     let data_dir = eff.agent.data_dir();
     let enabled = eff.plugins.http_guard.enabled;
 

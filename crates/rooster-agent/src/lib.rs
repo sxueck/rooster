@@ -11,6 +11,7 @@ pub mod hardening;
 pub mod httpguard;
 pub mod hubclient;
 pub mod management;
+pub mod nginx;
 pub mod outbox;
 pub mod plugin;
 pub mod sshguard;

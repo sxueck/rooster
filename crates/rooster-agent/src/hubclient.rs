@@ -414,6 +414,21 @@ pub async fn connect_and_serve(
                 if let Frame::Error { message } = &frame {
                     break Err(format!("hub rejected connection: {message}"));
                 }
+                // Nginx validation/reload may outlast a heartbeat. Keep replies on
+                // this session's sender so a reconnect cannot receive stale ids.
+                if let Frame::ApiRequest { id, method, path, headers, body } = &frame {
+                    if path.starts_with("/v0/management/nginx/") {
+                        state.hub_connected.send_replace(true);
+                        let state = state.clone();
+                        let tx = frame_tx.clone();
+                        let (id, method, path, headers, body) = (*id, method.clone(), path.clone(), headers.clone(), body.clone());
+                        tokio::spawn(async move {
+                            let (status, headers, body) = crate::management::serve_trusted(&state, &method, &path, &headers, &body).await;
+                            let _ = tx.send(Frame::ApiResponse { id, status, headers, body });
+                        });
+                        continue;
+                    }
+                }
                 if let Err(e) = handle_frame(state, &mut sink, &node, frame).await {
                     break Err(e);
                 }

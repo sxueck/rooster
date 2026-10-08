@@ -589,7 +589,10 @@ async fn passthrough(
         None
     };
     match conn
-        .api_request(&method, &mgmt_path, fwd_headers, body.to_vec(), PASSTHROUGH_TIMEOUT)
+        .api_request(
+            &method, &mgmt_path, fwd_headers, body.to_vec(),
+            if path.starts_with("nginx/") { Duration::from_secs(45) } else { PASSTHROUGH_TIMEOUT },
+        )
         .await
     {
         Ok((status, resp_headers, resp_body)) => {

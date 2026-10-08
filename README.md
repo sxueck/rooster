@@ -15,6 +15,9 @@ Agent:
 - 80/443 reverse proxy — TLS termination (static certs or ACME HTTP-01 with
   cache/renewal) or TCP passthrough via ClientHello SNI peeking; PROXY
   protocol v1/v2 toward upstreams; trusted-proxy real-IP resolution.
+- Nginx discovery and WAF onboarding — scan host server blocks from the Sites
+  tab, enable monitor/block for compatible HTTP proxy sites, and restore their
+  original forwarding configuration. See `docs/nginx-waf-onboarding.md`.
 - WAF — ModSecurity SecLang subset with an OWASP CRS v4 PL1 subset (624
   rules, 0 skipped; see `rules/`), anomaly scoring, paranoia levels, live
   rule inventory and explain-where-rules-came-from diagnostics.

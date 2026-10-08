@@ -1,0 +1,41 @@
+name: nginx-waf
+on:
+  pull_request:
+    paths:
+      - 'crates/rooster-agent/**'
+      - 'crates/rooster-hub/**'
+      - 'crates/rooster-config/**'
+      - 'web/**'
+      - 'Cargo.*'
+      - '.github/workflows/nginx-waf.yml'
+permissions:
+  contents: read
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_CODEGEN_UNITS: '1'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Nginx for isolated lifecycle test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nginx
+          sudo systemctl stop nginx
+      - name: Update Rust toolchain
+        run: rustup update stable --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Nginx lifecycle and agent regression tests
+        env:
+          ROOSTER_TEST_NGINX: '1'
+        run: |
+          cargo test -p rooster-agent --lib --locked -- --test-threads=1
+          cargo test -p rooster-agent --test management --test hub_passthrough --locked
+          cargo test -p rooster-agent --test httpguard --locked -- http_proxy_headers waf_modes_and_exclusions waf_block_reports_block_event_with_severity tls_terminate tls_passthrough body_limit_forwarded_full websocket http2
+          cargo check -p rooster-hub --locked
+      - name: Frontend build
+        run: |
+          npm ci --prefix web
+          npm run build --prefix web

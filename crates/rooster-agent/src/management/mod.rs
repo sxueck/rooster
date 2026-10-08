@@ -60,6 +60,8 @@ pub fn mgmt_router(state: Arc<AgentState>) -> Router {
         .route("/plugins/{name}", get(get_plugin).put(put_plugin))
         .route("/stats", get(get_stats))
         .route("/network", get(get_network))
+        .route("/nginx/sites", get(list_nginx_sites))
+        .route("/nginx/sites/{id}/waf", put(put_nginx_waf))
         .route("/sites", get(list_sites))
         .route("/sites/{id}", put(put_site).delete(delete_site))
         .route("/layers", get(get_layers))
@@ -1042,6 +1044,9 @@ async fn put_site(
 
     // 与 put_forward 相同的临界区:读磁盘 → yamlpatch → 原子落盘。
     let _guard = state.write_lock.lock().unwrap();
+    if crate::nginx::is_managed(&state, &id) {
+        return (StatusCode::CONFLICT, Json(json!({"error": "use the Nginx WAF controls to change or restore this managed site"}))).into_response();
+    }
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
@@ -1112,6 +1117,9 @@ async fn put_site(
 async fn delete_site(State(state): State<Arc<AgentState>>, Path(id): Path<String>) -> Response {
     // 同 put_site:临界区覆盖整段读改写。
     let _guard = state.write_lock.lock().unwrap();
+    if crate::nginx::is_managed(&state, &id) {
+        return (StatusCode::CONFLICT, Json(json!({"error": "restore the Nginx configuration before deleting this managed site"}))).into_response();
+    }
     let raw = match std::fs::read_to_string(&state.config_path) {
         Ok(r) => r,
         Err(e) => {
@@ -1340,4 +1348,47 @@ async fn get_waf_rules(State(state): State<Arc<AgentState>>) -> Response {
         "by_phase": by_phase,
     }))
     .into_response()
+}
+
+// Host Nginx operations run on a blocking worker, never on the WebSocket reader.
+async fn list_nginx_sites(State(state): State<Arc<AgentState>>) -> Response {
+    match tokio::task::spawn_blocking(move || crate::nginx::snapshot(&state)).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": error})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NginxWafChange {
+    mode: rooster_config::WafMode,
+    fingerprint: Option<String>,
+}
+async fn put_nginx_waf(
+    State(state): State<Arc<AgentState>>,
+    Path(id): Path<String>,
+    Json(body): Json<NginxWafChange>,
+) -> Response {
+    let rt = tokio::runtime::Handle::current();
+    match tokio::task::spawn_blocking(move || {
+        crate::nginx::change(state, id, body.mode, body.fingerprint, rt)
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => (StatusCode::CONFLICT, Json(json!({"error": error}))).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
 }

@@ -137,6 +137,7 @@ pub(crate) struct Shared {
     pub(crate) wasm: std::sync::RwLock<Option<Arc<crate::wasmrt::WasmRuntime>>>,
     /// 事件 sink(B5):WAF 拦截等事件由此进入节点事件流;
     /// 未注入(独立测试)时仅记日志,不产生事件。
+    pub(crate) probe_token: String,
     pub(crate) event_sink: std::sync::RwLock<Option<Arc<dyn Fn(rooster_proto::Event) + Send + Sync>>>,
     pub(crate) http_slot: Mutex<Option<ListenerSlot>>,
     pub(crate) https_slot: Mutex<Option<ListenerSlot>>,
@@ -165,6 +166,7 @@ impl HttpGuardRuntime {
                 challenges: Mutex::new(HashMap::new()),
                 inspector: std::sync::RwLock::new(inspector),
                 wasm: std::sync::RwLock::new(None),
+                probe_token: format!("{:032x}", rand::random::<u128>()),
                 event_sink: std::sync::RwLock::new(None),
                 http_slot: Mutex::new(None),
                 https_slot: Mutex::new(None),
@@ -174,6 +176,11 @@ impl HttpGuardRuntime {
                 gate: tokio::sync::Semaphore::new(1),
             }),
         }
+    }
+
+    /// Internal probe credential prevents self-tests from feeding automatic ban policies.
+    pub(crate) fn probe_token(&self) -> &str {
+        &self.inner.probe_token
     }
 
     /// 全量应用(增量 diff listener);未启用或 sites 为空不监听。
