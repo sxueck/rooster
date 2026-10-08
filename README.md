@@ -216,7 +216,11 @@ intentionally deleting hub data, including its node registry and PKI.
 
 The agent role bans via nftables on the host kernel — run it with
 `--network host --cap-add NET_ADMIN`, or enroll real nodes with
-`install.sh` (see `deploy.sh` option 3).
+`install.sh` (see `deploy.sh` option 3). Docker agents use a persistent
+`rooster-agent-data` volume for signed upgrades and rollback; pulling an image
+does not replace the installed agent in that volume. See
+[Docker agent packaging and upgrades](docs/docker-agent-upgrade.md) for signing,
+publishing, deployment and the real Docker end-to-end test.
 
 ## Toolchain
 

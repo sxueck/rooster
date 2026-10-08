@@ -20,6 +20,15 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// 上报给 Hub 的运行时版本(Hello/升级判定共用):CI/Docker 构建注入的
+/// `ROOSTER_VERSION` 优先,空串视为未注入并回退 crate 版本,保证
+/// 升级后 Hub 看到的版本与镜像内二进制一致。
+pub fn reported_version() -> &'static str {
+    option_env!("ROOSTER_VERSION")
+        .filter(|v| !v.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 struct HubEndpoints {
     ws_url: String,
     rest_base: String,
@@ -352,7 +361,7 @@ pub async fn connect_and_serve(
     // Hello。
     let hello = Frame::Hello {
         node_id: node.clone(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: reported_version().to_string(),
         config_hash: hash,
     };
     sink.send(Message::binary(rooster_proto::encode(&hello)))
@@ -845,6 +854,18 @@ pub async fn renewal_loop(state: Arc<AgentState>) {
 mod tests {
     use super::*;
     use rooster_config::HubSection;
+
+    /// 版本上报源:`ROOSTER_VERSION`(非空)优先,否则回退 crate 版本,
+    /// 无论注入与否都不得为空 —— Hub 靠它判定升级是否生效。
+    #[test]
+    fn reported_version_is_never_empty_and_matches_source() {
+        let v = reported_version();
+        assert!(!v.is_empty());
+        let expected = option_env!("ROOSTER_VERSION")
+            .filter(|v| !v.is_empty())
+            .unwrap_or(env!("CARGO_PKG_VERSION"));
+        assert_eq!(v, expected);
+    }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("rooster-hubclient-{tag}-{}", std::process::id()));

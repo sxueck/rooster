@@ -1,11 +1,23 @@
 //! `rooster` 单二进制入口:agent 与 hub 共用一个可执行文件。
 
 use clap::{Parser, Subcommand};
+use rooster_config::UpgradeMethod;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// `--upgrade-method` 值解析:与 config 的 `local.upgrade.method` 同词汇,
+/// 但只作为运行时覆盖,不回写 enrolled 配置。
+fn parse_upgrade_method(s: &str) -> Result<UpgradeMethod, String> {
+    match s {
+        "systemd" => Ok(UpgradeMethod::Systemd),
+        "exit" => Ok(UpgradeMethod::Exit),
+        "none" => Ok(UpgradeMethod::None),
+        _ => Err(format!("expected one of `systemd`, `exit`, `none`, got `{s}`")),
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "rooster", version, about = "port protection agent and management hub")]
+#[command(name = "rooster", version = rooster_agent::hubclient::reported_version(), about = "port protection agent and management hub")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -18,6 +30,13 @@ enum Command {
         /// Path to config.yaml.
         #[arg(long, default_value = "/etc/rooster/config.yaml")]
         config: PathBuf,
+        /// Runtime override of local.agent.data-dir (container: /var/lib/rooster).
+        /// Applied on top of every effective-config read; never written back.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Runtime override of local.upgrade.method (container: `exit`).
+        #[arg(long, value_parser = parse_upgrade_method)]
+        upgrade_method: Option<UpgradeMethod>,
         #[command(subcommand)]
         cmd: Option<AgentCmd>,
     },
@@ -33,10 +52,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AgentCmd {
-    /// systemd ExecStartPre 钩子:升级失败时回退 rooster.prev。
+    /// 启动前钩子:升级失败时回退 Agent 二进制。容器模式下由不可变
+    /// 守护进程调用,须显式指定可变 Agent 二进制。
     UpgradeGuard {
         #[arg(long, default_value = "/var/lib/rooster")]
         data_dir: PathBuf,
+        /// Explicit agent executable to restore (container:
+        /// /var/lib/rooster/bin/rooster). Rollback source is `<binary>.prev`.
+        #[arg(long)]
+        binary: Option<PathBuf>,
     },
 }
 
@@ -52,12 +76,26 @@ enum HubCmd {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Agent { config, cmd: None } => rooster_agent::run(&config).await,
         Command::Agent {
-            config: _,
-            cmd: Some(AgentCmd::UpgradeGuard { data_dir }),
+            config,
+            data_dir,
+            upgrade_method,
+            cmd: None,
         } => {
-            let code = rooster_agent::upgrade::guard(&data_dir);
+            rooster_agent::run(
+                &config,
+                rooster_agent::state::RuntimeOverrides {
+                    data_dir,
+                    upgrade_method,
+                },
+            )
+            .await
+        }
+        Command::Agent {
+            cmd: Some(AgentCmd::UpgradeGuard { data_dir, binary }),
+            ..
+        } => {
+            let code = rooster_agent::upgrade::guard(&data_dir, binary.as_deref());
             ExitCode::from(code as u8)
         }
         Command::Hub { config, cmd: None } => match rooster_hub::run(&config).await {
@@ -85,5 +123,16 @@ async fn main() -> ExitCode {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cli_version_matches_agent_hello() {
+        use clap::CommandFactory;
+
+        let command = super::Cli::command();
+        assert_eq!(command.get_version(), Some(rooster_agent::hubclient::reported_version()));
     }
 }

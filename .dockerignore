@@ -10,4 +10,10 @@ config.yaml
 hub.yaml
 .env.local
 .env.*.local
+.env
+**/.env
+**/config.yaml
+**/hub.yaml
+# Deployment signing keys must never be sent to the image builder.
+**/*.key
 *.log

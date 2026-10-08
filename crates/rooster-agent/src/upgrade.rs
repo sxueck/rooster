@@ -17,7 +17,18 @@ pub fn marker_path(state: &Arc<AgentState>) -> PathBuf {
 
 pub fn prev_binary_path() -> Option<PathBuf> {
     let exe = running_exe_path().ok()?;
-    Some(exe.with_file_name("rooster.prev"))
+    Some(prev_path_for(&exe))
+}
+
+/// 回滚备份路径:`<exe 同目录>/<exe 文件名 stem>.prev`。显式目标
+/// (容器守卫 `--binary`)与自备份使用同一规则,保证能对上。
+pub fn prev_path_for(exe: &Path) -> PathBuf {
+    let stem = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("rooster");
+    exe.with_file_name(format!("{stem}.prev"))
 }
 
 fn status(state: &Arc<AgentState>, version: &str, stage: &str, detail: Option<String>) {
@@ -55,7 +66,9 @@ fn download_progress_detail(last: u64, loaded: u64, total: Option<u64>) -> (u64,
     }
 }
 
-/// 收到 Upgrade 帧后的执行流程。
+/// 收到 Upgrade 帧后的执行流程。整段持 `upgrade_lock`:备份 prev → 写
+/// marker → 原子替换必须串行,否则并发升级会互相覆盖回滚备份或交错
+/// rename(后到者把先到者的新二进制当旧版本备份走)。
 pub async fn handle(
     state: &Arc<AgentState>,
     version: &str,
@@ -63,6 +76,7 @@ pub async fn handle(
     signature_b64: &str,
     frame_public_key: Option<&str>,
 ) {
+    let _upgrade_guard = state.upgrade_lock.lock().await;
     status(state, version, "downloading", None);
     // 下载复用 hub 下载通道:hub 下发的是相对路径(/v0/downloads/...),
     // 必须解析到 hub 基地址并携带 mTLS 节点身份;完整性由下方 Ed25519
@@ -129,16 +143,7 @@ pub async fn handle(
     }
     status(state, version, "applied", None);
 
-    // 重启前写入标记:新进程自检通过后清除。
-    let _ = std::fs::write(
-        marker_path(state),
-        serde_json::json!({
-            "version": version,
-            "ts": now_secs(),
-        })
-        .to_string(),
-    );
-
+    // marker 已在 swap_binary 内于替换前原子落盘;此处无需重写。
     match state.effective().upgrade.method {
         rooster_config::UpgradeMethod::Systemd => {
             let _ = tokio::process::Command::new("systemctl")
@@ -207,31 +212,96 @@ fn strip_deleted_suffix(raw: &Path) -> PathBuf {
 
 const DELETED_MARK: &str = " (deleted)";
 
-/// 备份当前二进制 → 原子替换。
+/// 版本号只允许出现在同目录临时文件名里:过滤到 [A-Za-z0-9._-],
+/// 超长截断 —— Hub 下发的 version 是外部输入,不清洗会拼出
+/// `../../` 或带 `/` 的路径(路径注入)。
+fn sanitize_version_component(version: &str) -> String {
+    let mut s: String = version
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        s.push_str("unknown");
+    }
+    s
+}
+
+/// 备份当前二进制 → 原子替换。marker 必须在新二进制 rename 提交**之前**
+/// 原子落盘且不容忍失败:否则崩溃窗口内新二进制已生效却没有回滚凭据。
 fn swap_binary(state: &Arc<AgentState>, version: &str, bytes: &[u8]) -> Result<(), String> {
     let exe = running_exe_path()?;
+    apply_bytes(&exe, bytes, version, &marker_path(state))
+}
+
+/// 纯文件操作版升级提交(便于单测):备份 → 写新二进制临时文件 →
+/// **原子持久化 marker** → rename 提交。marker 失败则删除临时文件并
+/// 报错,绝不提交新二进制(fail-closed)。
+fn apply_bytes(exe: &Path, bytes: &[u8], version: &str, marker: &Path) -> Result<(), String> {
     let dir = exe
         .parent()
         .ok_or_else(|| "exe has no parent dir".to_string())?
         .to_path_buf();
 
-    let _ = state; // 版本号只用于日志/事件
-    // 备份(覆盖旧 prev)。
-    let prev = dir.join("rooster.prev");
-    std::fs::copy(&exe, &prev)
-        .map_err(|e| format!("backup {} -> {}: {e}", exe.display(), prev.display()))?;
+    if marker.exists() {
+        return Err("another upgrade is pending self-check or rollback".into());
+    }
+    // Stage the backup so an interrupted copy cannot destroy the last rollback image.
+    let prev = prev_path_for(exe);
+    let staged_prev = dir.join(".rooster.prev-tmp");
+    std::fs::copy(exe, &staged_prev).map_err(|e| format!("backup: {e}"))?;
+    std::fs::File::open(&staged_prev).and_then(|f| f.sync_all())
+        .map_err(|e| format!("fsync backup: {e}"))?;
+    std::fs::rename(&staged_prev, &prev).map_err(|e| format!("commit backup: {e}"))?;
+    sync_directory(&dir)?;
 
     // 写临时文件 → fsync → rename(与配置写入同款原子性)。
-    let tmp = dir.join(format!(".rooster.new-{version}"));
+    let tmp = dir.join(format!(".rooster.new-{}", sanitize_version_component(version)));
+
     let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
     f.write_all(bytes).map_err(|e| format!("write tmp: {e}"))?;
-    f.sync_all().map_err(|e| format!("fsync tmp: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod staged executable: {e}"))?;
     }
-    std::fs::rename(&tmp, &exe).map_err(|e| format!("rename: {e}"))?;
+    f.sync_all().map_err(|e| format!("fsync tmp: {e}"))?;
+    // 提交前先落回滚凭据:原子写失败 → 放弃本次升级,保留旧二进制。
+    if let Err(e) = persist_marker(marker, version) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("persist upgrade marker {}: {e}", marker.display()));
+    }
+    std::fs::rename(&tmp, exe).map_err(|e| format!("rename: {e}"))?;
+    sync_directory(&dir)
+}
+
+/// 原子写升级标记(tmp → fsync → rename);失败必须上抛,不得忽略。
+fn persist_marker(marker: &Path, version: &str) -> Result<(), String> {
+    let dir = marker
+        .parent()
+        .ok_or_else(|| "marker has no parent dir".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let tmp = dir.join(".upgrade-pending.json.tmp");
+    let body = serde_json::json!({ "version": version, "ts": now_secs() }).to_string();
+    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create: {e}"))?;
+    f.write_all(body.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    f.sync_all().map_err(|e| format!("fsync: {e}"))?;
+    std::fs::rename(&tmp, marker).map_err(|e| format!("rename: {e}"))?;
+    sync_directory(dir)
+}
+
+fn sync_directory(dir: &Path) -> Result<(), String> {
+    // fsync the directory as well: file fsync alone does not persist the rename after a crash.
+    #[cfg(unix)]
+    std::fs::File::open(dir).and_then(|f| f.sync_all())
+        .map_err(|e| format!("fsync directory {}: {e}", dir.display()))?;
     Ok(())
 }
 
@@ -264,43 +334,86 @@ fn restore_into(prev: &std::path::Path, exe: &std::path::Path) -> Result<bool, S
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod restored executable: {e}"))?;
     }
+    std::fs::File::open(&tmp).and_then(|f| f.sync_all())
+        .map_err(|e| format!("fsync restored executable: {e}"))?;
     std::fs::rename(&tmp, exe).map_err(|e| format!("restore rename: {e}"))?;
+    sync_directory(&dir)?;
     Ok(true)
 }
 
-/// `rooster upgrade-guard --data-dir`:systemd ExecStartPre 钩子。
-/// 标记存在且超过宽限期 → 上次升级失败,回退旧二进制。
-pub fn guard(data_dir: &std::path::Path) -> i32 {
+/// `rooster agent upgrade-guard --data-dir [--binary]`:systemd
+/// ExecStartPre / 容器监督进程的启动前钩子。
+/// - 无 `--binary`(systemd):回退对象是本进程 exe 旁的 `rooster.prev`;
+/// - 有 `--binary`(容器,守护进程是不可变 /usr/local/bin/rooster,
+///   Agent 是可变 /var/lib/rooster/bin/rooster):回退对象是该显式路径
+///   及其 `<stem>.prev`。新二进制“无法执行”时 Agent 进程永远起不来,
+///   自检永远不清 marker —— 因此目标缺失/不可执行时立即回退,不等宽限期。
+pub fn guard(data_dir: &std::path::Path, binary: Option<&std::path::Path>) -> i32 {
     let marker = data_dir.join("upgrade-pending.json");
-    let Ok(raw) = std::fs::read_to_string(&marker) else {
-        return 0;
+    let raw = match std::fs::read_to_string(&marker) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            eprintln!("upgrade-guard: cannot read pending marker: {e}");
+            return 1;
+        }
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        let _ = std::fs::remove_file(&marker);
-        return 0;
+    let v = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("upgrade-guard: invalid pending marker: {e}");
+            return 1;
+        }
     };
     let ts = v["ts"].as_u64().unwrap_or(0);
     let version = v["version"].as_str().unwrap_or("?");
     // 宽限 90s:新进程正常时应已自检清除;仍存在说明上次启动即失败。
-    if now_secs().saturating_sub(ts) > 90 {
-        match restore_previous() {
-            Ok(true) => {
-                let _ = std::fs::remove_file(&marker);
-                eprintln!("upgrade-guard: rolled back to rooster.prev (version {version} failed)");
-            }
-            Ok(false) => {
-                let _ = std::fs::remove_file(&marker);
-                eprintln!("upgrade-guard: no rooster.prev to roll back to");
-            }
-            Err(e) => {
-                eprintln!("upgrade-guard: rollback failed: {e}");
+    let stale = now_secs().saturating_sub(ts) > 90;
+    // 显式目标:文件缺失或无执行位 → 新二进制不可能跑起来清 marker,
+    // 立即回退而不是空转 90s 崩溃循环。(二进制有 +x 但内容损坏的
+    // 情况由宽限期兜底:自检失败保留 marker,下次 guard 回退。)
+    let target_broken = binary.is_some_and(|b| !is_executable_file(b));
+    if !stale && !target_broken {
+        return 0;
+    }
+    let restore = match binary {
+        Some(b) => restore_into(&prev_path_for(b), b),
+        None => restore_previous(),
+    };
+    match restore {
+        Ok(true) => {
+            let _ = std::fs::remove_file(&marker);
+            eprintln!("upgrade-guard: rolled back to previous binary (version {version} failed)");
+        }
+        Ok(false) => {
+            eprintln!("upgrade-guard: no previous binary to roll back to");
+            if binary.is_some() {
                 return 1;
             }
+            let _ = std::fs::remove_file(&marker);
+        }
+        Err(e) => {
+            // 回退失败保留 marker(下次 guard 重试),退出码 1 交监督方处置。
+            eprintln!("upgrade-guard: rollback failed: {e}");
+            return 1;
         }
     }
     0
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// 启动时自检:标记存在 → 60s 内连上 Hub 则清除标记,
@@ -313,11 +426,26 @@ pub fn spawn_self_check(state: Arc<AgentState>) {
     tokio::spawn(async move {
         let mut rx = state.hub_connected.subscribe();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        let ok = tokio::select! {
-            changed = rx.changed() => {
-                changed.is_ok() && *rx.borrow_and_update()
+        // 订阅时可能已经连上 Hub,先读当前值以免一直等待 changed()。
+        // 瞬时断线不是终态:继续等待重连或超时。
+        let ok = 'wait: {
+            if *rx.borrow() {
+                break 'wait true;
             }
-            _ = tokio::time::sleep_until(deadline) => false,
+            loop {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break 'wait false; // watch sender 已销毁
+                        }
+                        if *rx.borrow_and_update() {
+                            break 'wait true;
+                        }
+                        // 瞬时断线:继续等直到 deadline。
+                    }
+                    _ = tokio::time::sleep_until(deadline) => break 'wait false,
+                }
+            }
         };
         if ok {
             let _ = std::fs::remove_file(marker_path(&state));
@@ -415,8 +543,167 @@ mod tests {
         )
         .unwrap();
         // 没有 rooster.prev:标记被清,不回退,退出码 0。
-        assert_eq!(guard(&dir), 0);
+        assert_eq!(guard(&dir, None), 0);
         assert!(!marker.exists());
+    }
+
+    fn write_marker(dir: &std::path::Path, ts: u64) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let marker = dir.join("upgrade-pending.json");
+        std::fs::write(
+            &marker,
+            serde_json::json!({"version": "1.0.0-container", "ts": ts}).to_string(),
+        )
+        .unwrap();
+        marker
+    }
+
+    /// 容器守护(guard 自身是不可变二进制,不看 current_exe):
+    /// `--binary` 显式指定 Agent 可执行文件,stale marker → 从
+    /// `<binary>.prev` 恢复到显式目标并清标记。
+    #[test]
+    fn guard_restores_explicit_target_from_prev() {
+        let dir = std::env::temp_dir()
+            .join(format!("rooster-guard-target-{}-{}", std::process::id(), rand::random::<u64>()));
+        let bin = dir.join("bin").join("rooster");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"new-broken").unwrap();
+        std::fs::write(prev_path_for(&bin), b"old-good").unwrap();
+        let marker = write_marker(&dir.join("data"), now_secs() - 1000);
+
+        assert_eq!(guard(&dir.join("data"), Some(&bin)), 0);
+        assert_eq!(std::fs::read(&bin).unwrap(), b"old-good");
+        assert!(!marker.exists(), "成功回退后必须清 marker");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新二进制“无法执行”(这里模拟缺失执行位;文件缺失同理):Agent
+    /// 进程永远起不来清 marker,守护必须立即回退而不是空等 90s 宽限。
+    #[test]
+    fn guard_restores_broken_target_without_waiting_grace() {
+        let dir = std::env::temp_dir()
+            .join(format!("rooster-guard-exec-{}-{}", std::process::id(), rand::random::<u64>()));
+        let bin = dir.join("bin").join("rooster");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"garbage-no-exec-bit").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        std::fs::write(prev_path_for(&bin), b"old-good").unwrap();
+        // ts=now:宽限期内;若只看宽限会直接返回 0 不回退。
+        let marker = write_marker(&dir.join("data"), now_secs());
+
+        assert_eq!(guard(&dir.join("data"), Some(&bin)), 0);
+        assert_eq!(std::fs::read(&bin).unwrap(), b"old-good");
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fail-closed:回退本身失败(prev 不可读)→ 保留 marker 供下次
+    // guard 重试,退出码 1。
+    #[test]
+    fn guard_fails_closed_when_explicit_rollback_fails() {
+        let dir = std::env::temp_dir()
+            .join(format!("rooster-guard-fail-{}-{}", std::process::id(), rand::random::<u64>()));
+        let bin = dir.join("bin").join("rooster");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"new-broken").unwrap();
+        // prev 是目录:fs::copy 读它必失败。
+        std::fs::create_dir_all(prev_path_for(&bin)).unwrap();
+        let marker = write_marker(&dir.join("data"), now_secs() - 1000);
+
+        assert_eq!(guard(&dir.join("data"), Some(&bin)), 1);
+        assert!(marker.exists(), "回退失败必须保留 marker 供重试");
+        assert_eq!(std::fs::read(&bin).unwrap(), b"new-broken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fail-closed:marker 无法原子落盘(data-dir 被占位文件堵住)→
+    /// 升级必须在提交新二进制之前放弃,旧二进制原封不动,临时文件清理。
+    #[test]
+    fn apply_bytes_fails_closed_when_marker_cannot_persist() {
+        let dir = std::env::temp_dir()
+            .join(format!("rooster-marker-fail-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("rooster");
+        std::fs::write(&exe, b"old-binary").unwrap();
+        // 占位文件使 marker 的父目录无法创建。
+        std::fs::write(dir.join("data"), b"not-a-dir").unwrap();
+        let marker = dir.join("data").join("upgrade-pending.json");
+
+        let err = apply_bytes(&exe, b"new-binary", "2.0.0", &marker).unwrap_err();
+        assert!(err.contains("marker"), "错误应指向 marker 持久化: {err}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old-binary", "不得提交新二进制");
+        assert_eq!(std::fs::read(prev_path_for(&exe)).unwrap(), b"old-binary");
+        assert!(!dir.join(".rooster.new-2.0.0").exists(), "临时文件应清理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_upgrade_preserves_rollback_backup() {
+        let dir = std::env::temp_dir()
+            .join(format!("rooster-pending-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("rooster");
+        let marker = dir.join("upgrade-pending.json");
+        std::fs::write(&exe, b"current").unwrap();
+        std::fs::write(prev_path_for(&exe), b"previous").unwrap();
+        std::fs::write(&marker, b"pending").unwrap();
+        assert!(apply_bytes(&exe, b"next", "3.0.0", &marker).is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"current");
+        assert_eq!(std::fs::read(prev_path_for(&exe)).unwrap(), b"previous");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"pending");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_guard_retains_marker_when_backup_missing_or_marker_invalid() {
+        let dir = std::env::temp_dir()
+            .join(format!("rooster-guard-missing-{}", rand::random::<u64>()));
+        let marker = write_marker(&dir, now_secs() - 1000);
+        let binary = dir.join("rooster");
+        assert_eq!(guard(&dir, Some(&binary)), 1);
+        assert!(marker.exists());
+        std::fs::write(&marker, b"invalid-json").unwrap();
+        assert_eq!(guard(&dir, Some(&binary)), 1);
+        assert!(marker.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 正常路径:marker 在提交前原子落盘;成功后 exe 是新内容,
+    /// prev 是旧内容,marker 携带版本与时间戳。
+    #[test]
+    fn apply_bytes_commits_only_after_marker_persisted() {
+        let dir = std::env::temp_dir()
+            .join(format!("rooster-marker-ok-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("rooster");
+        std::fs::write(&exe, b"old-binary").unwrap();
+        let data = dir.join("data");
+        let marker = data.join("upgrade-pending.json");
+
+        apply_bytes(&exe, b"new-binary", "2.0.0", &marker).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary");
+        assert_eq!(std::fs::read(prev_path_for(&exe)).unwrap(), b"old-binary");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(v["version"].as_str(), Some("2.0.0"));
+        assert!(v["ts"].as_u64().unwrap() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hub 下发的 version 是外部输入:临时文件名必须清洗掉路径分隔符,
+    /// 否则 `.rooster.new-../../x` 会写到 exe 目录之外(路径注入)。
+    #[test]
+    fn version_component_is_sanitized() {
+        assert_eq!(sanitize_version_component("1.2.3"), "1.2.3");
+        assert_eq!(sanitize_version_component("../../pwned"), ".._.._pwned");
+        assert!(!sanitize_version_component("a/b\\c").contains('/'));
+        assert!(!sanitize_version_component("a/b\\c").contains('\\'));
+        assert_eq!(sanitize_version_component(""), "unknown");
+        assert!(sanitize_version_component(&"x".repeat(200)).len() <= 64);
     }
 
     /// 重跑 install.sh 覆盖运行中的二进制后,current_exe() 带 " (deleted)"
@@ -435,9 +722,7 @@ mod tests {
     }
 
     fn exe_prev_path() -> PathBuf {
-        std::env::current_exe()
-            .unwrap()
-            .with_file_name("rooster.prev")
+        prev_path_for(&std::env::current_exe().unwrap())
     }
 
     fn ensure_no_prev() {

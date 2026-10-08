@@ -648,24 +648,51 @@ deploy_agent_join() (
 )
 
 # ---------------- agent: docker ----------------
+# The entrypoint seeds the agent only once; signed upgrades persist in the
+# data volume rather than replacing the immutable image binary.
 deploy_agent_docker() {
-  have docker || die "docker not found"
+  have docker || die "docker not found (https://docs.docker.com/engine/install/)"
+  # validate the daemon before any prompt or deletion: with docker down we
+  # must not rm the running agent container
+  docker info >/dev/null 2>&1 || die "docker daemon is not reachable (is the service running?)"
+  step "checking prerequisites (docker daemon)"
   say "${Y}the agent bans via nftables on the HOST kernel — it needs host networking"
   say "and NET_ADMIN; for production prefer the install.sh enrollment.${N}"
-  local dir
+  local dir names recreate=no
   dir="$(ask "directory containing an enrolled config.yaml" "/etc/rooster")"
   [ -f "$dir/config.yaml" ] || die "no config.yaml in $dir (enroll via install.sh first, or write one)"
   dir="$(cd "$dir" && pwd -P)"
+  names="$(docker ps -a --format '{{.Names}}')"
+  if grep -qx rooster-agent <<< "$names"; then
+    [ "$(choose "container 'rooster-agent' exists" \
+      "abort" \
+      "recreate it (enrolled config and the rooster-agent-data volume are kept)")" != abort ] ||
+      die "aborted; the existing container was left untouched"
+    recreate=yes
+  fi
   step "pulling image $IMAGE:latest (layer progress below)"
   docker pull "$IMAGE:latest"
-  step "starting the agent container (host network + NET_ADMIN)"
-  docker rm -f rooster-agent >/dev/null 2>&1 || true
-  docker run -d --name rooster-agent --restart unless-stopped \
+  step "starting the agent container (host network + NET_ADMIN, persistent rooster-agent-data volume)"
+  # A failed pull must leave the existing container running.
+  if [ "$recreate" = yes ]; then
+    docker rm -f rooster-agent >/dev/null
+  fi
+  # Never delete this volume: the installed binary and upgrade state must
+  # survive image pulls and container recreation.
+  docker run -d --name rooster-agent --restart unless-stopped --init \
     --network host --cap-add NET_ADMIN \
+    -v rooster-agent-data:/var/lib/rooster \
     -v "$dir:/etc/rooster" \
-    "$IMAGE" agent --config /etc/rooster/config.yaml >/dev/null
+    "$IMAGE:latest" agent --config /etc/rooster/config.yaml >/dev/null
   say ""
   say "$B>Agent container started$N — logs: docker logs -f rooster-agent"
+  say "  agent state: docker volume ${B}rooster-agent-data${N} mounted at /var/lib/rooster"
+  say "  ${DIM}hub-signed upgrades replace the binary inside that volume and persist across"
+  say "  ${DIM}\`docker pull\` and container recreation; --restart unless-stopped reloads the"
+  say "  ${DIM}upgraded process, and the entrypoint's upgrade-guard rolls bad ones back.${N}"
+  say "  ${DIM}this script never deletes volumes; wiping agent state (enrolled identity,"
+  say "  ${DIM}upgraded binary) requires \`docker rm -f rooster-agent && docker volume rm"
+  say "  ${DIM}rooster-agent-data\` run manually.${N}"
 }
 
 renew_hub_tls() (

@@ -14,6 +14,27 @@ use crate::outbox::Outbox;
 
 const MAX_EVENTS: usize = 500;
 
+/// CLI 运行时覆盖项(容器部署):叠加在每次 effective 配置读取之上,
+/// 热重载/commit 后自动重新应用,不回写 enrolled config.yaml。
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeOverrides {
+    pub data_dir: Option<PathBuf>,
+    pub upgrade_method: Option<rooster_config::UpgradeMethod>,
+}
+
+impl RuntimeOverrides {
+    /// 幂等叠加:只覆盖显式给出的字段。
+    pub fn apply(&self, mut effective: EffectiveConfig) -> EffectiveConfig {
+        if let Some(data_dir) = &self.data_dir {
+            effective.agent.data_dir = Some(data_dir.clone());
+        }
+        if let Some(method) = self.upgrade_method {
+            effective.upgrade.method = method;
+        }
+        effective
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EventRecord {
     pub ts: u64,
@@ -64,6 +85,8 @@ pub struct AgentState {
     /// 循环消费(转发 diff、白名单重算、ssh-guard 重启、wasm 重载)。
     /// 回滚也走 commit_raw,因此自动被覆盖。
     pub runtime_notify: tokio::sync::Notify,
+    /// CLI 运行时覆盖项(容器);effective() 每次读取时叠加。
+    pub runtime_overrides: RwLock<RuntimeOverrides>,
     /// WASM 插件运行时。
     pub wasmrt: Arc<crate::wasmrt::WasmRuntime>,
     /// 当前运行的 wasm 配置快照(变更比对)。
@@ -85,6 +108,9 @@ pub struct AgentState {
     pub outbox_acked: Mutex<u64>,
     /// hub 连接状态(升级自检用)。
     pub hub_connected: tokio::sync::watch::Sender<bool>,
+    /// 串行化并发 Upgrade 帧:备份 prev → 写 marker → 原子替换必须整体
+    /// 互斥,否则两个升级互相覆盖回滚备份 / 交错 rename。
+    pub upgrade_lock: tokio::sync::Mutex<()>,
     /// 注入当前 hub 连接的发送端(证书续签等 Agent 主动帧),附会话代号以便
     /// 旧会话退出时不会误注销新会话的发送端。
     pub hub_frame_tx: Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<rooster_proto::Frame>)>>,
@@ -133,14 +159,24 @@ impl AgentState {
             hub_outbox: Mutex::new(None),
             outbox_notify: tokio::sync::Notify::new(),
             outbox_acked: Mutex::new(0),
+            runtime_overrides: RwLock::new(RuntimeOverrides::default()),
             hub_connected: tokio::sync::watch::Sender::new(false),
+            upgrade_lock: tokio::sync::Mutex::new(()),
             hub_frame_tx: Mutex::new(None),
             hub_frame_gen: AtomicU64::new(0),
         }
     }
 
+    /// CLI 运行时覆盖项(容器);构造后、共享 Arc 前设置一次。
+    pub fn set_runtime_overrides(&self, overrides: RuntimeOverrides) {
+        *self.runtime_overrides.write().unwrap() = overrides;
+    }
+
+    /// 读取生效配置,叠加 CLI 运行时覆盖项(容器模式的 data-dir /
+    /// upgrade-method 在热重载后仍然生效)。
     pub fn effective(&self) -> EffectiveConfig {
-        self.effective.read().unwrap().clone()
+        let eff = self.effective.read().unwrap().clone();
+        self.runtime_overrides.read().unwrap().apply(eff)
     }
 
     pub fn current_hash(&self) -> String {
@@ -214,6 +250,7 @@ impl AgentState {
                 effective,
                 ..
             } => {
+                let effective = self.runtime_overrides.read().unwrap().apply(effective);
                 *self.effective.write().unwrap() = effective;
                 self.push_event(Event::ConfigChanged { hash });
                 self.runtime_notify.notify_one();
@@ -233,6 +270,8 @@ impl AgentState {
     /// 不产生事件;调用方按场景(ConfigChanged / ConfigRolledBack)自行记录。
     pub fn commit_raw(&self, new_raw: &str) -> Result<EffectiveConfig, ConfigError> {
         let (_file, effective) = parse_and_validate(new_raw)?;
+        // 覆盖项叠加在返回值与内存生效配置上;磁盘文件保持 enrolled 内容。
+        let effective = self.runtime_overrides.read().unwrap().apply(effective);
         self.writer.write_atomic(new_raw)?;
         let h = rooster_config::hash_content(new_raw);
         *self.watcher.last_self_write.lock().unwrap() = h.clone();
@@ -323,5 +362,84 @@ impl AgentState {
             }
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::management::auth::AuthGate;
+    use rooster_config::{hash_content, parse_and_validate, ConfigWriter, WatcherState};
+    use std::path::Path;
+
+    fn build_state(dir: &Path) -> Arc<AgentState> {
+        let raw = format!(
+            "local:\n  agent:\n    node-name: override-test\n    data-dir: {}\n  upgrade:\n    method: systemd\n",
+            dir.join("enrolled-data").display()
+        );
+        let config_path = dir.join("config.yaml");
+        std::fs::write(&config_path, &raw).unwrap();
+        let (_file, effective) = parse_and_validate(&raw).unwrap();
+        let writer = ConfigWriter::new(&config_path, dir);
+        let watcher = Arc::new(WatcherState::new(hash_content(&raw)));
+        Arc::new(AgentState::new(
+            config_path,
+            writer,
+            watcher,
+            effective,
+            AuthGate::new(String::new()),
+        ))
+    }
+
+    /// 容器模式 CLI 覆盖项(agent --data-dir / --upgrade-method):
+    /// ①立即生效;②热重载 Applied 后仍然生效;③commit_raw 写入新配置
+    /// 后生效视图仍带覆盖,但磁盘 enrolled 文件不被改写。
+    #[test]
+    fn runtime_overrides_survive_reload_and_commit() {
+        let dir = std::env::temp_dir()
+            .join(format!("rooster-overrides-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = build_state(&dir);
+        let override_dir = dir.join("container-data");
+        state.set_runtime_overrides(RuntimeOverrides {
+            data_dir: Some(override_dir.clone()),
+            upgrade_method: Some(rooster_config::UpgradeMethod::Exit),
+        });
+
+        // ① 立即生效。
+        let eff = state.effective();
+        assert_eq!(eff.agent.data_dir(), override_dir);
+        assert_eq!(eff.upgrade.method, rooster_config::UpgradeMethod::Exit);
+
+        // ② 外部热重载(磁盘文件换成另一个 data-dir):覆盖项保持。
+        let raw2 = format!(
+            "local:\n  agent:\n    node-name: override-test\n    data-dir: {}\n",
+            dir.join("rewritten-data").display()
+        );
+        let config_path = &state.config_path;
+        std::fs::write(config_path, &raw2).unwrap();
+        let (file, effective) = parse_and_validate(&raw2).unwrap();
+        state.on_reload_outcome(rooster_config::ReloadOutcome::Applied {
+            hash: hash_content(&raw2),
+            config: file,
+            effective,
+        });
+        let eff = state.effective();
+        assert_eq!(eff.agent.data_dir(), override_dir, "热重载不得冲掉 CLI 覆盖");
+        assert_eq!(eff.upgrade.method, rooster_config::UpgradeMethod::Exit);
+
+        // ③ API 路径 commit_raw:生效视图带覆盖,磁盘保持 enrolled 值。
+        let raw3 = format!(
+            "local:\n  agent:\n    node-name: override-test\n    data-dir: {}\n",
+            dir.join("api-data").display()
+        );
+        let committed = state.commit_raw(&raw3).unwrap();
+        assert_eq!(committed.agent.data_dir(), override_dir);
+        assert_eq!(state.effective().agent.data_dir(), override_dir);
+        let on_disk = std::fs::read_to_string(config_path).unwrap();
+        assert!(on_disk.contains("api-data"), "enrolled 配置应保留 API 写入值");
+        assert!(!on_disk.contains("container-data"), "覆盖项不得回写磁盘");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

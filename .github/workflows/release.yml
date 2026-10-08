@@ -27,37 +27,32 @@ jobs:
     env:
       SUFFIX: ${{ matrix.suffix }}
       TARGET: ${{ matrix.target }}
+      CARGO_BUILD_JOBS: 1
     steps:
       # v4
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
 
-      # v2
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          key: ${{ matrix.target }}
+      - name: Set binary version
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) version="${GITHUB_REF#refs/tags/v}" ;;
+            *) version="main-${GITHUB_SHA::7}" ;;
+          esac
+          echo "ROOSTER_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Build
         run: |
-          cargo build --release --bin rooster --target "$TARGET"
+          cargo build --locked --release --bin rooster --target "$TARGET"
           "target/$TARGET/release/rooster" --version
           "target/$TARGET/release/rooster" agent upgrade-guard --help >/dev/null
 
-      # 产物只保留压缩形态(gz ~2.7x / xz ~4x):上传面板前本地解压再签名。
       - name: Package
         run: |
-          case "$GITHUB_REF" in
-            refs/tags/v*) ver="${GITHUB_REF#refs/tags/v}" ;;
-            *) ver="main-${GITHUB_SHA::7}" ;;
-          esac
-          mkdir dist
-          bin="rooster-$ver-$SUFFIX"
-          cp "target/$TARGET/release/rooster" "dist/$bin"
-          gzip -9 -k "dist/$bin"
-          xz -9 -T0 -k "dist/$bin"
-          rm "dist/$bin"
-          (cd dist && sha256sum "$bin.gz" "$bin.xz" > SHA256SUMS)
+          sh scripts/package-agent.sh "target/$TARGET/release/rooster" dist "$SUFFIX"
+          rm dist/SHA256SUMS
+          mv dist/manifest.json "dist/manifest-$SUFFIX.json"
 
       # v4
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -81,15 +76,18 @@ jobs:
           merge-multiple: true
           path: release
 
+      - name: Combine checksums
+        run: cat release/SHA256SUMS-* > release/SHA256SUMS
+
       # runner 自带 gh:create 失败重跑时 release 可能已建,先 view 再补传。
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF#refs/tags/}"
-          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" \
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --title "rooster ${tag#v}" \
-            --notes 'Compressed rooster binaries (-x86_64 / -aarch64) plus SHA256SUMS. Decompress, sign with your Ed25519 upgrade key, then upload through the panel as version <ver>-<arch>.' \
+            --notes 'Raw and compressed rooster binaries (-x86_64 / -aarch64), manifests and SHA256SUMS. Sign raw binaries with your deployment Ed25519 upgrade key using scripts/publish-agent.py, then upload as version <ver>-<arch>.' \
             --verify-tag
           gh release upload "$tag" release/* --clobber --repo "$GITHUB_REPOSITORY"

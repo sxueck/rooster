@@ -112,6 +112,18 @@ wait_hub(){
 '''
 
 
+AGENT_DOCKER = r'''
+have(){ return 0; }
+docker(){
+  printf '%s\n' "$*" >> "$COMMAND_LOG"
+  case "$1" in
+    info) [ "${DAEMON_DOWN:-}" != yes ];;
+    ps) printf '%s' "${EXISTING_AGENT:-}";;
+  esac
+}
+'''
+
+
 class DeployTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -378,6 +390,76 @@ as_root(){ "$@"; }
                 self.assertIn("INSTALL_ARG <--ca-sha256>", output)
                 self.assertNotIn("INSTALL_ARG <--insecure>", output)
                 self.assertIn("INSTALL_ARG <test-token>", output)
+
+    def enrolled_config(self):
+        directory = self.dir / "enrolled"
+        directory.mkdir()
+        (directory / "config.yaml").write_text("local:\n  agent:\n    node-name: docker-test\n")
+        return directory
+
+    def agent_run_line(self, directory):
+        return ("run -d --name rooster-agent --restart unless-stopped --init "
+                "--network host --cap-add NET_ADMIN "
+                "-v rooster-agent-data:/var/lib/rooster "
+                f"-v {directory}:/etc/rooster "
+                "ghcr.io/sxueck/rooster:latest agent --config /etc/rooster/config.yaml")
+
+    def test_agent_docker_validates_daemon_before_any_change(self):
+        enrolled = self.enrolled_config()
+        result = bash(AGENT_DOCKER + "\ndeploy_agent_docker", f"{enrolled}\n", env={
+            **self.env, "DAEMON_DOWN": "yes",
+        })
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("daemon", result.stderr)
+        commands = Path(self.env["COMMAND_LOG"]).read_text()
+        self.assertIn("info", commands)
+        for forbidden in ("pull", "rm -f", "run -d", "volume"):
+            self.assertNotIn(forbidden, commands)
+
+    def test_agent_docker_uses_named_volume_init_and_host_network(self):
+        enrolled = self.enrolled_config()
+        output = self.ok(bash(AGENT_DOCKER + "\ndeploy_agent_docker", f"{enrolled}\n", env=self.env))
+        commands = Path(self.env["COMMAND_LOG"]).read_text()
+        run_line = self.agent_run_line(enrolled)
+        self.assertIn(run_line, commands)
+        # the image is pulled before anything is created or removed
+        self.assertLess(commands.index("pull ghcr.io/sxueck/rooster:latest"), commands.index(run_line))
+        self.assertNotIn("rm -f", commands)
+        self.assertNotIn("volume", commands)
+        self.assertIn("rooster-agent-data", output)
+        self.assertIn("docker pull", output)
+        self.assertIn("never deletes volumes", output)
+
+    def test_agent_docker_requires_confirmation_and_keeps_volume(self):
+        enrolled = self.enrolled_config()
+        env = {**self.env, "EXISTING_AGENT": "rooster-agent\n"}
+        aborted = bash(AGENT_DOCKER + "\ndeploy_agent_docker", f"{enrolled}\n1\n", env=env)
+        self.assertNotEqual(aborted.returncode, 0)
+        commands = Path(self.env["COMMAND_LOG"]).read_text()
+        for forbidden in ("pull", "rm -f", "run -d", "volume"):
+            self.assertNotIn(forbidden, commands)
+        self.assertIn("left untouched", aborted.stderr)
+        self.assertIn("are kept", aborted.stderr)
+
+        output = self.ok(bash(AGENT_DOCKER + "\ndeploy_agent_docker", f"{enrolled}\n2\n", env=env))
+        commands = Path(self.env["COMMAND_LOG"]).read_text()
+        run_line = self.agent_run_line(enrolled)
+        self.assertIn("rm -f rooster-agent", commands)
+        # removal happens only after the confirmed pull and before the new run
+        self.assertLess(commands.index("pull ghcr.io/sxueck/rooster:latest"),
+                        commands.index("rm -f rooster-agent"))
+        self.assertLess(commands.index("rm -f rooster-agent"), commands.index(run_line))
+        # Container recreation must not delete the persistent volume.
+        self.assertNotIn("volume", commands)
+        self.assertIn("never deletes volumes", output)
+
+    def test_agent_docker_rejects_directory_without_config(self):
+        empty = self.dir / "not-enrolled"
+        empty.mkdir()
+        result = bash(AGENT_DOCKER + "\ndeploy_agent_docker", f"{empty}\n", env=self.env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("config.yaml", result.stderr)
+        self.assertNotIn("run -d", Path(self.env["COMMAND_LOG"]).read_text())
 
     def test_printed_self_signed_curl_command_has_valid_flags(self):
         output = self.ok(bash("join_hint hub.example 9443 yes"))

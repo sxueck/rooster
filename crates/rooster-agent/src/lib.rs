@@ -39,8 +39,10 @@ pub fn write_private_file(path: &Path) {
     }
 }
 
-/// `rooster agent` 入口:装载配置 → 回写明文密钥 → 热重载 → 管理 API。
-pub async fn run(config_path: &Path) -> ExitCode {
+/// `rooster agent [--data-dir PATH] [--upgrade-method systemd|exit|none]`
+/// 入口:装载配置 → 应用 CLI 运行时覆盖(容器模式,不回写磁盘)→
+/// 回写明文密钥 → 热重载 → 管理 API。
+pub async fn run(config_path: &Path, overrides: state::RuntimeOverrides) -> ExitCode {
     let raw = match std::fs::read_to_string(config_path) {
         Ok(raw) => raw,
         Err(_) => {
@@ -64,6 +66,9 @@ pub async fn run(config_path: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // CLI 覆盖项先于一切消费方生效(WAF 规则目录、data-dir、升级方式),
+    // 并登记到 state:热重载后由 effective() 重新叠加。
+    let effective = overrides.apply(effective);
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -89,6 +94,7 @@ pub async fn run(config_path: &Path) -> ExitCode {
         effective.clone(),
         auth,
     ));
+    state.set_runtime_overrides(overrides);
 
     // 明文 secret-key 首次启动时哈希回写(保留注释)。
     if let Some(plaintext) = effective.management.secret_key.as_deref() {
