@@ -1,0 +1,56 @@
+name: nginx-waf
+on:
+  pull_request:
+    paths:
+      - 'crates/rooster-agent/**'
+      - 'crates/rooster-hub/**'
+      - 'crates/rooster-config/**'
+      - 'web/**'
+      - 'Cargo.*'
+      - '.github/workflows/nginx-waf.yml'
+      - 'docs/geoip.md'
+permissions:
+  contents: read
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_CODEGEN_UNITS: '1'
+      CARGO_INCREMENTAL: '0'
+      ROOSTER_TEST_GEOIP: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install Nginx for isolated lifecycle test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nginx
+          sudo systemctl stop nginx
+      - name: Update Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Prepare DB-IP Country Lite fixture (CC BY 4.0)
+        run: |
+          mkdir -p crates/rooster-agent/tests/data
+          month=$(date -u +%Y-%m)
+          base=https://download.db-ip.com/free
+          curl --fail --location --retry 3 --max-time 120 \
+            "$base/dbip-country-lite-$month.mmdb.gz" \
+            -o "$RUNNER_TEMP/dbip-country-lite.mmdb.gz"
+          gzip -dc "$RUNNER_TEMP/dbip-country-lite.mmdb.gz" \
+            > crates/rooster-agent/tests/data/dbip-country-lite.mmdb
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Nginx lifecycle and agent regression tests
+        env:
+          ROOSTER_TEST_NGINX: '1'
+        run: |
+          cargo test -p rooster-config --locked
+          cargo test -p rooster-agent --lib --locked -- --test-threads=1
+          cargo test -p rooster-agent --locked \
+            --test management --test hub_passthrough --test bans_api
+          cargo test -p rooster-agent --test httpguard --locked \
+            -- --test-threads=1
+          cargo check -p rooster-hub --locked
+      - name: Frontend build
+        run: |
+          npm ci --prefix web
+          npm run build --prefix web

@@ -431,3 +431,18 @@ export function deleteWasmRegistry(name: string): Promise<OkResp> {
 
 // re-exports commonly needed alongside client calls
 export type { NodeInfo, AuditEntry, WasmPlugin, Site, ForwardRule, BanPolicy, SshGuardPluginConfig, HardeningSectionConfig, HardeningConfig }
+
+export interface NginxSite {
+  id: string; domains: string[]; listen: string[]; file: string
+  upstream: string | null; supported: boolean; reason: string | null
+  mode: 'off' | 'detect' | 'block'
+  status: 'discovered' | 'attached' | 'needs-recovery'
+  fingerprint: string
+}
+export interface NginxSnapshot { running: boolean; sites: NginxSite[] }
+export function getNginxSites(id: string): Promise<NginxSnapshot> {
+  return request<NginxSnapshot>(`/nodes/${encodeURIComponent(id)}/management/nginx/sites`)
+}
+export function setNginxWaf(id: string, siteId: string, mode: 'off' | 'detect' | 'block', fingerprint: string): Promise<{ id: string; mode: string; status: string }> {
+  return request(`/nodes/${encodeURIComponent(id)}/management/nginx/sites/${encodeURIComponent(siteId)}/waf`, { method: 'PUT', body: { mode, fingerprint } })
+}

@@ -15,7 +15,7 @@ pub mod writer;
 pub use error::ConfigError;
 pub use schema::{
     AcmeConfig, AclConfig, AgentConfigFile, EffectiveConfig, ForwardLimits, ForwardProto,
-    ForwardRule, GeoipConfig, HubSection, LocalConfig, ManagedConfig, OnError, ProxyProtocol,
+    ForwardRule, GeoipConfig, GlobalGeoipConfig, HubSection, LocalConfig, ManagedConfig, OnError, ProxyProtocol,
     Site, SiteTls, SshGuardConfig, SshLogSource, TlsMode, UpgradeMethod, UpgradeSection,
     WafMode, WasmLimits, WasmPlugin,
 };
@@ -55,6 +55,11 @@ local:
 
   events:
     retention: 30d
+
+  geoip:
+    enabled: true
+    database: dbip-country-lite
+    auto-update: true
 
   forwards: []
   # - id: mysql-to-db

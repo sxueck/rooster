@@ -344,7 +344,17 @@ async fn route_plain(
     // Host 路由(去端口、小写比较);无匹配回退第一个站点,
     // 没有任何站点时 404。
     let host = request_host(req.headers(), req.uri()).map(|h| strip_port(&h));
-    let Some(site) = eff.route(host.as_deref()) else {
+    let trusted = eff.trusted_proxies.iter().any(|net| net.contains(&peer.ip()));
+    let route_id = if trusted && peer.ip().is_loopback() {
+        req.headers().get("x-rooster-site").and_then(|v| v.to_str().ok())
+    } else {
+        None
+    };
+    let selected = match route_id {
+        Some(id) => eff.sites.iter().find(|s| s.cfg.id == id).cloned(),
+        None => eff.route(host.as_deref()),
+    };
+    let Some(site) = selected else {
         return text(StatusCode::NOT_FOUND, "no site configured\n");
     };
     site.stats.requests.fetch_add(1, Ordering::Relaxed);
@@ -386,6 +396,7 @@ async fn route_plain(
         return resp;
     }
 
+    let proto = forwarded_proto(trusted, req.headers());
     handle_site_request(
         shared,
         eff.clone(),
@@ -393,7 +404,7 @@ async fn route_plain(
         real_ip_of(&eff, req.headers(), peer),
         req,
         peer,
-        "http",
+        proto,
     )
     .await
 }
@@ -702,7 +713,14 @@ async fn handle_site_request(
                     hits: hits.iter().map(|(id, _)| *id).collect(),
                     score: Some(verdict.score),
                 };
-                let sink = shared.event_sink.read().unwrap().clone();
+                let internal_probe = _peer.ip().is_loopback()
+                    && parts.headers.get("x-rooster-self-test").and_then(|v| v.to_str().ok())
+                        == Some(shared.probe_token.as_str());
+                let sink = if internal_probe {
+                    None
+                } else {
+                    shared.event_sink.read().unwrap().clone()
+                };
                 match sink {
                     Some(sink) => sink(event),
                     None => tracing::debug!(
@@ -741,9 +759,13 @@ async fn handle_site_request(
         .uri(uri)
         .version(Version::HTTP_11);
     for (name, value) in parts.headers.iter() {
-        // HOST 除外:下方统一改写后单独设置,避免双 Host 头
-        // (RFC 9110 不允许,上游会 400)。
-        if name != HOST && !is_hop_by_hop(name, is_ws) {
+        // These headers are generated below; copying them first would append
+        // duplicate forwarding headers and let an upstream read stale values.
+        if !matches!(
+            name.as_str(),
+            "host" | "x-forwarded-for" | "x-real-ip" | "x-forwarded-proto"
+                | "x-rooster-site" | "x-rooster-self-test"
+        ) && !is_hop_by_hop(name, is_ws) {
             up_req_builder = up_req_builder.header(name.clone(), value.clone());
         }
     }
@@ -1149,5 +1171,32 @@ mod tests {
         let uri: http::Uri = "http://[2001:db8::1]:8080/x".parse().unwrap();
         let h = request_host(&HeaderMap::new(), &uri).unwrap();
         assert_eq!(strip_port(&h), "2001:db8::1");
+    }
+}
+
+/// Forwarded scheme is meaningful only across the configured proxy trust boundary.
+fn forwarded_proto(trusted: bool, headers: &HeaderMap) -> &'static str {
+    if trusted
+        && headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            == Some("https")
+    {
+        "https"
+    } else {
+        "http"
+    }
+}
+#[cfg(test)]
+mod forwarded_scheme_tests {
+    use super::*;
+    #[test]
+    fn scheme_requires_trusted_peer_and_exact_value() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(forwarded_proto(false, &h), "http");
+        assert_eq!(forwarded_proto(true, &h), "https");
+        h.insert("x-forwarded-proto", HeaderValue::from_static("https,http"));
+        assert_eq!(forwarded_proto(true, &h), "http");
     }
 }

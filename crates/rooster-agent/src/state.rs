@@ -40,6 +40,8 @@ pub struct AgentState {
     /// 连 `X-Rooster-Overwrote` 都不会发)。`commit_raw` 自身不取这把锁,
     /// 否则已持锁的调用方会自死锁;由各调用点在临界区入口获取。
     pub write_lock: Mutex<()>,
+    /// Serialize Nginx discovery mutations and recovery journals.
+    pub nginx_lock: Mutex<()>,
     /// 封禁管理器:无 CAP_NET_ADMIN / 无 nf_tables 时为 None,
     /// 封禁类接口返回 503,其余功能不受影响。
     pub bans: RwLock<Option<Arc<dyn BanManager>>>,
@@ -112,6 +114,7 @@ impl AgentState {
             pending_confirm: Mutex::new(None),
             auth,
             write_lock: Mutex::new(()),
+            nginx_lock: Mutex::new(()),
             bans: RwLock::new(None),
             ban_status: RwLock::new(crate::bans::BanStatus::default()),
             forwards: Arc::new(crate::forward::ForwardRuntime::new()),

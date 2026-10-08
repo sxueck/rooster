@@ -11,6 +11,7 @@ pub mod hardening;
 pub mod httpguard;
 pub mod hubclient;
 pub mod management;
+pub mod nginx;
 pub mod outbox;
 pub mod plugin;
 pub mod sshguard;
@@ -191,46 +192,21 @@ pub async fn run(config_path: &Path) -> ExitCode {
             .forwards
             .set_plugins(state.wasmrt.clone(), ban_hook);
     }
-    if let Some(geo) = &effective.plugins.http_guard.geoip {
-        let path =
-            crate::geoip::ensure_db(&data_dir, &geo.database, geo.auto_update).await;
-        // 配了 geo 规则却查不到库时默认拒绝启动;否则
-        // geo.deny 会在库缺失期间静默失效(读不到国家码 → 放行)。
-        if let Err(e) = crate::geoip::check_available(
-            geo.fail_open,
-            path.as_deref(),
-            effective.sites.iter().any(|s| s.geo.is_some()),
-        ) {
-            tracing::error!("{e}");
-            return ExitCode::FAILURE;
-        }
-        if let Some(path) = path {
-            tracing::info!("geoip database ready: {}", path.display());
-        }
+    if let Err(e) = crate::geoip::prepare_http_database(&effective).await {
+        tracing::error!("{e}");
+        return ExitCode::FAILURE;
     }
     {
-        // 月度自动更新。只在启动时拉一次会让长跑节点一直用过期
-        // 库,启动失败也永不重试;这里每日复查(fresh 命中直接返回)。
+        // Default attribution downloads must not delay management or Hub startup.
         let state = state.clone();
-        let data_dir = data_dir.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
-                let Some(geo) = state.effective().plugins.http_guard.geoip.clone() else {
-                    continue;
-                };
-                let db = crate::geoip::ensure_db(&data_dir, &geo.database, geo.auto_update).await;
-                if crate::geoip::check_available(
-                    geo.fail_open,
-                    db.as_deref(),
-                    state.effective().sites.iter().any(|s| s.geo.is_some()),
-                )
-                .is_ok()
-                    && db.is_some()
-                {
-                    // 库更新后重配置 http-guard,让新的 mmdb 生效。
-                    state.runtime_notify.notify_one();
+                let effective = state.effective();
+                match crate::geoip::refresh_databases(&effective).await {
+                    Ok(()) => state.runtime_notify.notify_one(),
+                    Err(e) => tracing::error!("{e}"),
                 }
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
             }
         });
     }

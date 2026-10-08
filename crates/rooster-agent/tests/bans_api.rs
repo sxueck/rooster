@@ -312,6 +312,60 @@ async fn allowlist_write_and_runtime_reconfigure() {
 }
 
 #[tokio::test]
+async fn ban_country_reports_database_health_and_resolves_public_ips() {
+    if std::env::var("ROOSTER_TEST_GEOIP").as_deref() != Ok("1") {
+        return;
+    }
+    let srv = start("geoip", true).await;
+    let response = authed_req(
+        &srv,
+        reqwest::Method::POST,
+        "/v0/management/bans",
+        Some(serde_json::json!({"ip": "8.8.8.8"})),
+    ).await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = authed_get(&srv, "/v0/management/bans").await.json().await.unwrap();
+    assert_eq!(body["geoip"]["available"], false);
+    assert!(body["geoip"]["reason"].as_str().unwrap().contains("database unavailable"));
+    assert!(body["bans"][0]["country"].is_null());
+
+    let dest = rooster_agent::geoip::db_path(&srv.dir, "dbip-country-lite");
+    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/dbip-country-lite.mmdb"), &dest).unwrap();
+    let body: serde_json::Value = authed_get(&srv, "/v0/management/bans").await.json().await.unwrap();
+    assert_eq!(body["geoip"]["available"], true);
+    assert!(body["geoip"]["reason"].is_null());
+    assert!(matches!(body["bans"][0]["country"].as_str(), Some("美国" | "United States" | "US")));
+
+    let original = std::fs::read_to_string(&srv.config_path).unwrap();
+    let global = format!("{original}\nmanaged:\n  geoip:\n    database: global-country\n    auto-update: false\n  plugins:\n    http-guard:\n      geoip:\n        database: missing-http-country\n        auto-update: false\n");
+    std::fs::copy(&dest, srv.dir.join("global-country.mmdb")).unwrap();
+    srv.state.commit_raw(&global).unwrap();
+    let body: serde_json::Value = authed_get(&srv, "/v0/management/bans").await.json().await.unwrap();
+    assert_eq!(body["geoip"]["available"], true);
+    assert!(!body["bans"][0]["country"].is_null());
+
+    let disabled = format!("{original}\nmanaged:\n  geoip:\n    enabled: false\n");
+    srv.state.commit_raw(&disabled).unwrap();
+    let body: serde_json::Value = authed_get(&srv, "/v0/management/bans").await.json().await.unwrap();
+    assert_eq!(body["geoip"]["available"], false);
+    assert!(body["geoip"]["reason"].as_str().unwrap().contains("disabled"));
+    assert!(body["bans"][0]["country"].is_null());
+
+    let legacy = format!("{original}\nmanaged:\n  plugins:\n    http-guard:\n      geoip:\n        database: legacy-country\n        auto-update: false\n");
+    let dest = srv.dir.join("legacy-country.mmdb");
+    std::fs::copy(srv.dir.join("dbip-country-lite.mmdb"), &dest).unwrap();
+    srv.state.commit_raw(&legacy).unwrap();
+    let body: serde_json::Value = authed_get(&srv, "/v0/management/bans").await.json().await.unwrap();
+    assert_eq!(body["geoip"]["available"], true);
+    assert!(!body["bans"][0]["country"].is_null());
+
+    std::fs::write(&dest, b"invalid database\xab\xcd\xefMaxMind.com").unwrap();
+    let body: serde_json::Value = authed_get(&srv, "/v0/management/bans").await.json().await.unwrap();
+    assert_eq!(body["geoip"]["available"], false);
+    assert!(body["bans"][0]["country"].is_null());
+}
+
+#[tokio::test]
 async fn stats_shape() {
     let srv = start("stats", true).await;
     let resp = authed_get(&srv, "/v0/management/stats").await;
