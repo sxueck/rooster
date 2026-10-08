@@ -290,18 +290,12 @@ pub(crate) async fn ensure_httpguard(state: &Arc<AgentState>, eff: &EffectiveCon
         *state.waf_cfg.lock().unwrap() = waf_json;
     }
 
-    // geoip:数据库路径(不存在时 http-guard 侧自然跳过 geo 规则);
-    // 下载/更新由 lib.rs 的后台任务负责。
-    let geoip_db = eff
-        .plugins
-        .http_guard
-        .geoip
-        .as_ref()
-        .map(|g| crate::geoip::db_path(&data_dir, &g.database))
-        .filter(|p| p.is_file());
+    let geo = eff.http_geoip();
+    let geoip_db = Some(crate::geoip::db_path(&data_dir, &geo.database))
+        .filter(|p| crate::geoip::open_db(p).is_ok());
     // 配了 geo 规则但库不可用时默认不应用:保持上一份生效配置,而不是
     // 让 geo.deny 静默失效。
-    if let Some(geo) = eff.plugins.http_guard.geoip.as_ref() {
+    if enabled {
         if let Err(e) = crate::geoip::check_available(
             geo.fail_open,
             geoip_db.as_deref(),

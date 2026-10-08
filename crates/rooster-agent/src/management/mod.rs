@@ -611,22 +611,30 @@ fn with_bans<T>(
     }
 }
 
-fn ban_country_reader(state: &AgentState) -> Option<maxminddb::Reader<Vec<u8>>> {
+fn ban_country_reader(state: &AgentState) -> Result<maxminddb::Reader<Vec<u8>>, String> {
     let eff = state.effective();
-    let geo = eff.plugins.http_guard.geoip.as_ref()?;
-    let path = crate::geoip::db_path(&eff.agent.data_dir(), &geo.database);
-    maxminddb::Reader::open_readfile(path).ok()
+    let geo = eff.attribution_geoip();
+    if !geo.enabled() {
+        return Err("global GeoIP attribution is disabled".into());
+    }
+    let path = crate::geoip::db_path(&eff.agent.data_dir(), geo.database());
+    crate::geoip::open_db(&path)
+        .map_err(|e| format!("GeoIP database unavailable at {}: {e}", path.display()))
 }
 
 fn ban_country(reader: Option<&maxminddb::Reader<Vec<u8>>>, ip: &str) -> Option<String> {
     let reader = reader?;
     let ip = ip.parse::<std::net::IpAddr>().ok()?;
     let country: maxminddb::geoip2::Country = reader.lookup(ip).ok()?;
-    let record = country.country?;
-    record
-        .names
-        .and_then(|names| names.get("zh-CN").or_else(|| names.get("en")).map(|name| (*name).to_string()))
-        .or_else(|| record.iso_code.map(str::to_string))
+    ban_country_name(country)
+}
+
+fn ban_country_name(country: maxminddb::geoip2::Country<'_>) -> Option<String> {
+    [country.country, country.registered_country].into_iter().flatten().find_map(|record| {
+        record.names
+            .and_then(|names| names.get("zh-CN").or_else(|| names.get("en")).map(|name| (*name).to_string()))
+            .or_else(|| record.iso_code.map(str::to_string))
+    })
 }
 
 fn ban_to_json(b: &rooster_nft::BanEntry, country: Option<String>) -> serde_json::Value {
@@ -647,7 +655,8 @@ async fn list_bans(State(state): State<Arc<AgentState>>) -> Response {
     let country_reader = ban_country_reader(&state);
     match with_bans(&state, |b| b.list_bans()) {
         Ok(bans) => Json(json!({
-            "bans": bans.iter().map(|ban| ban_to_json(ban, ban_country(country_reader.as_ref(), &ban.ip))).collect::<Vec<_>>(),
+            "bans": bans.iter().map(|ban| ban_to_json(ban, ban_country(country_reader.as_ref().ok(), &ban.ip))).collect::<Vec<_>>(),
+            "geoip": {"available": country_reader.is_ok(), "reason": country_reader.as_ref().err()},
         }))
         .into_response(),
         Err(resp) => resp,
@@ -1390,5 +1399,25 @@ async fn put_nginx_waf(
             Json(json!({"error": error.to_string()})),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod geoip_tests {
+    use super::*;
+
+    #[test]
+    fn country_names_use_language_and_registered_country_fallbacks() {
+        for (raw, expected) in [
+            (r#"{"country":{"iso_code":"US","names":{"zh-CN":"美国","en":"United States"}}}"#, Some("美国")),
+            (r#"{"country":{"names":{"en":"United States"}}}"#, Some("United States")),
+            (r#"{"country":{"iso_code":"US"}}"#, Some("US")),
+            (r#"{"registered_country":{"iso_code":"CN"}}"#, Some("CN")),
+            (r#"{"country":{},"registered_country":{"names":{"en":"China"}}}"#, Some("China")),
+            (r#"{}"#, None),
+        ] {
+            let country = serde_json::from_str(raw).unwrap();
+            assert_eq!(ban_country_name(country).as_deref(), expected, "{raw}");
+        }
     }
 }

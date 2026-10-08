@@ -41,19 +41,49 @@ pub fn check_available(
         .to_string())
 }
 
+pub(crate) async fn prepare_http_database(
+    eff: &rooster_config::EffectiveConfig,
+) -> Result<Option<PathBuf>, String> {
+    let required = eff.plugins.http_guard.enabled && eff.sites.iter().any(|s| s.geo.is_some());
+    if !required {
+        return Ok(None);
+    }
+    let geo = eff.http_geoip();
+    let path = ensure_db(&eff.agent.data_dir(), &geo.database, geo.auto_update).await;
+    check_available(geo.fail_open, path.as_deref(), required)?;
+    Ok(path)
+}
+
+pub(crate) async fn refresh_databases(eff: &rooster_config::EffectiveConfig) -> Result<(), String> {
+    let global = eff.attribution_geoip();
+    if global.enabled() {
+        if let Some(path) = ensure_db(&eff.agent.data_dir(), global.database(), global.auto_update()).await {
+            tracing::info!(db = %path.display(), "global geoip database ready");
+        }
+    }
+    if let Some(http) = &eff.plugins.http_guard.geoip {
+        if !global.enabled() || http.database != global.database() {
+            ensure_db(&eff.agent.data_dir(), &http.database, http.auto_update).await;
+        }
+    }
+    prepare_http_database(eff).await?;
+    Ok(())
+}
+
 /// 确保数据库存在且新鲜;返回可用路径(不可用 → None)。
 /// 不会阻塞启动超过下载时限:失败降级旧库或无 geo。
 pub async fn ensure_db(data_dir: &Path, database: &str, auto_update: bool) -> Option<PathBuf> {
     let path = db_path(data_dir, database);
-    if fresh(&path) {
+    let usable = open_db(&path).is_ok();
+    if usable && fresh(&path) {
         return Some(path);
     }
     if !auto_update {
-        if path.is_file() {
+        if usable {
             tracing::warn!("geoip database stale and auto-update disabled: {}", path.display());
             return Some(path);
         }
-        tracing::warn!("geoip database missing and auto-update disabled; geo rules inactive");
+        tracing::warn!("geoip database missing or invalid and auto-update disabled; attribution unavailable");
         return None;
     }
     let ym = current_year_month();
@@ -62,7 +92,7 @@ pub async fn ensure_db(data_dir: &Path, database: &str, auto_update: bool) -> Op
     match download_and_store(&url, &path).await {
         Ok(()) => Some(path),
         Err(e) => {
-            if path.is_file() {
+            if usable {
                 tracing::warn!("geoip update failed ({e}); keeping stale database");
                 Some(path)
             } else {
@@ -102,22 +132,25 @@ async fn download_and_store(url: &str, dest: &Path) -> Result<(), String> {
     GzDecoder::new(&gz[..])
         .read_to_end(&mut raw)
         .map_err(|e| format!("gunzip: {e}"))?;
-    // mmdb 元数据哨兵校验,防止把 HTML 错误页当数据库。
-    if !looks_like_mmdb(&raw) {
-        return Err("downloaded data is not an mmdb file".into());
-    }
+    parse_db(raw.as_slice()).map_err(|e| format!("invalid GeoIP database: {e}"))?;
+    let parent = dest.parent().ok_or("database path has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     let tmp = dest.with_extension("mmdb.tmp");
     std::fs::write(&tmp, &raw).map_err(|e| format!("write: {e}"))?;
     std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
     Ok(())
 }
 
-/// mmdb 元数据哨兵 "\xab\xcd\xef MaxMind.com" 出现在文件尾部窗口内
-/// (真实文件哨兵之后还有元数据段,不能只比末尾定长)。
-fn looks_like_mmdb(raw: &[u8]) -> bool {
-    const MARKER: &[u8] = b"\xab\xcd\xef MaxMind.com";
-    let start = raw.len().saturating_sub(128);
-    raw[start..].windows(MARKER.len()).any(|w| w == MARKER)
+pub(crate) fn open_db(path: &Path) -> Result<maxminddb::Reader<Vec<u8>>, String> {
+    let raw = std::fs::read(path).map_err(|e| e.to_string())?;
+    parse_db(raw)
+}
+
+// maxminddb 0.24 can panic on truncated metadata instead of returning an error.
+fn parse_db<S: AsRef<[u8]> + std::panic::UnwindSafe>(raw: S) -> Result<maxminddb::Reader<S>, String> {
+    std::panic::catch_unwind(|| maxminddb::Reader::from_source(raw))
+        .map_err(|_| "malformed MMDB metadata".to_string())?
+        .map_err(|e| e.to_string())
 }
 
 /// 公历年-月(Howard Hinnant civil_from_days 算法,免 chrono 依赖)。
@@ -143,6 +176,21 @@ pub fn current_year_month() -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn disabling_attribution_does_not_bypass_http_country_rules() {
+        let dir = std::env::temp_dir().join(format!("rooster-geoip-missing-{}", rand::random::<u64>()));
+        let raw = format!("local:\n  agent:\n    node-name: geoip-test\n    data-dir: {}\nmanaged:\n  geoip:\n    enabled: false\n    auto-update: false\n  plugins:\n    http-guard:\n      enabled: true\n      listen-http: 127.0.0.1:18080\n  sites:\n    - id: geo\n      server-names: [geo.test]\n      tls: {{mode: terminate}}\n      upstream: http://127.0.0.1:3000\n      geo: {{deny: [US]}}\n", dir.display());
+        let (_, mut eff) = rooster_config::parse_and_validate(&raw).unwrap();
+        assert!(prepare_http_database(&eff).await.is_err());
+        assert!(refresh_databases(&eff).await.is_err());
+        eff.plugins.http_guard.geoip = Some(rooster_config::GeoipConfig {
+            database: "separate-country".into(),
+            auto_update: false,
+            fail_open: true,
+        });
+        assert!(prepare_http_database(&eff).await.unwrap().is_none());
+    }
+
     #[test]
     fn year_month_shape() {
         let ym = current_year_month();
@@ -153,12 +201,55 @@ mod tests {
     }
 
     #[test]
-    fn mmdb_marker_check() {
+    fn invalid_mmdb_is_rejected_even_with_metadata_marker() {
         let mut raw = vec![0u8; 128];
         let marker = b"\xab\xcd\xef MaxMind.com";
         raw.extend_from_slice(marker);
-        assert!(looks_like_mmdb(&raw));
-        assert!(!looks_like_mmdb(b"not an mmdb"));
+        assert!(parse_db(raw.as_slice()).is_err());
+        assert!(parse_db(b"not an mmdb").is_err());
+    }
+
+    #[tokio::test]
+    async fn downloads_real_mmdb_and_preserves_it_on_invalid_update() {
+        if std::env::var("ROOSTER_TEST_GEOIP").as_deref() != Ok("1") {
+            return;
+        }
+        let raw = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/dbip-country-lite.mmdb"
+        ))
+        .expect("prepare the DB-IP fixture before running GeoIP tests");
+        let compress = |bytes: &[u8]| {
+            use std::io::Write;
+            let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            gzip.write_all(bytes).unwrap();
+            gzip.finish().unwrap()
+        };
+        let valid = compress(&raw);
+        let invalid = compress(b"not a database\xab\xcd\xefMaxMind.com");
+        let app = axum::Router::new()
+            .route("/valid", axum::routing::get(move || async move { valid }))
+            .route("/invalid", axum::routing::get(move || async move { invalid }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("rooster-geoip-{}", rand::random::<u64>()));
+        let dest = db_path(&dir, "dbip-country-lite");
+        download_and_store(&format!("http://{address}/valid"), &dest)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), raw);
+        assert_eq!(ensure_db(&dir, "dbip-country-lite", false).await, Some(dest.clone()));
+        let config = format!("local:\n  agent:\n    node-name: geoip-test\n    data-dir: {}\nmanaged:\n  plugins:\n    http-guard:\n      geoip:\n        auto-update: false\n", dir.display());
+        let (_, eff) = rooster_config::parse_and_validate(&config).unwrap();
+        assert!(prepare_http_database(&eff).await.unwrap().is_none());
+        refresh_databases(&eff).await.unwrap();
+        assert!(download_and_store(&format!("http://{address}/invalid"), &dest).await.is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), raw);
+        std::fs::write(&dest, b"corrupt\xab\xcd\xefMaxMind.com").unwrap();
+        assert!(ensure_db(&dir, "dbip-country-lite", false).await.is_none());
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 回归(F5):库不可用时 `allowed()` 一律返回 true,配了 `geo.deny`

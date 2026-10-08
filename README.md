@@ -224,6 +224,9 @@ Rust stable + Node 22 (panel build only). No external services required at
 runtime. The nftables integration test needs root on a real Linux host:
 `sudo ROOSTER_NFT_ITEST=1 cargo test -p rooster-nft --test integration`.
 
+GeoIP configuration, ban attribution diagnostics and CI fixtures:
+[docs/geoip.md](docs/geoip.md).
+
 ## Credits
 
 - WAF rule set: OWASP Core Rule Set subset, Apache-2.0 (`rules/CRS-LICENSE`).

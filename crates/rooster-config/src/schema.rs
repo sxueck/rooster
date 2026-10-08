@@ -41,6 +41,8 @@ pub struct LocalConfig {
     /// 远程升级执行方式。
     #[serde(default)]
     pub upgrade: UpgradeSection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geoip: Option<GlobalGeoipConfig>,
     /// 单节点加固覆盖项;与 managed 层递归合并(local 优先)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardening: Option<HardeningConfig>,
@@ -60,6 +62,8 @@ pub struct ManagedConfig {
     pub plugins: PluginsConfig,
     #[serde(default)]
     pub waf: WafConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geoip: Option<GlobalGeoipConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sites: Vec<Site>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -620,6 +624,34 @@ pub struct HttpGuardConfig {
     pub acme: Option<AcmeConfig>,
 }
 
+const DEFAULT_GEOIP_DATABASE: &str = "dbip-country-lite";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct GlobalGeoipConfig {
+    // Keep absent fields unset so local overrides do not erase managed settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<bool>,
+}
+
+impl GlobalGeoipConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn database(&self) -> &str {
+        self.database.as_deref().unwrap_or(DEFAULT_GEOIP_DATABASE)
+    }
+
+    pub fn auto_update(&self) -> bool {
+        self.auto_update.unwrap_or(true)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GeoipConfig {
@@ -635,7 +667,7 @@ pub struct GeoipConfig {
 }
 
 fn default_geoip_database() -> String {
-    "dbip-country-lite".to_string()
+    DEFAULT_GEOIP_DATABASE.to_string()
 }
 
 fn default_true() -> bool {
@@ -859,6 +891,8 @@ pub struct EffectiveConfig {
     #[serde(default)]
     pub hardening: HardeningConfig,
     #[serde(default)]
+    pub geoip: Option<GlobalGeoipConfig>,
+    #[serde(default)]
     pub forwards: Vec<ForwardRule>,
     #[serde(default)]
     pub plugins: PluginsConfig,
@@ -872,6 +906,37 @@ pub struct EffectiveConfig {
     pub wasm_plugins: Vec<WasmPlugin>,
 }
 
+impl EffectiveConfig {
+    pub fn attribution_geoip(&self) -> GlobalGeoipConfig {
+        let mut global = self.geoip.clone().unwrap_or_else(|| {
+            self.plugins.http_guard.geoip.as_ref().map(|legacy| GlobalGeoipConfig {
+                enabled: None,
+                database: Some(legacy.database.clone()),
+                auto_update: Some(legacy.auto_update),
+            }).unwrap_or_default()
+        });
+        if let Some(http) = &self.plugins.http_guard.geoip {
+            // One shared file cannot have independent update policies; HTTP wins.
+            if global.database() == http.database {
+                global.auto_update = Some(http.auto_update);
+            }
+        }
+        global
+    }
+
+    pub fn http_geoip(&self) -> GeoipConfig {
+        self.plugins.http_guard.geoip.clone().unwrap_or_else(|| {
+            let global = self.attribution_geoip();
+            // Disabling attribution must not disable configured HTTP country rules.
+            GeoipConfig {
+                database: global.database().to_string(),
+                auto_update: global.auto_update(),
+                fail_open: false,
+            }
+        })
+    }
+}
+
 impl AgentConfigFile {
     /// 分层合并:map 递归(local 覆盖)、带 id 列表按 id 合并、其余列表并集。
     /// 通过 serde_json::Value 做通用合并,再反序列化为强类型,
@@ -881,6 +946,14 @@ impl AgentConfigFile {
         let managed =
             serde_json::to_value(&self.managed).map_err(|e| ConfigError::Merge(e.to_string()))?;
         let merged = crate::merge::merge_values(&managed, &local);
-        serde_json::from_value(merged).map_err(|e| ConfigError::Merge(e.to_string()))
+        let mut effective: EffectiveConfig = serde_json::from_value(merged)
+            .map_err(|e| ConfigError::Merge(e.to_string()))?;
+        let global = effective.attribution_geoip();
+        effective.geoip = Some(GlobalGeoipConfig {
+            enabled: Some(global.enabled()),
+            database: Some(global.database().to_string()),
+            auto_update: Some(global.auto_update()),
+        });
+        Ok(effective)
     }
 }
