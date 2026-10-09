@@ -539,7 +539,10 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
             if reason.is_none()
                 && (locations.len() != 1 || loc.is_none() || proxies.len() != 1)
             {
-                reason = Some("只支持单个 location / 中的静态 proxy_pass".into());
+                // 其余 location 留在 Nginx 层不经过 WAF，用户会误以为整站已受保护。
+                reason = Some(
+                    "自动接入仅支持恰好一个 location / 且其中仅一个静态 proxy_pass；其他 location 不经过 WAF，请合并或手动接入".into(),
+                );
             }
             if reason.is_none()
                 && global_proxy_settings
@@ -1547,7 +1550,12 @@ mod tests {
                 "server { location / { proxy_pass http://g; } location /api { return 204; } }",
             ),
         ]);
-        assert_eq!(r[0].reason.as_deref(), Some("只支持单个 location / 中的静态 proxy_pass"));
+        assert_eq!(
+            r[0].reason.as_deref(),
+            Some(
+                "自动接入仅支持恰好一个 location / 且其中仅一个静态 proxy_pass；其他 location 不经过 WAF，请合并或手动接入"
+            )
+        );
     }
     #[test]
     fn proxyless_redirect_block_reports_itself() {
