@@ -5,17 +5,9 @@ import base64
 import hashlib
 import json
 import os
-from pathlib import Path
-import ssl
 import subprocess
 import tempfile
-import urllib.request
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Never forward a Hub session token to a redirected origin.
-        raise ValueError("Hub upload redirects are refused; use the final trusted HTTPS origin")
+from pathlib import Path
 
 
 def openssl(*args):
@@ -61,15 +53,24 @@ def main():
         token = args.token_file.read_text().strip()
         if not token or args.token_file.stat().st_mode & 0o077:
             parser.error("session token file must be nonempty and accessible only to its owner (chmod 600)")
-        request = urllib.request.Request(args.hub.rstrip("/") + "/v0/upgrades",
-            data=args.artifact.read_bytes(), method="POST", headers={
-                "Authorization": "Bearer " + token, "X-Rooster-Version": name.removeprefix("rooster-"),
-                "X-Rooster-Signature": meta["signature"], "Content-Type": "application/octet-stream"})
-        context = ssl.create_default_context(cafile=str(args.ca_file) if args.ca_file else None)
-        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context), NoRedirect())
-        with opener.open(request, timeout=120) as response:
-            if response.status != 200:
-                raise RuntimeError(f"upload failed: HTTP {response.status}")
+        # The parser above already rejected non-https origins (no file:/custom schemes).
+        upload_url = args.hub.rstrip("/") + "/v0/upgrades"
+        if not upload_url.startswith("https://"):
+            raise RuntimeError("upload origin must be https")
+        # curl over urllib: without -L it never follows redirects, so the session
+        # token cannot reach a redirected origin; it also sidesteps Python 3.13+
+        # strict TLS rejecting deploy.sh CAs that lack the keyUsage extension.
+        cmd = ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "120",
+               *( ["--cacert", str(args.ca_file)] if args.ca_file else [] ),
+               "-H", "Authorization: Bearer " + token,
+               "-H", "X-Rooster-Version: " + name.removeprefix("rooster-"),
+               "-H", "X-Rooster-Signature: " + meta["signature"],
+               "-H", "Content-Type: application/octet-stream",
+               "--data-binary", "@" + str(args.artifact),
+               "-X", "POST", upload_url]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0 or not proc.stdout.strip().startswith("2"):
+            raise RuntimeError(f"upload failed: HTTP {proc.stdout.strip() or 'n/a'} ({proc.stderr.strip()})")
         print(f"Uploaded {name}; trigger a targeted or staged rollout in the panel")
 
 
