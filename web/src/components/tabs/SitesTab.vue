@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { h, onMounted, ref } from 'vue'
+import { computed, h, onMounted, ref } from 'vue'
 import { RButton, RInput, RModal, RPanel, RTable, RTag, useMessage, type RColumn } from '../../ui'
 import { deleteSite, getSites, putSite, getNginxSites, setNginxWaf } from '../../api/client'
 import type { Site, NginxSite } from '../../api/client'
@@ -15,6 +15,34 @@ const editShow = ref(false)
 const editId = ref('')
 const editText = ref('')
 const nginxSites = ref<NginxSite[]>([])
+
+/** 发现层按 server 块出 行，同域名的 80 跳转块无转发不可接入，折叠进主行避免占屏。 */
+interface NginxGroupRow {
+  [key: string]: unknown
+  key: string
+  main: NginxSite
+  folded: NginxSite[]
+}
+const nginxRows = computed<NginxGroupRow[]>(() => {
+  const groups = new Map<string, NginxSite[]>()
+  for (const s of nginxSites.value) {
+    const k = s.domains[0] || '_'
+    const g = groups.get(k)
+    if (g) g.push(s)
+    else groups.set(k, [s])
+  }
+  const rows: NginxGroupRow[] = []
+  for (const [key, list] of groups) {
+    const attachable = list.filter((s) => s.upstream)
+    const shown = attachable.length > 0 ? attachable : [list[0]]
+    shown.forEach((main, i) => {
+      // 可接入的块（有 upstream）必须各自占行保留操作入口；其余全部折进首行。
+      const folded = i === 0 ? list.filter((s) => s !== main && !s.upstream) : []
+      rows.push({ key: i === 0 ? key : `${key}:${main.id}`, main, folded })
+    })
+  }
+  return rows
+})
 const scanning = ref(false)
 const scanError = ref('')
 const scanned = ref(false)
@@ -23,16 +51,20 @@ const busy = ref('')
 const attachShow = ref(false)
 const attachSite = ref<NginxSite | null>(null)
 
-const nginxCols: RColumn<NginxSite>[] = [
-  { title: 'DOMAINS / LISTEN', key: 'domains', render: (r) => h('div', [h('div', r.domains.join(', ') || '默认站点'), h('small', { class: 'muted' }, r.listen.join(', '))]) },
-  { title: 'CONFIG', key: 'file', mono: true },
-  { title: 'UPSTREAM', key: 'upstream', mono: true },
-  { title: 'STATUS', key: 'status', render: (r) => h('div', [hTag(r.status === 'attached' ? (r.mode === 'block' ? 'ok' : 'warn') : 'muted', r.status === 'attached' ? (r.mode === 'block' ? '已接入 · 阻断' : '已接入 · 监控') : r.status === 'needs-recovery' ? '需要恢复' : '未接入'), r.reason ? h('small', { class: 'muted', style: 'display:block;max-width:260px' }, r.reason) : null]) },
-  { title: 'ACTIONS', key: 'actions', render: (r) => h('span', { class: 'row-tight' }, r.status === 'attached' ? [
-    nginxButton(r.mode === 'block' ? '切换监控' : '开启阻断', r, r.mode === 'block' ? 'detect' : 'block'), nginxButton('关闭并恢复', r, 'off'),
-  ] : r.status === 'needs-recovery' ? [nginxButton('恢复原配置', r, 'off')] : [
-    h(RButton, { variant: 'link', disabled: !r.supported || busy.value !== '', onClick: () => { attachSite.value = r; attachShow.value = true } }, { default: () => '启用 WAF' }),
+const nginxCols: RColumn<NginxGroupRow>[] = [
+  { title: 'DOMAINS / LISTEN', key: 'domains', render: (r) => h('div', [
+    h('div', r.main.domains.join(', ') || '默认站点'),
+    h('small', { class: 'muted' }, r.main.listen.join(', ')),
+    ...r.folded.map((f) => h('small', { class: 'muted', style: 'display:block' }, `+ ${f.listen.join(', ') || '—'} · 无转发（跳转/ACME）`)),
   ]) },
+  { title: 'CONFIG', key: 'file', mono: true, render: (r) => r.main.file },
+  { title: 'UPSTREAM', key: 'upstream', mono: true, render: (r) => r.main.upstream ?? '' },
+  { title: 'STATUS', key: 'status', render: (r) => { const m = r.main; return h('div', [hTag(m.status === 'attached' ? (m.mode === 'block' ? 'ok' : 'warn') : 'muted', m.status === 'attached' ? (m.mode === 'block' ? '已接入 · 阻断' : '已接入 · 监控') : m.status === 'needs-recovery' ? '需要恢复' : '未接入'), m.reason ? h('small', { class: 'muted', style: 'display:block;max-width:260px' }, m.reason) : null]) } },
+  { title: 'ACTIONS', key: 'actions', render: (r) => { const m = r.main; return h('span', { class: 'row-tight' }, m.status === 'attached' ? [
+    nginxButton(m.mode === 'block' ? '切换监控' : '开启阻断', m, m.mode === 'block' ? 'detect' : 'block'), nginxButton('关闭并恢复', m, 'off'),
+  ] : m.status === 'needs-recovery' ? [nginxButton('恢复原配置', m, 'off')] : [
+    h(RButton, { variant: 'link', disabled: !m.supported || busy.value !== '', onClick: () => { attachSite.value = m; attachShow.value = true } }, { default: () => '启用 WAF' }),
+  ]) } },
 ]
 function nginxButton(label: string, row: NginxSite, mode: WafMode) {
   return h(RButton, { variant: 'link', loading: busy.value === row.id, disabled: busy.value !== '', onClick: () => changeNginx(row, mode) }, { default: () => label })
@@ -193,7 +225,7 @@ onMounted(() => { void load(); void scanNginx() })
       <p v-if="scanError" class="muted" style="padding: 0 16px">{{ scanError }}</p>
       <p v-else-if="scanned && !nginxRunning" class="muted" style="padding: 0 16px">已读取配置，但 Nginx 未运行，不能快捷接入。</p>
       <p v-else-if="scanned && nginxSites.length === 0" class="muted" style="padding: 0 16px">未发现 HTTP server 配置。</p>
-      <RTable :columns="nginxCols" :rows="nginxSites" :row-key="(r: NginxSite) => r.id" />
+      <RTable :columns="nginxCols" :rows="nginxRows" :row-key="(r: NginxGroupRow) => r.key" />
     </RPanel>
     <RModal v-model:show="attachShow" title="启用站点 WAF" kicker="NGINX · WAF" :width="560">
       <p>{{ attachSite?.domains.join(', ') || '默认站点' }}</p>

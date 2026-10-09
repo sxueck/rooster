@@ -28,11 +28,22 @@ integration.
 
 All parsed HTTP server blocks appear in the discovery table. Automatic
 onboarding supports exactly one `location /` (or `location ^~ /`) with one
-literal `proxy_pass http://host:port` without a URI suffix. Named upstream
-groups, HTTPS upstreams, variable upstreams, FastCGI, static serving, extra or
-nested locations, includes inside a server/location, rewrites, caches and
-module hooks are displayed with an unsupported reason. Ambiguous inherited
+`proxy_pass` without a URI suffix. The proxy target may be a literal
+`http://host:port` (and `https://host:port`, attached with upstream TLS
+verification skipped to match Nginx's default of not verifying upstream
+certificates) or a named `upstream` group — but only when the group contains
+exactly one non-`backup`, non-`down` `server` entry, because forwarding through
+Rooster would otherwise silently change load-balancing or failover semantics.
+Resolved groups keep Nginx's `$proxy_host` semantics: `Host` and implicit
+`proxy_redirect` continue to use the group name. Variable upstreams, upstream
+groups with several servers, FastCGI, static serving, extra or nested
+locations, includes inside a server/location, rewrites, caches and module
+hooks are displayed with an unsupported reason. Ambiguous inherited
 HTTP-level proxy settings in included server files are also declined.
+
+The table folds server blocks without a `proxy_pass` (port-80 redirect/ACME
+blocks) into their domain group's first row, so a certificate-split pair of
+80/443 blocks occupies one actionable row.
 
 Inherited `proxy_set_header` directives are materialized when a location-level
 injection would otherwise suppress inheritance. Original Host behavior and
