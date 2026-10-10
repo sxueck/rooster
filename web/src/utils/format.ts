@@ -56,6 +56,37 @@ export function fmtDuration(secs: number): string {
   return `${Math.floor(m / 60)}h${m % 60}m`
 }
 
+/** 去掉升级包名里的架构后缀（`0.5.0-x86_64` → `0.5.0`），便于与节点版本比较。 */
+export function stripArch(version: string): string {
+  return version.replace(/-(x86_64|aarch64|arm64|amd64)$/i, '')
+}
+
+/** 点分数字版本比较：返回负数/0/正数。非数字段按 0 处理后回退字符串比较。 */
+export function cmpVersion(a: string, b: string): number {
+  const pa = stripArch(a).split('.')
+  const pb = stripArch(b).split('.')
+  const n = Math.max(pa.length, pb.length)
+  for (let i = 0; i < n; i++) {
+    const x = pa[i] ?? ''
+    const y = pb[i] ?? ''
+    const nx = /^\d+$/.test(x) ? Number(x) : null
+    const ny = /^\d+$/.test(y) ? Number(y) : null
+    if (nx !== null && ny !== null) {
+      if (nx !== ny) return nx - ny
+    } else if (x !== y) {
+      return x < y ? -1 : 1
+    }
+  }
+  return 0
+}
+
+/** 节点版本是否已是给定升级包列表里的最新版（无包时返回 false，保持入口可见）。 */
+export function isLatestVersion(version: string | null | undefined, versions: string[]): boolean {
+  if (!version || versions.length === 0) return false
+  const latest = versions.reduce((m, v) => (cmpVersion(v, m) > 0 ? v : m))
+  return cmpVersion(stripArch(version), latest) >= 0
+}
+
 export function eventKindLabel(kind: string): string {
   switch (kind) {
     case 'ban':

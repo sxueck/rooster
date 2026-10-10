@@ -73,6 +73,7 @@ async fn agent_session(state: Arc<HubState>, meta: ConnMeta, mut sock: WebSocket
         rec.version = version.clone();
         rec.config_hash = config_hash;
         rec.last_seen = now_secs();
+        rec.last_ip = Some(meta.peer.ip().to_string());
         let _ = state.store.upsert_node(&rec);
     }
     let _ = state.events_tx.send(serde_json::json!({

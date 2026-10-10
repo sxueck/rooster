@@ -35,6 +35,8 @@ pub struct NodeRecord {
     pub pending_template: Option<String>,
     /// 离线期间待下发的升级包(入库 key,如 `0.2.0-x86_64`)。
     pub pending_upgrade: Option<String>,
+    /// 最近一次长连接的对端 IP(面板展示用;经 L7 代理时是代理地址)。
+    pub last_ip: Option<String>,
 }
 
 impl NodeRecord {
@@ -49,6 +51,7 @@ impl NodeRecord {
             cert_fp,
             pending_template: None,
             pending_upgrade: None,
+            last_ip: None,
         }
     }
 }
@@ -769,6 +772,22 @@ impl Store {
         let r = self.db.begin_read().map_err(json_err)?;
         let t = r.open_table(UPGRADE_SIG).map_err(json_err)?;
         Ok(t.get(version).map_err(json_err)?.map(|v| v.value()))
+    }
+
+    /// 删除升级包（元数据 / 内容 / 签名三者一起清理）。
+    pub fn delete_upgrade(&self, version: &str) -> Result<bool, String> {
+        let w = self.db.begin_write().map_err(json_err)?;
+        let mut removed = false;
+        {
+            let mut t = w.open_table(UPGRADES).map_err(json_err)?;
+            removed |= t.remove(version).map_err(json_err)?.is_some();
+            let mut t = w.open_table(UPGRADE_BLOB).map_err(json_err)?;
+            t.remove(version).map_err(json_err)?;
+            let mut t = w.open_table(UPGRADE_SIG).map_err(json_err)?;
+            t.remove(version).map_err(json_err)?;
+        }
+        w.commit().map_err(json_err)?;
+        Ok(removed)
     }
 
     pub fn list_upgrades(&self) -> Result<Vec<(String, UpgradeRecord)>, String> {

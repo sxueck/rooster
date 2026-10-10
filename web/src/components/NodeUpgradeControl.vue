@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { getUpgrades, rolloutUpgrade } from '../api/client'
 import type { UpgradeEntry } from '../api/types'
 import { RButton, RField, RModal, RSelect, useMessage } from '../ui'
 import RunStatus from './RunStatus.vue'
-import { errMsg } from '../utils/format'
+import { errMsg, isLatestVersion } from '../utils/format'
 
-const props = defineProps<{ nodeId: string; online: boolean }>()
+const props = defineProps<{ nodeId: string; online: boolean; version?: string | null }>()
 const message = useMessage()
 const show = ref(false)
 const runShow = ref(false)
@@ -16,6 +16,35 @@ const versions = ref<UpgradeEntry[]>([])
 const selected = ref<string | null>(null)
 const runId = ref('')
 const options = computed(() => versions.value.map((v) => ({ label: v.version, value: v.version })))
+const upToDate = ref(false)
+
+// 升级包列表全页共享（30s 缓存）：节点列表每行一个控件，逐行拉取会打满 hub。
+let upgradesCache: { at: number; list: UpgradeEntry[] } | null = null
+let upgradesInflight: Promise<UpgradeEntry[]> | null = null
+function fetchUpgrades(): Promise<UpgradeEntry[]> {
+  if (upgradesCache && Date.now() - upgradesCache.at < 30_000) {
+    return Promise.resolve(upgradesCache.list)
+  }
+  upgradesInflight ??= getUpgrades()
+    .then((r) => {
+      upgradesCache = { at: Date.now(), list: r.upgrades }
+      return r.upgrades
+    })
+    .finally(() => {
+      upgradesInflight = null
+    })
+  return upgradesInflight
+}
+
+onMounted(async () => {
+  // 已是最新版则直接隐藏入口；拉取失败保持入口可见（拉取时也无妨）。
+  try {
+    const list = await fetchUpgrades()
+    upToDate.value = isLatestVersion(props.version, list.map((v) => v.version))
+  } catch {
+    /* 保持可见 */
+  }
+})
 
 async function open() {
   if (!props.online) {
@@ -60,7 +89,7 @@ async function upgrade() {
 </script>
 
 <template>
-  <span class="control">
+  <span v-if="!upToDate" class="control">
     <RButton variant="link" tone="warn" :loading="loading" :disabled="!online" @click="open">升级 Agent</RButton>
     <RModal v-model:show="show" kicker="NODE UPGRADE" :title="`升级节点 ${nodeId}`" :width="440">
       <div class="stack">

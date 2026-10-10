@@ -63,7 +63,7 @@ onMounted(loadNode)
     <template v-else>
       <RPageHeader kicker="CLUSTER · NODE DETAIL" :title="nodeId" sub="节点详情">
         <template #extra>
-          <NodeUpgradeControl v-if="node" :node-id="node.id" :online="node.online" />
+          <NodeUpgradeControl v-if="node" :node-id="node.id" :online="node.online" :version="node.version" />
           <RButton variant="ghost" size="sm" @click="router.back()">← 返回</RButton>
           <RStatusDot :tone="node?.online ? 'ok' : 'muted'" :pulse="!!node?.online">
             {{ node?.online ? '在线' : '离线' }}
@@ -76,6 +76,7 @@ onMounted(loadNode)
 
       <RPanel>
         <template v-if="node">
+          <RTag v-if="node.ip" class="label-tag mono">{{ node.ip }}</RTag>
           <RTag v-for="(v, k) in node.labels" :key="k" class="label-tag">{{ k }}={{ v }}</RTag>
           <span class="muted num">config_hash: {{ node.config_hash }}</span>
         </template>

@@ -61,6 +61,8 @@ export interface NodeInfo {
   last_seen: number
   config_hash: string
   pending_template: string | null
+  /** 最近一次长连接对端 IP；旧 hub 不返回该字段。 */
+  ip?: string | null
 }
 export interface NodesResp {
   nodes: NodeInfo[]

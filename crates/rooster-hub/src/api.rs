@@ -100,6 +100,7 @@ pub fn router(state: Arc<HubState>) -> Router {
         .route("/v0/events", get(query_events))
         .route("/v0/audit", get(query_audit))
         .route("/v0/upgrades", get(list_upgrades))
+        .route("/v0/upgrades/{version}", delete(delete_upgrade))
         .route("/v0/upgrades/{version}/rollout", post(rollout_upgrade))
         .route("/v0/wasm-plugins", get(list_wasm))
         .route("/v0/wasm-plugins/{name}", delete(delete_wasm))
@@ -501,6 +502,7 @@ async fn list_nodes(State(state): State<Arc<HubState>>) -> Response {
                 "last_seen": n.last_seen,
                 "config_hash": n.config_hash,
                 "pending_template": n.pending_template.is_some(),
+                "ip": n.last_ip,
             })
         })
         .collect();
@@ -1413,6 +1415,41 @@ fn verify_upgrade_signature(state: &Arc<HubState>, content: &[u8], sig_b64: &str
     let sig: ed25519_dalek::Signature =
         sig.as_slice().try_into().map_err(|_| "bad signature length")?;
     vk.verify(content, &sig).map_err(|e| e.to_string())
+}
+
+async fn delete_upgrade(
+    State(state): State<Arc<HubState>>,
+    Path(version): Path<String>,
+) -> Response {
+    match state.store.delete_upgrade(&version) {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "upgrade version not uploaded"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e})),
+            )
+                .into_response()
+        }
+    }
+    // 离线节点若还挂着这个版本的待下发升级，一并清掉，避免重连后
+    // replay 撞上已删除的包（replay 对缺失包也会自清理，这里是提前收敛）。
+    for mut rec in state.store.list_nodes().unwrap_or_default() {
+        if rec.pending_upgrade.as_deref() == Some(version.as_str()) {
+            rec.pending_upgrade = None;
+            if let Err(e) = state.store.upsert_node(&rec) {
+                tracing::warn!(node = rec.id, error = e, "failed to clear pending upgrade");
+            }
+        }
+    }
+    state.audit("panel", None, "DELETE", &format!("/v0/upgrades/{version}"), b"", 200);
+    Json(json!({"ok": true})).into_response()
 }
 
 #[derive(Deserialize, Default)]

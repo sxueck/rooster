@@ -62,10 +62,13 @@ const cols = computed<RColumn[]>(() => [
     render: (row) =>
       h(
         'span',
-        {},
-        Object.entries(row.labels).map(([k, v]) =>
-          h(RTag, { key: k }, { default: () => `${k}=${v}` }),
-        ),
+        { class: 'row-tight labels-cell' },
+        [
+          row.ip ? h('span', { class: 'mono muted node-ip' }, row.ip) : null,
+          ...Object.entries(row.labels).map(([k, v]) =>
+            h(RTag, { key: k }, { default: () => `${k}=${v}` }),
+          ),
+        ].filter((x) => x !== null),
       ),
   },
   { title: 'VERSION', key: 'version', width: 90, mono: true },
@@ -92,7 +95,7 @@ const cols = computed<RColumn[]>(() => [
     width: 230,
     render: (row) =>
       h('span', { class: 'row-tight' }, [
-        h(NodeUpgradeControl, { nodeId: row.id, online: row.online }),
+        h(NodeUpgradeControl, { nodeId: row.id, online: row.online, version: row.version }),
         h(RButton, { variant: 'link', onClick: () => openLabelDialog([row.id]) }, { default: () => '编辑标签' }),
         h(RButton, { variant: 'link', tone: 'danger', onClick: () => confirmRevoke(row) }, { default: () => '注销' }),
       ]),
@@ -349,5 +352,9 @@ onUnmounted(stopRegistration)
 /* tag chips in the LABELS column flow inline with small gaps */
 :deep(.rt tbody td .rtg + .rtg) {
   margin-left: 6px;
+}
+.node-ip {
+  margin-right: 2px;
+  white-space: nowrap;
 }
 </style>

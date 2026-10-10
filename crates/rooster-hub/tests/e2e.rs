@@ -1208,6 +1208,90 @@ async fn rollout_results_json_uses_snake_case_node_id() {
     assert_eq!(run["results"][0]["node_id"], "json-node", "run: {run}");
 }
 
+/// 删除升级包必须三表(元数据/内容/签名)一起清,并取消离线节点的待下发;
+/// 否则节点重连 replay 会撞上已删的包,面板列表也仍显示幽灵版本。
+#[tokio::test]
+async fn delete_upgrade_clears_tables_and_offline_pending() {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    let sk = SigningKey::generate(&mut rand::rng());
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let hub = start_hub_with_key(
+        "del-upgrade",
+        Some(format!("ed25519:{}", b64.encode(sk.verifying_key().to_bytes()))),
+    )
+    .await;
+    let token = login(&hub).await;
+    hub._state
+        .store
+        .insert_token("tok-del", Duration::from_secs(60))
+        .unwrap();
+    register(&hub, "tok-del", "del-node").await; // 注册即有节点行,保持离线
+
+    let binary = b"fake-agent".to_vec();
+    let sig = b64.encode(sk.sign(&binary).to_bytes());
+    let resp = client()
+        .post(format!("{}/v0/upgrades", hub.base))
+        .bearer_auth(&token)
+        .header("x-rooster-version", "0.9.0-x86_64")
+        .header("x-rooster-signature", &sig)
+        .body(binary)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 离线节点 rollout → 后台任务异步写 pending_upgrade,轮询等它落库。
+    let resp = client()
+        .post(format!("{}/v0/upgrades/0.9.0-x86_64/rollout", hub.base))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"node_id": "del-node", "batch_size": 1, "wait_secs": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await.ok());
+    let mut pending = None;
+    for _ in 0..40 {
+        pending = hub._state
+            .store
+            .get_node("del-node")
+            .unwrap()
+            .unwrap()
+            .pending_upgrade;
+        if pending.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(pending.as_deref(), Some("0.9.0-x86_64"), "rollout must mark the offline node");
+
+    let resp = client()
+        .delete(format!("{}/v0/upgrades/0.9.0-x86_64", hub.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await.ok());
+    assert_eq!(hub._state.store.get_upgrade("0.9.0-x86_64").unwrap(), None);
+    assert_eq!(hub._state.store.get_upgrade_sig("0.9.0-x86_64").unwrap(), None);
+    assert!(
+        hub._state.store.list_upgrades().unwrap().is_empty(),
+        "metadata row must be gone",
+    );
+    assert_eq!(
+        hub._state.store.get_node("del-node").unwrap().unwrap().pending_upgrade,
+        None,
+        "offline pending upgrade must be cancelled with the package",
+    );
+    let resp = client()
+        .delete(format!("{}/v0/upgrades/0.9.0-x86_64", hub.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "second delete must be 404");
+}
+
 /// 用指定 ConnMeta 起一个共用同一 HubState 的服务实例(mTLS 下载分支
 /// 的连接级指纹来自这里)。
 async fn serve_with_meta(

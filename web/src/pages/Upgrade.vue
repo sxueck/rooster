@@ -9,19 +9,22 @@ import {
   RPageHeader,
   RPanel,
   RTable,
+  useDialog,
   useMessage,
   type RColumn,
 } from '../ui'
-import { getNodes, getUpgrades, rolloutUpgrade, uploadUpgrade } from '../api/client'
+import { getNodes, getUpgrades, rolloutUpgrade, uploadUpgrade, deleteUpgrade } from '../api/client'
 import type { NodeInfo, UpgradeEntry } from '../api/types'
 import KvEditor from '../components/KvEditor.vue'
 import RunStatus from '../components/RunStatus.vue'
 import { errMsg, fmtBytes, fmtTime } from '../utils/format'
 
 const message = useMessage()
+const dialog = useDialog()
 
 const upgrades = ref<UpgradeEntry[]>([])
 const loading = ref(false)
+const deleting = ref('')
 
 const cols: RColumn<UpgradeEntry>[] = [
   { title: 'VERSION', key: 'version', width: 140, mono: true },
@@ -36,9 +39,16 @@ const cols: RColumn<UpgradeEntry>[] = [
   {
     title: 'ACTIONS',
     key: 'actions',
-    width: 90,
+    width: 130,
     render: (r) =>
-      h(RButton, { variant: 'link', tone: 'warn', onClick: () => openRollout(r.version) }, { default: () => '下发' }),
+      h('span', { class: 'row-tight' }, [
+        h(RButton, { variant: 'link', tone: 'warn', onClick: () => openRollout(r.version) }, { default: () => '下发' }),
+        h(
+          RButton,
+          { variant: 'link', tone: 'danger', loading: deleting.value === r.version, onClick: () => confirmDelete(r.version) },
+          { default: () => '删除' },
+        ),
+      ]),
   },
 ]
 
@@ -105,6 +115,27 @@ const rolloutDlg = ref<{
 }>({ show: false, version: '', selector: {}, batch_size: 2, wait_secs: 30 })
 const runDlg = ref<{ show: boolean; runId: string }>({ show: false, runId: '' })
 const rolling = ref(false)
+
+function confirmDelete(version: string) {
+  dialog.warning({
+    title: '删除升级包',
+    content: `确定删除版本 ${version} 的升级包吗？已下发到节点的升级不受影响；离线节点的待下发升级会被取消。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      deleting.value = version
+      try {
+        await deleteUpgrade(version)
+        message.success(`已删除升级包 ${version}`)
+        await load()
+      } catch (e) {
+        message.error(errMsg(e))
+      } finally {
+        deleting.value = ''
+      }
+    },
+  })
+}
 
 async function openRollout(version: string) {
   try {

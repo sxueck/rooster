@@ -437,6 +437,9 @@ export function rolloutUpgrade(
     body,
   })
 }
+export function deleteUpgrade(version: string): Promise<OkResp> {
+  return request<OkResp>(`/upgrades/${encodeURIComponent(version)}`, { method: 'DELETE' })
+}
 
 // ---------------- audit ----------------
 export function getAudit(limit: number, offset: number): Promise<AuditResp> {
