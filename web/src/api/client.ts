@@ -463,12 +463,20 @@ export function deleteWasmRegistry(name: string): Promise<OkResp> {
 // re-exports commonly needed alongside client calls
 export type { NodeInfo, AuditEntry, WasmPlugin, Site, ForwardRule, BanPolicy, SshGuardPluginConfig, HardeningSectionConfig, HardeningConfig }
 
+export interface NginxLocSummary {
+  location: string
+  upstream: string
+}
 export interface NginxSite {
   id: string; domains: string[]; listen: string[]; file: string
   upstream: string | null; supported: boolean; reason: string | null
   mode: 'off' | 'detect' | 'block'
   status: 'discovered' | 'attached' | 'needs-recovery'
   fingerprint: string
+  /** 其余可接管 location 的摘要；旧 Agent 可能不返回 */
+  extra_locations?: NginxLocSummary[]
+  /** 保留在 Nginx、不经过 WAF 的非代理 location 数量 */
+  bypassed_locations?: number
 }
 export interface NginxSnapshot { running: boolean; sites: NginxSite[] }
 export function getNginxSites(id: string): Promise<NginxSnapshot> {

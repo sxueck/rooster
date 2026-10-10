@@ -46,10 +46,20 @@ const nginxRows = computed<NginxGroupRow[]>(() => {
 const scanning = ref(false)
 const scanError = ref('')
 const scanned = ref(false)
+/** nginx 未安装/未找到：不当作错误展示，直接给“暂无数据”。 */
+const scanMissing = ref(false)
 const nginxRunning = ref(false)
 const busy = ref('')
 const attachShow = ref(false)
 const attachSite = ref<NginxSite | null>(null)
+/** 已展开“未接入原因”的行 id；默认全部折叠，点击状态标签才展开。 */
+const expanded = ref(new Set<string>())
+function toggleReason(id: string) {
+  const next = new Set(expanded.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expanded.value = next
+}
 
 const nginxCols: RColumn<NginxGroupRow>[] = [
   { title: 'DOMAINS / LISTEN', key: 'domains', render: (r) => h('div', [
@@ -58,8 +68,12 @@ const nginxCols: RColumn<NginxGroupRow>[] = [
     ...r.folded.map((f) => h('small', { class: 'muted', style: 'display:block' }, `+ ${f.listen.join(', ') || '—'} · 无转发（跳转/ACME）`)),
   ]) },
   { title: 'CONFIG', key: 'file', mono: true, render: (r) => r.main.file },
-  { title: 'UPSTREAM', key: 'upstream', mono: true, render: (r) => r.main.upstream ?? '' },
-  { title: 'STATUS', key: 'status', render: (r) => { const m = r.main; return h('div', [hTag(m.status === 'attached' ? (m.mode === 'block' ? 'ok' : 'warn') : 'muted', m.status === 'attached' ? (m.mode === 'block' ? '已接入 · 阻断' : '已接入 · 监控') : m.status === 'needs-recovery' ? '需要恢复' : '未接入'), m.reason ? h('small', { class: 'muted', style: 'display:block;max-width:260px' }, m.reason) : null]) } },
+  { title: 'UPSTREAM', key: 'upstream', mono: true, render: (r) => h('div', [
+    h('div', r.main.upstream ?? ''),
+    ...(r.main.extra_locations ?? []).map((x) => h('small', { class: 'muted', style: 'display:block' }, `${x.location} → ${x.upstream}`)),
+    r.main.bypassed_locations ? h('small', { class: 'muted', style: 'display:block' }, `另有 ${r.main.bypassed_locations} 个非代理 location 留在 Nginx（不经 WAF）`) : null,
+  ]) },
+  { title: 'STATUS', key: 'status', width: 150, render: (r) => statusCell(r) },
   { title: 'ACTIONS', key: 'actions', render: (r) => { const m = r.main; return h('span', { class: 'row-tight' }, m.status === 'attached' ? [
     nginxButton(m.mode === 'block' ? '切换监控' : '开启阻断', m, m.mode === 'block' ? 'detect' : 'block'), nginxButton('关闭并恢复', m, 'off'),
   ] : m.status === 'needs-recovery' ? [nginxButton('恢复原配置', m, 'off')] : [
@@ -70,9 +84,14 @@ function nginxButton(label: string, row: NginxSite, mode: WafMode) {
   return h(RButton, { variant: 'link', loading: busy.value === row.id, disabled: busy.value !== '', onClick: () => changeNginx(row, mode) }, { default: () => label })
 }
 async function scanNginx() {
-  scanning.value = true; scanError.value = ''
+  scanning.value = true; scanError.value = ''; scanMissing.value = false
   try { const value = await getNginxSites(props.nodeId); nginxSites.value = value.sites; nginxRunning.value = value.running; scanned.value = true }
-  catch (e) { scanError.value = errMsg(e); nginxSites.value = []; scanned.value = false }
+  catch (e) {
+    const msg = errMsg(e)
+    if (/not found on this host/i.test(msg)) scanMissing.value = true
+    else scanError.value = msg
+    nginxSites.value = []; scanned.value = false
+  }
   finally { scanning.value = false }
 }
 async function changeNginx(row: NginxSite, mode: WafMode) {
@@ -102,6 +121,11 @@ function wafLabel(waf: Site['waf']): { label: string; tone: 'muted' | 'warn' | '
   return { label: '关闭', tone: 'muted' }
 }
 
+/** rooster 站点是否由 Nginx 接入托管(含多 location 子站点 id `nginx-<hash>-lN`)。 */
+function isNginxManaged(id: string): boolean {
+  return nginxSites.value.some((n) => n.id === id || id.startsWith(`${n.id}-l`))
+}
+
 const cols: RColumn<SiteRow>[] = [
   { title: 'ID', key: 'id', width: 130, mono: true },
   { title: 'DOMAINS', key: 'names' },
@@ -118,7 +142,7 @@ const cols: RColumn<SiteRow>[] = [
     width: 150,
     render: (r) =>
       h('span', { class: 'row-tight' }, [
-        ...(nginxSites.value.some((n) => n.id === r.id) ? [h('small', { class: 'muted' }, '由 Nginx 接入管理')] : [
+        ...(isNginxManaged(r.id) ? [h('small', { class: 'muted' }, '由 Nginx 接入管理')] : [
           hBtn(sites.value[r.index]?.waf?.mode === 'block' ? '切换监控' : '开启阻断', () => changeSiteMode(r.index)),
           hBtn('JSON 编辑', () => openEdit(r.index)), hBtn('删除', () => removeSite(r.index), 'danger'),
         ]),
@@ -128,6 +152,19 @@ const cols: RColumn<SiteRow>[] = [
 
 function hTag(tone: 'muted' | 'warn' | 'ok', label: string) {
   return h(RTag, { tone }, { default: () => label })
+}
+/** 状态单元格：只放一个紧凑标签；未接入/待恢复带原因时点击标签展开原因。 */
+function statusCell(r: NginxGroupRow) {
+  const m = r.main
+  const attached = m.status === 'attached'
+  const label = attached ? (m.mode === 'block' ? '阻断' : '监控') : m.status === 'needs-recovery' ? '待恢复' : '未接入'
+  const tone = attached ? (m.mode === 'block' ? 'ok' : 'warn') : 'muted'
+  const clickable = !attached && !!m.reason
+  const open = expanded.value.has(m.id)
+  const tag = clickable
+    ? h('button', { class: 'status-toggle', onClick: () => toggleReason(m.id) }, [hTag(tone, label), h('span', { class: 'status-caret' }, open ? '▲' : '▼')])
+    : hTag(tone, label)
+  return open && m.reason ? h('div', [tag, h('small', { class: 'muted status-reason' }, m.reason)]) : tag
 }
 function hBtn(label: string, onClick: () => void, tone?: 'danger') {
   return h(RButton, { variant: 'link', tone, onClick }, { default: () => label })
@@ -223,14 +260,15 @@ onMounted(() => { void load(); void scanNginx() })
     <RPanel title="Nginx 站点" kicker="DISCOVERY" flush>
       <template #actions><RButton size="sm" :loading="scanning" :disabled="busy !== ''" @click="scanNginx">扫描 Nginx</RButton></template>
       <p v-if="scanError" class="muted" style="padding: 0 16px">{{ scanError }}</p>
+      <p v-else-if="scanMissing" class="muted" style="padding: 0 16px">暂无数据</p>
       <p v-else-if="scanned && !nginxRunning" class="muted" style="padding: 0 16px">已读取配置，但 Nginx 未运行，不能快捷接入。</p>
       <p v-else-if="scanned && nginxSites.length === 0" class="muted" style="padding: 0 16px">未发现 HTTP server 配置。</p>
-      <RTable :columns="nginxCols" :rows="nginxRows" :row-key="(r: NginxGroupRow) => r.key" />
+      <RTable v-if="!scanMissing" :columns="nginxCols" :rows="nginxRows" :row-key="(r: NginxGroupRow) => r.key" empty-text="暂无数据" />
     </RPanel>
     <RModal v-model:show="attachShow" title="启用站点 WAF" kicker="NGINX · WAF" :width="560">
       <p>{{ attachSite?.domains.join(', ') || '默认站点' }}</p>
       <p class="muted">将备份并调整 {{ attachSite?.file }} 的转发目标，经过本机 Rooster 检测后再访问原上游。证书继续由 Nginx 管理。校验或接入失败会恢复配置。</p>
-      <p class="muted">监控模式只记录日志；阻断模式会拒绝命中的请求。当前请求体检测上限为 128 KiB。此操作不会自动启用全局 CRS。</p>
+      <p class="muted">监控模式只记录日志；阻断模式会拒绝命中的请求。当前请求体检测上限为 128 KiB。</p>
       <template #footer>
         <RButton variant="ghost" :disabled="busy !== ''" @click="attachShow = false">取消</RButton>
         <RButton :loading="busy !== ''" @click="attachSite && changeNginx(attachSite, 'detect')">接入并监控</RButton>
@@ -261,3 +299,26 @@ onMounted(() => { void load(); void scanNginx() })
     </RModal>
   </div>
 </template>
+
+<style scoped>
+.status-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+}
+.status-caret {
+  font-size: 9px;
+  color: var(--faint);
+}
+.status-reason {
+  display: block;
+  max-width: 260px;
+  margin-top: 4px;
+  line-height: 1.5;
+}
+</style>
