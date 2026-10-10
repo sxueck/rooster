@@ -1,8 +1,6 @@
 # Rooster ops UI — component contract (for page migration)
 
-Design language: hairline dividers, uppercase English micro labels,
-monospace data, dense flat panels. Chinese stays for body text, buttons,
-titles; **table column titles and section kickers are English uppercase**.
+Design language: hairline dividers, uppercase English micro labels, monospace data, dense flat panels. Chinese stays for body text, buttons, titles; **table column titles and section kickers are English uppercase**.
 
 Import everything from the barrel only:
 
@@ -63,9 +61,7 @@ const cols: RColumn[] = [
 ]
 ```
 
-`render` returns VNode | string | number; no render → raw `row[key]`
-(auto stringified; `mono` flag for data columns). Alignment: `align: 'right'`
-for numeric columns.
+`render` returns VNode | string | number; no render → raw `row[key]` (auto stringified; `mono` flag for data columns). Alignment: `align: 'right'` for numeric columns.
 
 ## RTabs lazy pattern (NodeDetail)
 
@@ -93,15 +89,9 @@ for numeric columns.
 
 ## Style rules
 
-- Use CSS vars from `src/style.css` (`--ink --sub --faint --line --line-strong
-  --panel --tint --ok --danger --warn --info --mono`). No hardcoded greys/greens.
-- Data (ids, hashes, IPs, timestamps, numbers, commands) → `class="mono"` or
-  `class="num"` / RTable `mono: true`.
+- Use CSS vars from `src/style.css` (`--ink --sub --faint --line --line-strong --panel --tint --ok --danger --warn --info --mono`). No hardcoded greys/greens.
+- Data (ids, hashes, IPs, timestamps, numbers, commands) → `class="mono"` or `class="num"` / RTable `mono: true`.
 - Section/table headers: English uppercase micro labels. Buttons & prose: Chinese.
-- Status: `RStatusDot` (dot + text) for online/offline/live states; `RTag` for
-  categorical chips.
+- Status: `RStatusDot` (dot + text) for online/offline/live states; `RTag` for categorical chips.
 - Keep ALL business logic, API calls, event handling identical — visual layer only.
-- Do not touch files outside your batch. Do not run `npm run build` /
-  `vue-tsc -b` (parallel forks share the tsbuildinfo; the orchestrator
-  integrates). You may run `npx vue-tsc --noEmit` and filter output to your
-  own files.
+- Do not touch files outside your batch. Do not run `npm run build` / `vue-tsc -b` (parallel forks share the tsbuildinfo; the orchestrator integrates). You may run `npx vue-tsc --noEmit` and filter output to your own files.

@@ -10,9 +10,7 @@ npm run dev        # 默认使用 mock 数据（VITE_ROOSTER_MOCK=1），无需�
 ```
 
 - 默认 dev 走 `src/api/mock.ts`（3+ 节点、模板、封禁、事件、审计等假数据），登录页任意 ≥4 字符的 secret_key 即可进入。
-- 连接真实 hub：把 `.env.development` 里 `VITE_ROOSTER_MOCK` 改为 `0`，然后启动本地 hub
-  （`127.0.0.1:9443`，dev server 已配置 `/v0` → `http://127.0.0.1:9443` 的代理，含 WebSocket），
-  登录页 Hub 地址留空即走同源代理；或填 `https://<hub>` 直连。
+- 连接真实 hub：把 `.env.development` 里 `VITE_ROOSTER_MOCK` 改为 `0`，然后启动本地 hub （`127.0.0.1:9443`，dev server 已配置 `/v0` → `http://127.0.0.1:9443` 的代理，含 WebSocket）， 登录页 Hub 地址留空即走同源代理；或填 `https://<hub>` 直连。
 - 生产构建固定使用真实 fetch（`.env.production` 中 `VITE_ROOSTER_MOCK=0`）。
 
 ## 构建
