@@ -209,6 +209,21 @@ write_hub_config() {
   chmod 600 "$file"
 }
 
+# 老 install 的 hub.yaml 里写死了 `session-ttl: 12h`。两条部署路径都对已有配置
+# 一律保留,所以后来调到 30d 的默认值永远覆盖不到它们:面板会话仍按 12h 过期,
+# 重开浏览器就被踢回登录页重输密钥。这里只替换这个历史默认值——用户自己写的
+# 其它 TTL 保持原样。返回 0 表示已改写,非 0 表示无需改写(调用方据此跳过回写)。
+LEGACY_SESSION_TTL='^session-ttl:[[:space:]]*"?12h"?[[:space:]]*$'
+bump_session_ttl() {
+  local file="$1" tmp
+  grep -Eq "$LEGACY_SESSION_TTL" "$file" || return 1
+  tmp="$(mktemp)"
+  sed -E "s/$LEGACY_SESSION_TTL/session-ttl: 30d/" "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+  say "  ${DIM}hub.yaml: session-ttl 12h -> 30d (existing install kept the old default)${N}"
+}
+
 # static 模式下 Agent 必须拨 Hub 自己的 TLS 端口(客户端证书得端到端到达
 # hub);L7 反代的 Host 头不带端口,推不出这个地址。这里的 port 是宿主机侧
 # 暴露的端口(docker 映射后的 host 端口,不是容器内 9443)。plain 模式不写:
@@ -399,6 +414,7 @@ deploy_hub_docker() (
     save_password "$dir/.env.passwd" "$secret"
     say "  password: $dir/.env.passwd (keep private)"
   else
+    bump_session_ttl "$dir/hub.yaml" || :
     # pre-keyed installs keep their existing release keypair; older
     # deployments upgrade in place by appending the line once
     if ! grep -q '^upgrade-public-key:' "$dir/hub.yaml"; then
@@ -551,6 +567,8 @@ deploy_hub_native() (
   else
     as_root cp "$dir/hub.yaml" "$work/hub.yaml"
     as_root chown "$(id -u)" "$work/hub.yaml"
+    # scratch copy is the only readable form of the root-owned config
+    if bump_session_ttl "$work/hub.yaml"; then as_root cp "$work/hub.yaml" "$dir/hub.yaml"; fi
     if ! as_root grep -q '^upgrade-public-key:' "$dir/hub.yaml"; then
       local rel_pub
       rel_pub="$(gen_release_key "$work")"

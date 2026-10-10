@@ -236,6 +236,21 @@ class DeployTests(unittest.TestCase):
         backups = list(config.glob("install-backup.*"))
         self.assertEqual((backups[0] / "hub.yaml").read_text(), "old-deployment")
 
+    def test_docker_overwrite_replaces_legacy_session_ttl_default(self):
+        # 12h was the value deploy.sh used to write; anything else is the operator's choice.
+        for ttl, expected in [("12h", "session-ttl: 30d"), ("6h", "session-ttl: 6h")]:
+            with self.subTest(ttl=ttl):
+                config = self.dir / f"ttl-{ttl}"
+                config.mkdir()
+                (config / "hub.yaml").write_text(f"listen: 0.0.0.0:9443\nsession-ttl: {ttl}\n")
+                self.ok(bash(DOCKER + "\ndeploy_hub_docker",
+                             f"hub.example\n9443\ntest-only\n{config}\n", env=self.env))
+                retained = (config / "hub.yaml").read_text()
+                self.assertIn(expected, retained)
+                self.assertIn("listen: 0.0.0.0:9443", retained)
+                backups = list(config.glob("install-backup.*"))
+                self.assertIn(f"session-ttl: {ttl}", (backups[0] / "hub.yaml").read_text())
+
     def test_docker_tls_uses_port_mapping_and_public_ca_mode(self):
         tls = self.certificates()
         config = self.dir / "docker config"
@@ -372,6 +387,24 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(config.read_text(), old)
         backups = list(config.parent.glob("install-backup.*"))
         self.assertEqual((backups[0] / "hub.yaml").read_text(), old)
+
+    def test_native_overwrite_replaces_legacy_session_ttl_default(self):
+        work = self.native_workspace()
+        config = Path(self.env["SANDBOX"]) / "etc/rooster/hub.yaml"
+        config.parent.mkdir(parents=True)
+        # upgrade-public-key pre-set: that append path is out of scope here
+        config.write_text(
+            'listen: 127.0.0.1:10443\ntls:\n  mode: none\n'
+            'session-ttl: 12h\nupgrade-public-key: "ed25519:x"\n'
+        )
+        output = self.ok(bash(NATIVE + "\ndeploy_hub_native",
+                             "hub.example\n10443\ntest-only\n3\n8443\n", cwd=work, env=self.env))
+        self.assertIn("session-ttl: 30d", config.read_text())
+        self.assertIn("listen: 127.0.0.1:10443", config.read_text())
+        self.assertIn('upgrade-public-key: "ed25519:x"', config.read_text())
+        self.assertIn("session-ttl 12h -> 30d", output)
+        backups = list(config.parent.glob("install-backup.*"))
+        self.assertIn("session-ttl: 12h", (backups[0] / "hub.yaml").read_text())
 
     def test_agent_unsigned_is_only_enabled_by_explicit_choice(self):
         mocks = r'''
