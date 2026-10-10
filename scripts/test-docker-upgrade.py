@@ -288,6 +288,7 @@ class Hub:
             urllib.request.HTTPSHandler(context=self.ctx))
         self.base = f"https://127.0.0.1:{port}"
         self.token = None
+        self.last_run_id = None  # 最近一次 rollout,失败诊断时 dump
 
     def request(self, method, path, *, data=None, json_body=None, extra_headers=None, timeout=30):
         if json_body is not None:
@@ -366,6 +367,7 @@ class Hub:
         status, body = self.json("POST", f"/v0/upgrades/{key}/rollout",
                                  json_body={"node_id": node_id, "batch_size": 1, "wait_secs": 45})
         check(status == 200, f"rollout {key} failed: {status} {body}")
+        self.last_run_id = body.get("run_id")
         return body
 
     def rollout_upgraded(self, run_id, node_id):
@@ -464,6 +466,7 @@ def main(argv=None):
     workdir = Path(tempfile.mkdtemp(prefix=f"rooster-{suffix}-"))
     secret_values = []  # never printed
     dk = None
+    hub = None
 
     def fail_diag(msg):
         if dk:
@@ -655,6 +658,11 @@ def main(argv=None):
         return 0
     except TestFailure as e:
         fail_diag(redact(str(e), secret_values))
+        # 等待条件超时时,rollout 记录本身是最直接的证据(docker 日志看不出状态机卡在哪)。
+        if hub is not None and hub.last_run_id:
+            status, body = hub.json("GET", f"/v0/rollouts/{hub.last_run_id}")
+            log(f"--- rollout {hub.last_run_id} (HTTP {status}) ---\n"
+                f"{redact(json.dumps(body, indent=2), secret_values)}")
         return 1
     except EnvError as e:
         log(f"ENVIRONMENT ERROR: {e}")

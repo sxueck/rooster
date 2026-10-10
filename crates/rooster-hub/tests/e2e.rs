@@ -1123,6 +1123,90 @@ async fn upgrade_upload_accepts_multi_megabyte_package() {
     assert_eq!(resp.status(), 413, "non-upload routes must keep the default body limit");
 }
 
+/// rollout 结果行的 JSON 键必须是 snake_case:API 层与面板/发布脚本都读
+/// `node_id`;字段一旦被 kebab-case 序列化成 `node-id`,GET /v0/rollouts
+/// 的消费方会永远读不到节点行(docker e2e 曾因此起时 300s)。
+#[tokio::test]
+async fn rollout_results_json_uses_snake_case_node_id() {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    let sk = SigningKey::generate(&mut rand::rng());
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let hub = start_hub_with_key(
+        "rollout-json",
+        Some(format!("ed25519:{}", b64.encode(sk.verifying_key().to_bytes()))),
+    )
+    .await;
+    let token = login(&hub).await;
+    hub._state
+        .store
+        .insert_token("tok-json", Duration::from_secs(60))
+        .unwrap();
+    register(&hub, "tok-json", "json-node").await; // 注册即有节点行,保持离线
+
+    let binary = b"fake-agent".to_vec();
+    let sig = b64.encode(sk.sign(&binary).to_bytes());
+    let resp = client()
+        .post(format!("{}/v0/upgrades", hub.base))
+        .bearer_auth(&token)
+        .header("x-rooster-version", "0.1.0-x86_64")
+        .header("x-rooster-signature", &sig)
+        .body(binary)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // 离线节点:行立即落 pending-offline,无需等待观察窗口。
+    let resp = client()
+        .post(format!("{}/v0/upgrades/0.1.0-x86_64/rollout", hub.base))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"node_id": "json-node", "batch_size": 1, "wait_secs": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await.ok());
+    let run_id = resp.json::<serde_json::Value>().await.unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    async fn get_json(uri: String, token: &str) -> serde_json::Value {
+        client()
+            .get(uri)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+    // rollout 后台任务是异步写的:行落下后还要一个 tick 才翻转终态。
+    let mut single = get_json(format!("{}/v0/rollouts/{run_id}", hub.base), &token).await;
+    for _ in 0..40 {
+        if single["status"] != "running" && single["results"].as_array().is_some_and(|a| !a.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        single = get_json(format!("{}/v0/rollouts/{run_id}", hub.base), &token).await;
+    }
+    assert_eq!(single["status"], "waiting-offline", "run: {single}");
+    let row = &single["results"][0];
+    assert_eq!(row["node_id"], "json-node", "row keys: {:?}", row.as_object().unwrap().keys());
+    assert!(row.get("node-id").is_none(), "kebab-case key leaked: {row}");
+
+    // 面板读列表端点,同一行结构。
+    let listed = get_json(format!("{}/v0/rollouts", hub.base), &token).await;
+    let run = listed["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == run_id.as_str())
+        .expect("run listed");
+    assert_eq!(run["results"][0]["node_id"], "json-node", "run: {run}");
+}
+
 /// 用指定 ConnMeta 起一个共用同一 HubState 的服务实例(mTLS 下载分支
 /// 的连接级指纹来自这里)。
 async fn serve_with_meta(

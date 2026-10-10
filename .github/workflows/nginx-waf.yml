@@ -49,7 +49,7 @@ jobs:
             --test management --test hub_passthrough --test bans_api
           cargo test -p rooster-agent --test httpguard --locked \
             -- --test-threads=1
-          cargo check -p rooster-hub --locked
+          cargo test -p rooster-hub --locked
       - name: Frontend build
         run: |
           npm ci --prefix web

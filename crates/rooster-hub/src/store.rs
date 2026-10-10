@@ -87,8 +87,9 @@ pub struct TemplateRecord {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub struct RolloutNodeResult {
+    /// 存量 redb 记录以 kebab-case 键(`node-id`)持久化;alias 只影响读取。
+    #[serde(alias = "node-id")]
     pub node_id: String,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -987,6 +988,15 @@ mod tests {
             status: "running".into(),
             results: vec![],
         }
+    }
+
+    /// 存量 redb 记录里的行是 kebab-case 键(`node-id`),改 snake_case 后必须仍可读。
+    #[test]
+    fn rollout_row_reads_legacy_kebab_case_records() {
+        let row: RolloutNodeResult =
+            serde_json::from_str(r#"{"node-id":"web-1","status":"sent"}"#).unwrap();
+        assert_eq!(row.node_id, "web-1");
+        assert_eq!(serde_json::to_string(&row).unwrap(), r#"{"node_id":"web-1","status":"sent"}"#);
     }
 
     /// 面板的下发列表必须给“最新的 limit 条”:旧实现先按 redb key 顺序
