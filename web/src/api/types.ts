@@ -299,8 +299,8 @@ export interface NodeWasmResp {
 
 // ---------------- events ----------------
 export type RoosterEvent =
-  | { kind: 'ban'; ip: string; reason: string; plugin: string; scope: string; ttl_secs: number }
-  | { kind: 'honeypot_hit'; ip: string; port: number; protocol: string }
+  | { kind: 'ban'; ip: string; reason: string; plugin: string; scope: string; ttl_secs: number; country?: string | null }
+  | { kind: 'honeypot_hit'; ip: string; port: number; protocol: string; country?: string | null }
   | {
       kind: 'block'
       ip: string
@@ -312,6 +312,8 @@ export type RoosterEvent =
       hits?: number[]
       /** 累计异常评分；旧事件可能缺失 */
       score?: number | null
+      /** 攻击源国家/地区；无 GeoIP 库时缺失 */
+      country?: string | null
     }
   | { kind: 'config_changed'; hash: string }
   | { kind: 'config_invalid'; error: string; line: number }

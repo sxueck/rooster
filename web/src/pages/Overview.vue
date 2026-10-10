@@ -13,7 +13,6 @@ import {
 import { getOverview } from '../api/client'
 import type { CountryCount, IpCount, OverviewResp, RuleCount } from '../api/types'
 import TrendChart from '../components/TrendChart.vue'
-import GeoFooter from '../components/GeoFooter.vue'
 import { errMsg } from '../utils/format'
 
 const message = useMessage()
@@ -78,14 +77,7 @@ const countryCols: RColumn<CountryCount>[] = [
           :rows="data?.top_countries ?? []"
           :row-key="(r: CountryCount) => r.country"
         />
-        <div class="geo-note"><GeoFooter /></div>
       </RPanel>
     </div>
   </div>
 </template>
-
-<style scoped>
-.geo-note {
-  padding: 0 14px;
-}
-</style>

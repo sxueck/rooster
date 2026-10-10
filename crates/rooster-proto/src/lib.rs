@@ -96,11 +96,16 @@ pub enum Event {
         plugin: String,
         scope: String,
         ttl_secs: u64,
+        /// 攻击源国家/地区名（Agent 端 GeoIP 属地标注；无库/无匹配 → None）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        country: Option<String>,
     },
     HoneypotHit {
         ip: String,
         port: u16,
         protocol: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        country: Option<String>,
     },
     Block {
         ip: String,
@@ -120,6 +125,9 @@ pub enum Event {
         /// 累计异常评分(阈值见 `waf.crs.inbound-anomaly-threshold`)。
         #[serde(default)]
         score: Option<u32>,
+        /// 攻击源国家/地区名(同 Ban.country)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        country: Option<String>,
     },
     /// 配置在进程外被修改并通过校验,已热重载。
     ConfigChanged { hash: String },
@@ -248,6 +256,7 @@ mod tests {
                 plugin: "ssh-guard".into(),
                 scope: "local".into(),
                 ttl_secs: 3600,
+                country: Some("中国".into()),
             }],
         });
         roundtrip(Frame::EventAck { acked_through: 12 });
@@ -297,6 +306,7 @@ mod tests {
                 path: Some("/login".into()),
                 hits: vec![942100, 942130],
                 score: Some(10),
+                country: None,
             }],
         });
         // 老 Agent 发的无 severity/path/hits/score 帧仍要能解码。
@@ -304,11 +314,12 @@ mod tests {
         let back: Frame = serde_json::from_str(legacy).expect("legacy block decodes");
         match back {
             Frame::Event { batch, .. } => match &batch[0] {
-                Event::Block { severity, path, hits, score, .. } => {
+                Event::Block { severity, path, hits, score, country, .. } => {
                     assert!(severity.is_none());
                     assert!(path.is_none());
                     assert!(hits.is_empty());
                     assert!(score.is_none());
+                    assert!(country.is_none(), "老帧缺 country 必须容错为 None");
                 }
                 other => panic!("wrong event: {other:?}"),
             },
@@ -329,6 +340,7 @@ mod tests {
             plugin: "ssh-guard".into(),
             scope: "local".into(),
             ttl_secs: 1,
+            country: None,
         };
         assert_eq!(e.subject_ip(), Some("1.2.3.4"));
         assert_eq!(e.source_plugin(), Some("ssh-guard"));
@@ -337,6 +349,7 @@ mod tests {
             ip: "203.0.113.8".into(),
             port: 2222,
             protocol: "tcp".into(),
+            country: None,
         };
         assert_eq!(hit.subject_ip(), Some("203.0.113.8"));
         assert_eq!(hit.source_plugin(), Some("honeypot"));

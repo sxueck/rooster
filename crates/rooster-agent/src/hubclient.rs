@@ -627,6 +627,7 @@ fn apply_global_ban(state: &Arc<AgentState>, ip: &str, ttl_secs: u64, reason: &s
                 plugin: "hub".to_string(),
                 scope: "global".to_string(),
                 ttl_secs,
+                country: None,
             });
         }
         Err(rooster_nft::NftError::Refused(msg)) => {

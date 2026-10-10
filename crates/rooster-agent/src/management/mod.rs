@@ -623,18 +623,7 @@ fn ban_country_reader(state: &AgentState) -> Result<maxminddb::Reader<Vec<u8>>, 
 }
 
 fn ban_country(reader: Option<&maxminddb::Reader<Vec<u8>>>, ip: &str) -> Option<String> {
-    let reader = reader?;
-    let ip = ip.parse::<std::net::IpAddr>().ok()?;
-    let country: maxminddb::geoip2::Country = reader.lookup(ip).ok()?;
-    ban_country_name(country)
-}
-
-fn ban_country_name(country: maxminddb::geoip2::Country<'_>) -> Option<String> {
-    [country.country, country.registered_country].into_iter().flatten().find_map(|record| {
-        record.names
-            .and_then(|names| names.get("zh-CN").or_else(|| names.get("en")).map(|name| (*name).to_string()))
-            .or_else(|| record.iso_code.map(str::to_string))
-    })
+    crate::geoip::country_name(reader?, ip)
 }
 
 fn ban_to_json(b: &rooster_nft::BanEntry, country: Option<String>) -> serde_json::Value {
@@ -708,6 +697,7 @@ async fn post_ban(
                 plugin: "manual".into(),
                 scope: "local".into(),
                 ttl_secs: entry.ttl.as_secs(),
+                country: None,
             });
             Json(json!({"ok": true, "ip": entry.ip, "ttl_secs": entry.ttl.as_secs()})).into_response()
         }
@@ -1404,8 +1394,6 @@ async fn put_nginx_waf(
 
 #[cfg(test)]
 mod geoip_tests {
-    use super::*;
-
     #[test]
     fn country_names_use_language_and_registered_country_fallbacks() {
         for (raw, expected) in [
@@ -1417,7 +1405,7 @@ mod geoip_tests {
             (r#"{}"#, None),
         ] {
             let country = serde_json::from_str(raw).unwrap();
-            assert_eq!(ban_country_name(country).as_deref(), expected, "{raw}");
+            assert_eq!(crate::geoip::country_name_from_record(country).as_deref(), expected, "{raw}");
         }
     }
 }

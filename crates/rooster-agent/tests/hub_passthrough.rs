@@ -263,14 +263,23 @@ async fn ws_accept(mut stream: TcpStream) -> WebSocketStream<TcpStream> {
 
 async fn next_frame(ws: &mut WebSocketStream<TcpStream>) -> Frame {
     use futures_util::StreamExt;
-    let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
-        .await
-        .expect("timeout waiting for frame")
-        .expect("stream ended")
-        .expect("ws error");
-    match msg {
-        tokio_tungstenite::tungstenite::Message::Binary(b) => rooster_proto::decode(&b).unwrap(),
-        other => panic!("expected binary frame, got {other:?}"),
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("timeout waiting for frame")
+            .expect("stream ended")
+            .expect("ws error");
+        match msg {
+            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                // 心跳 Ping 随时可能插入(心跳任务首 tick 立即触发),
+                // 与事件补报在 socket 上无顺序保证,跳过控制帧。
+                match rooster_proto::decode(&b).unwrap() {
+                    Frame::Ping | Frame::Pong => continue,
+                    frame => return frame,
+                }
+            }
+            other => panic!("expected binary frame, got {other:?}"),
+        }
     }
 }
 
@@ -359,6 +368,7 @@ async fn register_and_hello_share_identity_and_events_flow_without_ack() {
         plugin: "ssh-guard".into(),
         scope: "local".into(),
         ttl_secs: 60,
+        country: None,
     });
     match next_frame(&mut ws).await {
         Frame::Event { first_seq, batch } => {

@@ -14,6 +14,9 @@ use crate::outbox::Outbox;
 
 const MAX_EVENTS: usize = 500;
 
+/// GeoIP reader 缓存项:(库路径, reader;无库/损坏时 None)。
+type GeoCache = (PathBuf, Option<Arc<maxminddb::Reader<Vec<u8>>>>);
+
 /// CLI 运行时覆盖项(容器部署):叠加在每次 effective 配置读取之上,
 /// 热重载/commit 后自动重新应用,不回写 enrolled config.yaml。
 #[derive(Debug, Clone, Default)]
@@ -115,6 +118,10 @@ pub struct AgentState {
     /// 旧会话退出时不会误注销新会话的发送端。
     pub hub_frame_tx: Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<rooster_proto::Frame>)>>,
     hub_frame_gen: AtomicU64,
+    /// 事件属地标注用的 GeoIP reader 缓存(路径→reader;路径随配置变化
+    /// 才重开库,避免每个事件重读 ~10MB mmdb)。无库时存 None,
+    /// 下一个事件再试(后台会自动下载补齐)。
+    geo_reader: Mutex<Option<GeoCache>>,
 }
 
 impl AgentState {
@@ -164,6 +171,7 @@ impl AgentState {
             upgrade_lock: tokio::sync::Mutex::new(()),
             hub_frame_tx: Mutex::new(None),
             hub_frame_gen: AtomicU64::new(0),
+            geo_reader: Mutex::new(None),
         }
     }
 
@@ -184,6 +192,7 @@ impl AgentState {
     }
 
     pub fn push_event(&self, event: Event) {
+        let event = self.annotate_country(event);
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -203,6 +212,50 @@ impl AgentState {
             }
             self.outbox_notify.notify_one();
         }
+    }
+
+    /// 拦截/封禁类事件标注攻击源国家(Hub 总览 top-countries 的唯一
+    /// 数据源;无库/解析失败 → 不动,保持 country=None)。
+    /// 只在 push_event 这个唯一汇入点做一次,所有发射处不用各自关心。
+    fn annotate_country(&self, mut event: Event) -> Event {
+        let ip = match &mut event {
+            Event::Ban { ip, country, .. }
+            | Event::HoneypotHit { ip, country, .. }
+            | Event::Block { ip, country, .. } => {
+                if country.is_some() {
+                    return event;
+                }
+                ip.clone()
+            }
+            _ => return event,
+        };
+        let name = self.geo_country(&ip);
+        if let Event::Ban { country, .. }
+        | Event::HoneypotHit { country, .. }
+        | Event::Block { country, .. } = &mut event
+        {
+            *country = name;
+        }
+        event
+    }
+
+    fn geo_country(&self, ip: &str) -> Option<String> {
+        let eff = self.effective();
+        let geo = eff.attribution_geoip();
+        if !geo.enabled() {
+            return None;
+        }
+        let path = crate::geoip::db_path(&eff.agent.data_dir(), geo.database());
+        let mut cache = self.geo_reader.lock().unwrap();
+        let reader: Option<Arc<maxminddb::Reader<Vec<u8>>>> = match cache.as_ref() {
+            Some((cached, reader)) if *cached == path => reader.clone(),
+            _ => {
+                let opened = crate::geoip::open_db(&path).ok().map(Arc::new);
+                *cache = Some((path, opened.clone()));
+                opened
+            }
+        };
+        crate::geoip::country_name(reader.as_ref()?, ip)
     }
 
     /// 经当前 hub 连接发送 Agent 主动帧(未连接时 Err)。

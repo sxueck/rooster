@@ -17,7 +17,6 @@ import {
 } from '../ui'
 import { getNodes, queryEvents } from '../api/client'
 import type { EventRecord, EventsQuery } from '../api/types'
-import GeoFooter from '../components/GeoFooter.vue'
 import { errMsg, eventKindLabel, eventSummary, eventTagType, fmtTime } from '../utils/format'
 
 const message = useMessage()
@@ -146,15 +145,6 @@ const cols: RColumn[] = [
         :row-key="(r: EventRecord) => r.ts + r.node_id"
         :page-size="20"
       />
-      <div class="geo-foot">
-        <GeoFooter />
-      </div>
     </RPanel>
   </div>
 </template>
-
-<style scoped>
-.geo-foot {
-  padding: 0 10px 10px;
-}
-</style>

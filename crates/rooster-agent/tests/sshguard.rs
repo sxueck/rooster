@@ -300,6 +300,7 @@ async fn file_tail_bans_after_appended_line() {
             plugin,
             scope,
             ttl_secs,
+            country: _,
         }) => {
             assert_eq!(ip, "203.0.113.77");
             assert_eq!(plugin, "ssh-guard");

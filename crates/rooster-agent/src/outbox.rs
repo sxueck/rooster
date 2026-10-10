@@ -219,6 +219,7 @@ mod tests {
             plugin: "ssh-guard".into(),
             scope: "local".into(),
             ttl_secs: 60,
+            country: None,
         }
     }
 

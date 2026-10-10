@@ -645,6 +645,7 @@ async fn waf_block_reports_block_event_with_severity() {
             path,
             hits,
             score,
+            country: _,
         } => {
             assert_eq!(site, "wafev", "事件站点必须是 cfg.id");
             assert_eq!(rule_id, "942100");

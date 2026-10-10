@@ -266,6 +266,7 @@ async fn send_event(url: &str, node: &str, ip: &str) {
             plugin: "ssh-guard".into(),
             scope: "local".into(),
             ttl_secs: 3600,
+            country: None,
         }],
     })))
     .await
@@ -1272,6 +1273,7 @@ async fn revoke_kills_session_and_frees_reregistration() {
             plugin: "ssh-guard".into(),
             scope: "local".into(),
             ttl_secs: 3600,
+            country: None,
         }],
     })))
     .await
@@ -1314,6 +1316,7 @@ async fn revoke_kills_session_and_frees_reregistration() {
                 plugin: "ssh-guard".into(),
                 scope: "local".into(),
                 ttl_secs: 3600,
+                country: None,
             }],
         })))
         .await;

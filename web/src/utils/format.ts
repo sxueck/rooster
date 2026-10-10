@@ -92,14 +92,15 @@ export function eventTagType(kind: string): 'success' | 'warning' | 'error' | 'i
 }
 
 export function eventSummary(ev: RoosterEvent): string {
+  const geo = 'country' in ev && ev.country ? `［${ev.country}］` : ''
   switch (ev.kind) {
     case 'ban':
-      return `封禁 ${ev.ip}（${ev.plugin}，${fmtDuration(ev.ttl_secs)}）：${ev.reason}`
+      return `封禁 ${ev.ip}${geo}（${ev.plugin}，${fmtDuration(ev.ttl_secs)}）：${ev.reason}`
     case 'block': {
       // 新版 block 事件带 path / hits / score；旧数据缺失时保持原样，不显示 undefined
       const hitN = ev.hits?.length ?? 0
       const rule = hitN > 1 ? `${ev.rule_id} 等 ${hitN} 条` : String(ev.rule_id)
-      let s = `拦截 ${ev.ip}，命中规则 ${rule} @ ${ev.site}`
+      let s = `拦截 ${ev.ip}${geo}，命中规则 ${rule} @ ${ev.site}`
       if (ev.path) s += `，路径 ${ev.path}`
       if (ev.score !== null && ev.score !== undefined) s += `，异常评分 ${ev.score}`
       return s

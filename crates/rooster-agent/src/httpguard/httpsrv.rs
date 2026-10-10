@@ -712,6 +712,7 @@ async fn handle_site_request(
                     path: Some(parts.uri.path().to_string()),
                     hits: hits.iter().map(|(id, _)| *id).collect(),
                     score: Some(verdict.score),
+                    country: None,
                 };
                 let internal_probe = _peer.ip().is_loopback()
                     && parts.headers.get("x-rooster-self-test").and_then(|v| v.to_str().ok())

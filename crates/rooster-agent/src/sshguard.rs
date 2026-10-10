@@ -285,6 +285,7 @@ impl Pipeline {
                     plugin: "ssh-guard".to_string(),
                     scope: "local".to_string(),
                     ttl_secs: ttl.as_secs(),
+                    country: None,
                 });
             }
             Err(err) => match err {

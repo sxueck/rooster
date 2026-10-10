@@ -167,6 +167,7 @@ mod tests {
             plugin: "ssh-guard".into(),
             scope: "local".into(),
             ttl_secs: 3600,
+            country: None,
         }
     }
 
@@ -178,6 +179,7 @@ mod tests {
             severity: severity.map(str::to_string),
             path: Some("/login".into()),
             hits: vec![942100],
+            country: None,
             score: Some(5),
         }
     }
@@ -250,6 +252,7 @@ mod tests {
             path: None,
             hits: vec![],
             score: None,
+            country: None,
         };
         // 插件不匹配(ssh-guard vs http-guard)。
         assert!(eng.evaluate(&ps, "a", &block, 1).is_empty());

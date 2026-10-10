@@ -233,7 +233,7 @@ async fn handle_frame(state: &Arc<HubState>, conn: &Arc<crate::registry::Conn>, 
             let mut engine = state.policy.lock().unwrap();
             for event in &batch {
                 state.push_recent(node_id, ts, event.clone());
-                if let Event::HoneypotHit { ip, port, protocol } = event {
+                if let Event::HoneypotHit { ip, port, protocol, .. } = event {
                     let hit = crate::store::NodeHoneypotHitRecord {
                         node_id: node_id.to_string(),
                         ts,

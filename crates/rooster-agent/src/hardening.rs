@@ -657,6 +657,7 @@ async fn promote_scan_set(
                     plugin: plugin.to_string(),
                     scope: "local".to_string(),
                     ttl_secs: ttl.as_secs(),
+                    country: None,
                 });
             }
             Err(e) => {
@@ -725,6 +726,7 @@ async fn promote_honeypot_set(
             ip: ip.clone(),
             port,
             protocol: "tcp".to_string(),
+            country: None,
         });
 
         let ban_key = (ip.clone(), set);
@@ -750,6 +752,7 @@ async fn promote_honeypot_set(
                     plugin: plugin.to_string(),
                     scope: "local".to_string(),
                     ttl_secs: ttl.as_secs(),
+                    country: None,
                 });
             }
             Err(e) => {
@@ -823,6 +826,7 @@ async fn promote_plain_set(
                         plugin: plugin.to_string(),
                         scope: "local".to_string(),
                         ttl_secs: ttl.as_secs(),
+                        country: None,
                     });
                 }
                 Err(e) => {

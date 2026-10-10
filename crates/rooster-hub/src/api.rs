@@ -1264,34 +1264,50 @@ async fn overview(State(state): State<Arc<HubState>>) -> Response {
     let global_bans = state.store.list_global_bans().unwrap_or_default().len();
 
     // 从近期事件环聚合 24h 数据(总览)。cutoff 对齐整点,使 trend_24h 桶标签为整点时刻。
+    // 国家来自 Agent 端属地标注(事件 country 字段);蜜罐命中同样是攻击,
+    // 计入 IP/国家/趋势但不计入封禁数。
     let cutoff = (now_secs() / 3600 * 3600).saturating_sub(24 * 3600);
     let mut bans_24h = 0u64;
     let mut ips: BTreeMap<String, u64> = BTreeMap::new();
     let mut rules: BTreeMap<String, u64> = BTreeMap::new();
+    let mut countries: BTreeMap<String, u64> = BTreeMap::new();
     let mut trend = vec![0u64; 24];
+    let mut hit_bucket = |ts: u64, trend: &mut Vec<u64>| {
+        let bucket = ((ts - cutoff) / 3600) as usize;
+        if bucket < 24 {
+            trend[bucket] += 1;
+        }
+    };
     for r in state.recent.lock().unwrap().iter() {
         if r.ts < cutoff {
             continue;
         }
-        match &r.event {
-            rooster_proto::Event::Ban { ip, .. } => {
+        let (ip, country) = match &r.event {
+            rooster_proto::Event::Ban { ip, country, .. } => {
                 bans_24h += 1;
-                *ips.entry(ip.clone()).or_default() += 1;
-                let bucket = ((r.ts - cutoff) / 3600) as usize;
-                if bucket < 24 {
-                    trend[bucket] += 1;
-                }
+                (Some(ip), country.as_ref())
             }
-            rooster_proto::Event::Block { ip, rule_id, .. } => {
-                *ips.entry(ip.clone()).or_default() += 1;
-                *rules.entry(rule_id.clone()).or_default() += 1;
-                let bucket = ((r.ts - cutoff) / 3600) as usize;
-                if bucket < 24 {
-                    trend[bucket] += 1;
+            rooster_proto::Event::HoneypotHit { ip, country, .. } => (Some(ip), country.as_ref()),
+            rooster_proto::Event::Block { ip, rule_id, hits, country, .. } => {
+                // 异常评分模式下 hits 是本次真正被打的全部规则;老 Agent
+                // 没有该字段时回退主规则 id。
+                if hits.is_empty() {
+                    *rules.entry(rule_id.clone()).or_default() += 1;
+                } else {
+                    for h in hits {
+                        *rules.entry(h.to_string()).or_default() += 1;
+                    }
                 }
+                (Some(ip), country.as_ref())
             }
-            _ => {}
+            _ => (None, None),
+        };
+        let Some(ip) = ip else { continue };
+        *ips.entry(ip.clone()).or_default() += 1;
+        if let Some(c) = country {
+            *countries.entry(c.clone()).or_default() += 1;
         }
+        hit_bucket(r.ts, &mut trend);
     }
     let top = |m: BTreeMap<String, u64>| {
         let mut v: Vec<_> = m.into_iter().collect();
@@ -1308,7 +1324,7 @@ async fn overview(State(state): State<Arc<HubState>>) -> Response {
         "bans_24h": bans_24h,
         "top_attack_ips": top(ips).into_iter().map(|(ip, count)| json!({"ip": ip, "count": count})).collect::<Vec<_>>(),
         "top_rules": top(rules).into_iter().map(|(rule_id, count)| json!({"rule_id": rule_id, "count": count})).collect::<Vec<_>>(),
-        "top_countries": [],
+        "top_countries": top(countries).into_iter().map(|(country, count)| json!({"country": country, "count": count})).collect::<Vec<_>>(),
         "trend_24h": trend_24h,
     }))
     .into_response()

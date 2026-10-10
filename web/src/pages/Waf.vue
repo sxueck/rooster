@@ -18,7 +18,6 @@ import {
 import { getNodes, getWafReport, getWafRules } from '../api/client'
 import { ApiError } from '../api/types'
 import type { NodeInfo, WafReportResp, WafRule, WafRulesResp, WafSkippedRule } from '../api/types'
-import GeoFooter from '../components/GeoFooter.vue'
 import { errMsg } from '../utils/format'
 
 const message = useMessage()
@@ -237,9 +236,6 @@ watch(nodeId, () => void load())
           :row-key="(r: WafSkippedRule) => r.line + ':' + r.reason"
         />
       </template>
-      <div class="geo-foot">
-        <GeoFooter />
-      </div>
     </RPanel>
   </div>
 </template>
@@ -247,8 +243,5 @@ watch(nodeId, () => void load())
 <style scoped>
 .skip-none {
   padding: 10px 14px 0;
-}
-.geo-foot {
-  padding: 0 14px 12px;
 }
 </style>

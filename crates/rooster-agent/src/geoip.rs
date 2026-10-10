@@ -146,6 +146,34 @@ pub(crate) fn open_db(path: &Path) -> Result<maxminddb::Reader<Vec<u8>>, String>
     parse_db(raw)
 }
 
+/// 查 IP 的国家/地区展示名（zh-CN 优先，回退 en / ISO 代码）。
+/// 事件属地标注与封禁列表共用同一套规则，必须只有这一份实现。
+pub(crate) fn country_name(reader: &maxminddb::Reader<Vec<u8>>, ip: &str) -> Option<String> {
+    let ip = ip.parse::<std::net::IpAddr>().ok()?;
+    let country: maxminddb::geoip2::Country = reader.lookup(ip).ok()?;
+    country_name_from_record(country)
+}
+
+/// 从已解析的 Country 记录取展示名（拆出来供测试直接构造记录验证回退链）。
+pub(crate) fn country_name_from_record(
+    country: maxminddb::geoip2::Country<'_>,
+) -> Option<String> {
+    [country.country, country.registered_country]
+        .into_iter()
+        .flatten()
+        .find_map(|record| {
+            record
+                .names
+                .and_then(|names| {
+                    names
+                        .get("zh-CN")
+                        .or_else(|| names.get("en"))
+                        .map(|name| (*name).to_string())
+                })
+                .or_else(|| record.iso_code.map(str::to_string))
+        })
+}
+
 // maxminddb 0.24 can panic on truncated metadata instead of returning an error.
 fn parse_db<S: AsRef<[u8]> + std::panic::UnwindSafe>(raw: S) -> Result<maxminddb::Reader<S>, String> {
     std::panic::catch_unwind(|| maxminddb::Reader::from_source(raw))
