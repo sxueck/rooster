@@ -583,13 +583,19 @@ impl Store {
         w.commit().map_err(json_err)
     }
 
+    /// 会话的绝对过期时间戳(只读);无此会话返回 None。cookie 会话的
+    /// 「还剩多久」与面板开机探测都走这一个读路径。
+    pub fn session_expiry(&self, token: &str) -> Result<Option<u64>, String> {
+        let r = self.db.begin_read().map_err(json_err)?;
+        let t = r.open_table(SESSIONS).map_err(json_err)?;
+        Ok(t.get(token).map_err(json_err)?.map(|v| v.value()))
+    }
+
     /// 校验会话(只读)。过期清理由 Hub 的周期任务 `cleanup_sessions` 负责:
     /// 若在这里顺带清理,任何带无效 Bearer 的未认证请求都会换回一次写事务。
     pub fn validate_session(&self, token: &str) -> Result<bool, String> {
         let now = now_secs();
-        let r = self.db.begin_read().map_err(json_err)?;
-        let t = r.open_table(SESSIONS).map_err(json_err)?;
-        Ok(matches!(t.get(token).map_err(json_err)?, Some(v) if v.value() > now))
+        Ok(matches!(self.session_expiry(token)?, Some(exp) if exp > now))
     }
 
     /// 删除全部过期会话。
@@ -907,8 +913,11 @@ mod tests {
     #[test]
     fn sessions_validate_and_expire() {
         let s = tmp_store();
-        s.insert_session("tok", now_secs() + 60).unwrap();
+        let exp = now_secs() + 60;
+        s.insert_session("tok", exp).unwrap();
         assert!(s.validate_session("tok").unwrap());
+        assert_eq!(s.session_expiry("tok").unwrap(), Some(exp));
+        assert_eq!(s.session_expiry("nope").unwrap(), None);
         s.insert_session("old", now_secs() - 1).unwrap();
         assert!(!s.validate_session("old").unwrap());
         s.delete_session("tok").unwrap();

@@ -1,5 +1,11 @@
 import { defineStore } from 'pinia'
-import { login as apiLogin, getHub, getToken, setToken } from '../api/client'
+import {
+  login as apiLogin,
+  logout as apiLogout,
+  getHub,
+  getToken,
+  setToken,
+} from '../api/client'
 import { useEventsStore } from './events'
 
 /**
@@ -19,7 +25,12 @@ export const useAuthStore = defineStore('auth', {
       this.hub = getHub()
       return resp
     },
-    logout() {
+    async logout() {
+      try {
+        await apiLogout()
+      } catch {
+        // Hub 不可达也要把本地会话关掉
+      }
       setToken('')
       this.token = ''
       useEventsStore().disconnect()

@@ -1,5 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { getToken } from '../api/client'
+import { getToken, hasSession } from '../api/client'
 
 declare module 'vue-router' {
   interface RouteMeta {
@@ -34,10 +34,13 @@ const router = createRouter({
   ],
 })
 
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
   if (to.meta.public) return true
-  if (!getToken()) return { name: 'login', query: { redirect: to.fullPath } }
-  return true
+  if (getToken()) return true
+  // 本地存储是空的 ≠ 没有会话:cookie 按 host 存、与端口无关,
+  // 从 :443 还是 :9443 进来都是同一个会话,先问 Hub 一句再赶人。
+  if (await hasSession()) return true
+  return { name: 'login', query: { redirect: to.fullPath } }
 })
 
 export default router

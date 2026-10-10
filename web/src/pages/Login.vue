@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { RButton, RField, RInput, RPanel, useMessage } from '../ui'
 import { useAuthStore } from '../stores/auth'
@@ -16,6 +16,8 @@ const message = useMessage()
 const hub = ref(auth.hub)
 const secret = ref('')
 const error = ref('')
+// 会话被 Hub 判过期时 client.ts 会抹掉 token,这里说清原因,别只留一个空密码框。
+const expired = computed(() => route.query.reason === 'expired')
 const loading = ref(false)
 
 async function submit() {
@@ -52,6 +54,9 @@ async function submit() {
         </div>
       </template>
 
+      <div v-if="expired" class="expired mono">
+        上次会话已到期（Hub 的 session-ttl），本机 token 已清除，请重新登录。
+      </div>
       <div class="stack">
         <details class="advanced">
           <summary class="micro">高级选项 · Hub 地址</summary>
@@ -140,6 +145,16 @@ async function submit() {
   background: #fff7f7;
   border-radius: 3px;
   padding: 6px 10px;
+}
+.expired {
+  font-size: 12px;
+  color: var(--ink);
+  border: 1px solid #d9d2c2;
+  border-left: 3px solid #b8860b;
+  background: #fdf9ef;
+  border-radius: 3px;
+  padding: 6px 10px;
+  margin-bottom: 12px;
 }
 .note {
   margin-top: 14px;

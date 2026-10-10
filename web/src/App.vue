@@ -86,8 +86,8 @@ watch(
   { immediate: true },
 )
 
-function logout() {
-  auth.logout()
+async function logout() {
+  await auth.logout()
   void router.push('/login')
 }
 </script>

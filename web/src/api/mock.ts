@@ -810,6 +810,8 @@ route('POST', /^\/auth\/login$/, (_m, opts) => {
   return { token: 'mock-' + hex(24), expires_at: secIn(12 * 3600) } satisfies LoginResp
 })
 route('GET', /^\/overview$/, () => overview())
+// mock 不校验凭证,但登出要保持可调用(面板会 await 它)。
+route('POST', /^\/auth\/logout$/, () => ({ ok: true }) satisfies OkResp)
 
 // ---- nodes ----
 route('GET', /^\/nodes$/, () => ({ nodes: state.nodes.map((n) => n.info) }) satisfies NodesResp)

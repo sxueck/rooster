@@ -7,7 +7,7 @@ use crate::store::now_secs;
 use crate::HubState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rooster_proto::{Event, Frame};
 use std::sync::Arc;
@@ -333,11 +333,12 @@ async fn handle_frame(state: &Arc<HubState>, conn: &Arc<crate::registry::Conn>, 
 
 pub async fn panel_ws(
     State(state): State<Arc<HubState>>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
     uri: axum::http::Uri,
 ) -> Response {
-    // token 经查询参数(浏览器 WS 无法带 Authorization 头)。
-    let token = uri
+    // token 优先取查询参数(浏览器 WS 无法带 Authorization 头),再退到会话 cookie。
+    let query_token = uri
         .query()
         .and_then(|q| {
             q.split('&').find_map(|kv| {
@@ -346,7 +347,8 @@ pub async fn panel_ws(
             })
         })
         .unwrap_or_default();
-    let valid = state.store.validate_session(&token).unwrap_or(false);
+    let valid = (!query_token.is_empty() && state.store.validate_session(&query_token).unwrap_or(false))
+        || crate::api::session_is_valid(&state, &headers);
     if !valid {
         return (StatusCode::UNAUTHORIZED, "invalid session").into_response();
     }

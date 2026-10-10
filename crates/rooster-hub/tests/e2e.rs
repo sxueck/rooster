@@ -1350,3 +1350,148 @@ async fn mtls_node_identity_authorizes_wasm_download() {
         .unwrap();
     assert_eq!(resp.status(), 200, "plain loopback peer is the dev-mode allowance");
 }
+
+/// 登录响应的 `Set-Cookie` 里取会话 cookie 值(面板跨 origin 的唯一凭证)。
+async fn login_cookie(hub: &HubServer) -> String {
+    let resp = client()
+        .post(format!("{}/v0/auth/login", hub.base))
+        .json(&serde_json::json!({"secret_key": "hub-secret"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let raw = resp
+        .headers()
+        .get("set-cookie")
+        .expect("login must set a session cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        raw.contains("HttpOnly") && raw.contains("SameSite=Lax") && raw.contains("Path=/"),
+        "cookie attributes: {raw}"
+    );
+    let (name, value) = raw.split(';').next().unwrap().split_once('=').unwrap();
+    assert_eq!(name, "rooster_session", "cookie name: {raw}");
+    value.to_string()
+}
+
+/// 面板在 `https://host`(:443 反代)和 `https://host:9443`(Hub TLS)两个
+/// origin 上都有入口,而 cookie 按 host 存、与端口无关 —— 只带 cookie(甚至
+/// 带一个空 Bearer)也必须认证通过,否则重开浏览器就是白闪一下再赶回登录页。
+#[tokio::test]
+async fn cookie_session_authenticates_without_bearer() {
+    let hub = start_hub("cookie-session").await;
+    let cookie = login_cookie(&hub).await;
+    assert_eq!(cookie.len(), 64, "session token is 32 hex bytes: {cookie}");
+    let jar = format!("other=1; rooster_session={cookie}");
+
+    let resp = client()
+        .get(format!("{}/v0/nodes", hub.base))
+        .header("cookie", &jar)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "cookie alone must authenticate");
+
+    // 面板在没有本地 token 时仍会发 `Authorization: Bearer `(空值):
+    // 它不算凭证,必须继续往下找到 cookie。
+    let resp = client()
+        .get(format!("{}/v0/nodes", hub.base))
+        .bearer_auth("")
+        .header("cookie", &jar)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "an empty Bearer must not shadow the cookie");
+
+    // 过期的本地 token(另一个 origin 的分桶里残留的)也不能遮住好 cookie:
+    // 逐个试候选凭证,否则用户会被踢回登录页 —— 正是要修的症状。
+    let resp = client()
+        .get(format!("{}/v0/nodes", hub.base))
+        .bearer_auth("deadbeef".repeat(8))
+        .header("cookie", &jar)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "a stale Bearer must fall through to the cookie");
+
+    let probe: serde_json::Value = client()
+        .get(format!("{}/v0/auth/session", hub.base))
+        .header("cookie", &jar)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(probe["authenticated"], serde_json::json!(true), "{probe}");
+
+    // 无凭证的开机探测回答 false(200),而不是 401:它是公开路由。
+    let anon: serde_json::Value = client()
+        .get(format!("{}/v0/auth/session", hub.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(anon["authenticated"], serde_json::json!(false), "{anon}");
+
+    // 登出必须真删会话行,否则刷新就被 cookie 认回来。
+    let out = client()
+        .post(format!("{}/v0/auth/logout", hub.base))
+        .header("cookie", &jar)
+        .send()
+        .await
+        .unwrap();
+    assert!(out.status().is_success());
+    assert!(
+        out.headers()
+            .get("set-cookie")
+            .map(|v| v.to_str().unwrap_or_default().contains("Max-Age=0"))
+            .unwrap_or(false),
+        "logout must clear the cookie"
+    );
+    assert_eq!(
+        hub._state.store.session_expiry(&cookie).unwrap(),
+        None,
+        "logout must delete the durable session row"
+    );
+    let resp = client()
+        .get(format!("{}/v0/nodes", hub.base))
+        .header("cookie", &jar)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "revoked session must stop authenticating");
+}
+
+/// 面板事件 WS 带不了 `Authorization` 头,同源会话 cookie 是它唯一的凭证通道;
+/// 没有 cookie 时仍然必须被拒。
+#[tokio::test]
+async fn panel_ws_accepts_session_cookie_and_rejects_anonymous() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let hub = start_hub("panel-ws-cookie").await;
+    let cookie = login_cookie(&hub).await;
+    let url = format!("{}/v0/ws", hub.ws_base);
+
+    // 用 tungstenite 自己装配握手头(Host/key/version),只补一个 cookie 头。
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut().insert(
+        "cookie",
+        format!("rooster_session={cookie}")
+            .parse()
+            .expect("valid cookie header"),
+    );
+    let (_ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(resp.status(), 101, "cookie-only WS must upgrade");
+
+    let err = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains('4'),
+        "anonymous WS must be rejected, got: {err:?}"
+    );
+}

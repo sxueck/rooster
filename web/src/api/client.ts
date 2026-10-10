@@ -105,7 +105,8 @@ async function request<T>(path: string, opts: ReqOpts = {}): Promise<T> {
 
   const hub = getHub().replace(/\/+$/, '')
   const base = hub !== '' ? `${hub}/v0` : '/v0'
-  const headers: Record<string, string> = { Authorization: `Bearer ${getToken()}` }
+  const token = getToken()
+  const headers: Record<string, string> = token === '' ? {} : { Authorization: `Bearer ${token}` }
   let body: BodyInit | undefined
   if (opts.raw) {
     for (const [k, v] of Object.entries(opts.raw.headers)) headers[k] = v
@@ -117,7 +118,14 @@ async function request<T>(path: string, opts: ReqOpts = {}): Promise<T> {
 
   let resp: Response
   try {
-    resp = await fetch(base + path, { method: opts.method ?? 'GET', headers, body })
+    // same-origin:会话 cookie 只在同源请求里带上(手填跨 origin Hub 时不带,
+    // 那条路径继续靠 Bearer)。
+    resp = await fetch(base + path, {
+      method: opts.method ?? 'GET',
+      headers,
+      body,
+      credentials: 'same-origin',
+    })
   } catch (e) {
     throw new ApiError(0, `无法连接 Hub（${hub || '同源代理'}）：${String(e)}`)
   }
@@ -144,6 +152,26 @@ async function request<T>(path: string, opts: ReqOpts = {}): Promise<T> {
 export async function login(hub: string, secretKey: string): Promise<LoginResp> {
   setHub(hub.trim().replace(/\/+$/, ''))
   return request<LoginResp>('/auth/login', { method: 'POST', body: { secret_key: secretKey } })
+}
+
+/**
+ * 开机探测:本地没有 token 时,问一句 Hub 会话 cookie 还算不算数。
+ * cookie 按 host 存、与端口无关,所以 :443 与 :9443 两个 origin 共用一个会话。
+ * 任何异常(离线/5xx)一律当作 false,守卫据此赶去登录页而不是白屏。
+ */
+export async function hasSession(): Promise<boolean> {
+  if (MOCK_MODE) return getToken() !== ''
+  try {
+    const r = await request<{ authenticated: boolean }>('/auth/session')
+    return r.authenticated === true
+  } catch {
+    return false
+  }
+}
+
+/** 真登出:Hub 删会话行并抹 cookie,只清本地状态会被 cookie 认回来。 */
+export function logout(): Promise<OkResp> {
+  return request<OkResp>('/auth/logout', { method: 'POST' })
 }
 
 // ---------------- overview ----------------

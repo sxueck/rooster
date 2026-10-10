@@ -68,6 +68,8 @@ impl LoginGate {
 pub fn router(state: Arc<HubState>) -> Router {
     let public = Router::new()
         .route("/v0/auth/login", post(login))
+        .route("/v0/auth/session", get(session_probe))
+        .route("/v0/auth/logout", post(logout))
         .route("/v0/register", post(register))
         .route("/v0/pubkey.pem", get(pubkey_pem))
         .route("/v0/ca.crt", get(server_ca))
@@ -129,6 +131,91 @@ pub fn router(state: Arc<HubState>) -> Router {
 // ---------------------------------------------------------------------------
 // 中间件:会话鉴权 + CORS
 
+/// 会话 cookie 名。cookie 按 host 存、与端口无关,这是它能抹平
+/// `https://hub`(:443 反代)与 `https://hub:9443`(Hub static TLS)两个
+/// origin 的原因 —— localStorage 是分桶的,cookie 不是。
+pub const SESSION_COOKIE: &str = "rooster_session";
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    // 空 Bearer(面板没有本地 token 时也会发 `Bearer `)不算凭证。
+    (!raw.is_empty()).then(|| raw.to_string())
+}
+
+fn cookie_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|jar| {
+            jar.split(';').filter_map(|kv| {
+                let (k, v) = kv.trim().split_once('=')?;
+                (k == SESSION_COOKIE && !v.is_empty()).then(|| v.to_string())
+            })
+            .next()
+        })
+}
+
+/// 面板可能同时递交两个会话凭证(Bearer + cookie),去重后按 Bearer 优先。
+pub fn session_candidates(headers: &HeaderMap) -> Vec<String> {
+    let mut out = Vec::with_capacity(2);
+    for t in [bearer_token(headers), cookie_token(headers)].into_iter().flatten() {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// 任一候选凭证有效即通过。必须逐个试而不能只取第一个:一个过期的本地
+/// token 遮住仍然有效的 cookie 会把用户踢回登录页 —— 正是要修的症状。
+pub fn session_is_valid(state: &HubState, headers: &HeaderMap) -> bool {
+    session_candidates(headers)
+        .iter()
+        .any(|t| state.store.validate_session(t).unwrap_or(false))
+}
+
+/// 第一个「仍有效」的凭证及其绝对过期时间;开机探测与登出共用。
+pub fn live_session(state: &HubState, headers: &HeaderMap) -> Option<(String, u64)> {
+    let now = now_secs();
+    session_candidates(headers).into_iter().find_map(|t| {
+        state
+            .store
+            .session_expiry(&t)
+            .ok()
+            .flatten()
+            .filter(|exp| *exp > now)
+            .map(|exp| (t, exp))
+    })
+}
+
+/// Secure 依据:Hub 自己终结 TLS,或反代报了 `x-forwarded-proto: https`。
+/// 两者都没有(明文回环开发)不加 Secure,否则本地 http 拿不到 cookie。
+fn session_cookie_is_secure(state: &HubState, headers: &HeaderMap) -> bool {
+    if state.cfg.tls_mode_str() != "none" {
+        return true;
+    }
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').next().unwrap_or("").trim() == "https")
+        .unwrap_or(false)
+}
+
+/// 组 `Set-Cookie`;`token` 为空 + `max_age` 0 即删除指令。
+fn session_cookie_header(token: &str, max_age: u64, secure: bool) -> Option<header::HeaderValue> {
+    let secure = if secure { "; Secure" } else { "" };
+    let raw = format!(
+        "{SESSION_COOKIE}={token}; Max-Age={max_age}; Path=/; HttpOnly; SameSite=Lax{secure}"
+    );
+    header::HeaderValue::from_str(&raw).ok()
+}
+
 async fn session_auth(
     State(state): State<Arc<HubState>>,
     req: axum::extract::Request,
@@ -137,16 +224,7 @@ async fn session_auth(
     if req.method() == Method::OPTIONS {
         return next.run(req).await;
     }
-    let token = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    let ok = match token {
-        Some(t) => state.store.validate_session(&t).unwrap_or(false),
-        None => false,
-    };
+    let ok = session_is_valid(&state, req.headers());
     if ok {
         next.run(req).await
     } else {
@@ -244,6 +322,7 @@ struct LoginBody {
 async fn login(
     State(state): State<Arc<HubState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
     if !state.login_gate.check(peer.ip()) {
@@ -268,7 +347,8 @@ async fn login(
     }
     state.login_gate.clear(peer.ip());
     let token = new_token();
-    let exp = now_secs() + state.cfg.session_ttl().as_secs();
+    let ttl = state.cfg.session_ttl().as_secs();
+    let exp = now_secs() + ttl;
     if let Err(e) = state.store.insert_session(&token, exp) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -276,7 +356,45 @@ async fn login(
         )
             .into_response();
     }
-    Json(json!({"token": token, "expires_at": exp})).into_response()
+    // 同时下发 Bearer(旧行为)与会话 cookie(跨 origin 兜底通道)。
+    let Some(cookie) =
+        session_cookie_header(&token, ttl, session_cookie_is_secure(&state, &headers))
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "cannot issue session cookie"})),
+        )
+            .into_response();
+    };
+    let mut resp = Json(json!({"token": token, "expires_at": exp})).into_response();
+    resp.headers_mut().insert(header::SET_COOKIE, cookie);
+    resp
+}
+
+/// 开机探测:面板手上没有本地 token 时,用它问一句「这个 cookie 还算数吗」。
+/// 必须是公开路由(不带凭证时也要能回答 false),不能挂在 session_auth 后面。
+async fn session_probe(State(state): State<Arc<HubState>>, headers: HeaderMap) -> Response {
+    match live_session(&state, &headers) {
+        Some((_, exp)) => Json(json!({"authenticated": true, "expires_at": exp})).into_response(),
+        None => Json(json!({"authenticated": false})).into_response(),
+    }
+}
+
+/// 真登出:把面板递上来的候选凭证(Bearer 与 cookie 可能指向不同会话行)
+/// 全删,再抹 cookie。以前「退出」只清本地状态,会话一直活到自然过期;
+/// 有 cookie 兜底不删的话,刷新就又被认回来了。
+async fn logout(State(state): State<Arc<HubState>>, headers: HeaderMap) -> Response {
+    for t in session_candidates(&headers) {
+        if let Err(e) = state.store.delete_session(&t) {
+            tracing::warn!(error = e, "session delete failed");
+        }
+    }
+    let mut resp = Json(json!({"ok": true})).into_response();
+    let secure = session_cookie_is_secure(&state, &headers);
+    if let Some(cookie) = session_cookie_header("", 0, secure) {
+        resp.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    resp
 }
 
 fn new_token() -> String {
@@ -1355,12 +1473,7 @@ async fn download(
 ) -> Response {
     // 鉴权:会话 token、签名 URL、匿名引导制品,或 mTLS 节点身份
     // (hub→agent 的 wasm/升级包分发,Agent 侧只有证书没有面板会话)。
-    let authed = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| state.store.validate_session(t).unwrap_or(false))
-        .unwrap_or(false);
+    let authed = session_is_valid(&state, &headers);
     let signed = match (params.get("exp"), params.get("sig")) {
         (Some(e), Some(s)) => state
             .verify_download_url(&format!("/v0/downloads/{rest}"), e.parse().unwrap_or(0), s),
