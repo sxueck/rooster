@@ -35,9 +35,12 @@ withDefaults(
   gap: 8px;
 }
 .rfd-inline .rfd-label {
-  width: var(--lw);
+  /* 首行左对齐：标签宽度自适应内容，查询表单从行首开始，不再因固定
+     宽度右对齐标签而整行看起来居中缩进。 */
   flex: none;
-  text-align: right;
+  width: auto;
+  min-width: 0;
+  text-align: left;
 }
 .rfd-ctrl { min-width: 0; }
 .rfd-hint {
