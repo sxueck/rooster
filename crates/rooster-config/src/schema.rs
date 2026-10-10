@@ -708,7 +708,10 @@ fn default_inbound_threshold() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CrsConfig {
-    #[serde(default)]
+    /// 默认开启：内嵌 CRS 子集随二进制分发，不联网也能加载；要缩小
+    /// 覆盖面的节点显式写 `enabled: false`。默认关闭会让所有未显式配置的
+    /// 节点只剩 10 条内置签名，面板报“CRS 未生效、覆盖面不足”。
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_paranoia_level")]
     pub paranoia_level: u8,
