@@ -122,6 +122,10 @@ pub enum Event {
         /// “哪些规则在真实被打”才是运维要的清单)。
         #[serde(default)]
         hits: Vec<u32>,
+        /// 与 `hits` 逐项对齐的规则描述。面板只拿 id 时无法回答
+        /// “这条命中到底是什么攻击”,老版 Agent 不带该字段。
+        #[serde(default)]
+        hit_msgs: Vec<String>,
         /// 累计异常评分(阈值见 `waf.crs.inbound-anomaly-threshold`)。
         #[serde(default)]
         score: Option<u32>,
@@ -305,6 +309,10 @@ mod tests {
                 severity: Some("CRITICAL".into()),
                 path: Some("/login".into()),
                 hits: vec![942100, 942130],
+                hit_msgs: vec![
+                    "SQL Injection Attack Detected via libinjection".into(),
+                    "SQL Injection Attack: Common Table names".into(),
+                ],
                 score: Some(10),
                 country: None,
             }],
@@ -314,10 +322,11 @@ mod tests {
         let back: Frame = serde_json::from_str(legacy).expect("legacy block decodes");
         match back {
             Frame::Event { batch, .. } => match &batch[0] {
-                Event::Block { severity, path, hits, score, country, .. } => {
+                Event::Block { severity, path, hits, hit_msgs, score, country, .. } => {
                     assert!(severity.is_none());
                     assert!(path.is_none());
                     assert!(hits.is_empty());
+                    assert!(hit_msgs.is_empty(), "老帧缺 hit_msgs 必须容错为空");
                     assert!(score.is_none());
                     assert!(country.is_none(), "老帧缺 country 必须容错为 None");
                 }

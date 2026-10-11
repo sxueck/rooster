@@ -644,6 +644,7 @@ async fn waf_block_reports_block_event_with_severity() {
             severity,
             path,
             hits,
+            hit_msgs,
             score,
             country: _,
         } => {
@@ -653,6 +654,15 @@ async fn waf_block_reports_block_event_with_severity() {
             assert_eq!(ip, "127.0.0.1", "事件 IP 必须是解析后的客户端地址");
             assert_eq!(path.as_deref(), Some("/x"), "事件必须带被攻击路径");
             assert_eq!(hits, vec![942100u32], "事件必须带全部命中规则");
+            assert_eq!(
+                hit_msgs.len(),
+                hits.len(),
+                "hit_msgs 必须与 hits 逐项对齐,否则面板只能报规则号"
+            );
+            assert!(
+                hit_msgs.iter().any(|m| !m.is_empty()),
+                "事件必须带规则描述,实际: {hit_msgs:?}"
+            );
             assert!(score.is_some(), "事件必须带累计异常评分");
         }
         other => panic!("expected Block event, got {other:?}"),

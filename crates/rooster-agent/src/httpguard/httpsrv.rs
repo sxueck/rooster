@@ -415,7 +415,7 @@ fn real_ip_of(eff: &Effective, headers: &HeaderMap, peer: SocketAddr) -> std::ne
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    super::realip::real_ip(peer.ip(), xff.as_deref(), &eff.trusted_proxies)
+    rooster_config::realip::real_ip(peer.ip(), xff.as_deref(), &eff.trusted_proxies)
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +711,7 @@ async fn handle_site_request(
                     severity,
                     path: Some(parts.uri.path().to_string()),
                     hits: hits.iter().map(|(id, _)| *id).collect(),
+                    hit_msgs: hits.iter().map(|(_, msg)| msg.clone()).collect(),
                     score: Some(verdict.score),
                     country: None,
                 };

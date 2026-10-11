@@ -52,14 +52,6 @@ const nginxRunning = ref(false)
 const busy = ref('')
 const attachShow = ref(false)
 const attachSite = ref<NginxSite | null>(null)
-/** 已展开“未接入原因”的行 id；默认全部折叠，点击状态标签才展开。 */
-const expanded = ref(new Set<string>())
-function toggleReason(id: string) {
-  const next = new Set(expanded.value)
-  if (next.has(id)) next.delete(id)
-  else next.add(id)
-  expanded.value = next
-}
 
 const nginxCols: RColumn<NginxGroupRow>[] = [
   { title: 'DOMAINS / LISTEN', key: 'domains', render: (r) => h('div', [
@@ -77,7 +69,16 @@ const nginxCols: RColumn<NginxGroupRow>[] = [
   { title: 'ACTIONS', key: 'actions', render: (r) => { const m = r.main; return h('span', { class: 'row-tight' }, m.status === 'attached' ? [
     nginxButton(m.mode === 'block' ? '切换监控' : '开启阻断', m, m.mode === 'block' ? 'detect' : 'block'), nginxButton('关闭并恢复', m, 'off'),
   ] : m.status === 'needs-recovery' ? [nginxButton('恢复原配置', m, 'off')] : [
-    h(RButton, { variant: 'link', disabled: !m.supported || busy.value !== '', onClick: () => { attachSite.value = m; attachShow.value = true } }, { default: () => '启用 WAF' }),
+    h(
+      RButton,
+      {
+        variant: 'link',
+        disabled: !m.supported || busy.value !== '',
+        title: m.supported ? undefined : m.reason ?? '',
+        onClick: () => { attachSite.value = m; attachShow.value = true },
+      },
+      { default: () => '启用 WAF' },
+    ),
   ]) } },
 ]
 function nginxButton(label: string, row: NginxSite, mode: WafMode) {
@@ -153,18 +154,14 @@ const cols: RColumn<SiteRow>[] = [
 function hTag(tone: 'muted' | 'warn' | 'ok', label: string) {
   return h(RTag, { tone }, { default: () => label })
 }
-/** 状态单元格：只放一个紧凑标签；未接入/待恢复带原因时点击标签展开原因。 */
+/** 状态单元格：一个紧凑标签 + 未接入原因直接写明（“为什么不能一键启用 WAF”是这一页唯一的关键问题）。 */
 function statusCell(r: NginxGroupRow) {
   const m = r.main
   const attached = m.status === 'attached'
   const label = attached ? (m.mode === 'block' ? '阻断' : '监控') : m.status === 'needs-recovery' ? '待恢复' : '未接入'
   const tone = attached ? (m.mode === 'block' ? 'ok' : 'warn') : 'muted'
-  const clickable = !attached && !!m.reason
-  const open = expanded.value.has(m.id)
-  const tag = clickable
-    ? h('button', { class: 'status-toggle', onClick: () => toggleReason(m.id) }, [hTag(tone, label), h('span', { class: 'status-caret' }, open ? '▲' : '▼')])
-    : hTag(tone, label)
-  return open && m.reason ? h('div', [tag, h('small', { class: 'muted status-reason' }, m.reason)]) : tag
+  const reason = !attached && m.reason ? h('small', { class: 'muted status-reason' }, m.reason) : null
+  return reason ? h('div', [hTag(tone, label), reason]) : hTag(tone, label)
 }
 function hBtn(label: string, onClick: () => void, tone?: 'danger') {
   return h(RButton, { variant: 'link', tone, onClick }, { default: () => label })
@@ -301,20 +298,6 @@ onMounted(() => { void load(); void scanNginx() })
 </template>
 
 <style scoped>
-.status-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 0;
-  border: none;
-  background: none;
-  cursor: pointer;
-  font: inherit;
-}
-.status-caret {
-  font-size: 9px;
-  color: var(--faint);
-}
 .status-reason {
   display: block;
   max-width: 260px;

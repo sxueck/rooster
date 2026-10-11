@@ -69,14 +69,18 @@ onMounted(loadNode)
             {{ node?.online ? '在线' : '离线' }}
           </RStatusDot>
           <RTag v-if="node">v{{ node.version }}</RTag>
-          <RTag v-if="node?.pending_template" tone="warn">待下发：{{ node.pending_template }}</RTag>
+          <RTag v-if="node?.pending_template" tone="warn" title="已排队待下发的模板：下发时节点离线或未确认成功，节点重连后会自动补发；长期显示表示尚未应用成功。">待下发模板：{{ node.pending_template }}</RTag>
           <RTag v-if="node">心跳 {{ fmtRelative(node.last_seen) }}</RTag>
         </template>
       </RPageHeader>
 
       <RPanel>
         <template v-if="node">
-          <RTag v-if="node.ip" class="label-tag mono">{{ node.ip }}</RTag>
+          <RTag
+            v-if="node.ip"
+            class="label-tag mono"
+            title="最近一次长连接的来源地址。Hub 在 L7 代理后面时这列是代理地址；在 hub.yaml 里配 trusted-proxies 后才会从 X-Forwarded-For 解析出节点真实 IP。"
+          >IP {{ node.ip }}</RTag>
           <RTag v-for="(v, k) in node.labels" :key="k" class="label-tag">{{ k }}={{ v }}</RTag>
           <span class="muted num">config_hash: {{ node.config_hash }}</span>
         </template>

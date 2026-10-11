@@ -338,10 +338,12 @@ function buildWafRules(threshold: number, crs: WafCrsStatus): WafRulesResp {
       min_pl: minPl,
     }
   })
+  // CRS 的 SecAction 初始化规则没有 msg / severity，面板默认隐藏它们。
+  rules.push({ id: 901110, phase: 1, msg: null, severity: null, tags: ['OWASP_CRS'], min_pl: 0 })
   const bySev: Record<string, number> = {}
   const byPhase: Record<string, number> = {}
   for (const r of rules) {
-    bySev[r.severity] = (bySev[r.severity] ?? 0) + 1
+    if (r.severity) bySev[r.severity] = (bySev[r.severity] ?? 0) + 1
     byPhase[String(r.phase)] = (byPhase[String(r.phase)] ?? 0) + 1
   }
   return {

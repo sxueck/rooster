@@ -27,7 +27,6 @@ mod geo;
 mod httpsrv;
 mod passthrough;
 mod peek;
-mod realip;
 mod settings;
 mod throttle;
 mod tlsconf;

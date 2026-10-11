@@ -60,7 +60,78 @@ pub fn replace_subtree(
     segs: &[Seg],
     value: &serde_json::Value,
 ) -> Result<String, ConfigError> {
-    apply(raw, to_route(segs), Op::Replace(json_to_yaml_value(value)?))
+    match apply(raw, to_route(segs), Op::Replace(json_to_yaml_value(value)?)) {
+        Ok(out) => Ok(out),
+        Err(direct) => {
+            // flow 风格父节点(`plugins: { a: { .. } }`)下的子树 yamlpatch 定位不了。
+            // 逐级往上把那个祖先连同新值整体重写为 block 风格:本次写入能成,
+            // 该祖先之后的补丁也能成。
+            for depth in (1..segs.len()).rev() {
+                if let Ok(out) = replace_ancestor(raw, segs, depth, value) {
+                    return Ok(out);
+                }
+            }
+            Err(direct)
+        }
+    }
+}
+
+/// 把 `segs[..depth]` 指向的祖先节点连同深层新值一起 Replace。
+fn replace_ancestor(
+    raw: &str,
+    segs: &[Seg],
+    depth: usize,
+    value: &serde_json::Value,
+) -> Result<String, ConfigError> {
+    let mut tree: serde_json::Value = serde_norway::from_str(raw)
+        .map_err(|e| ConfigError::Patch(format!("value conversion failed: {e}")))?;
+    write_deep(&mut tree, segs, value)?;
+    let ancestor = read_deep(&tree, &segs[..depth])
+        .ok_or_else(|| ConfigError::Patch("ancestor disappeared".into()))?;
+    apply(
+        raw,
+        to_route(&segs[..depth]),
+        Op::Replace(json_to_yaml_value(ancestor)?),
+    )
+}
+
+fn write_deep(
+    tree: &mut serde_json::Value,
+    segs: &[Seg],
+    value: &serde_json::Value,
+) -> Result<(), ConfigError> {
+    let bad = || ConfigError::Patch("route does not exist in the parsed document".into());
+    let mut node = tree;
+    for seg in &segs[..segs.len() - 1] {
+        node = match (seg, node) {
+            (Seg::K(k), serde_json::Value::Object(map)) => map.get_mut(&k[..]).ok_or_else(bad)?,
+            (Seg::I(i), serde_json::Value::Array(items)) => items.get_mut(*i).ok_or_else(bad)?,
+            _ => return Err(bad()),
+        };
+    }
+    match (&segs[segs.len() - 1], node) {
+        (Seg::K(k), serde_json::Value::Object(map)) => {
+            map.insert((*k).to_string(), value.clone());
+            Ok(())
+        }
+        (Seg::I(i), serde_json::Value::Array(items)) if *i < items.len() => {
+            items[*i] = value.clone();
+            Ok(())
+        }
+        _ => Err(bad()),
+    }
+}
+
+fn read_deep<'a>(tree: &'a serde_json::Value, segs: &[Seg]) -> Option<&'a serde_json::Value> {
+    let mut node = tree;
+    for seg in segs {
+        node = match (seg, node) {
+            (Seg::K(k), serde_json::Value::Object(map)) => map.get(&k[..])?,
+            (Seg::I(i), serde_json::Value::Array(items)) => items.get(*i)?,
+            _ => return None,
+        };
+    }
+    Some(node)
 }
 
 /// 向 route 指向的列表末尾追加一项。
@@ -88,24 +159,31 @@ pub fn add_key(
     key: &str,
     value: &serde_json::Value,
 ) -> Result<String, ConfigError> {
-    let mut buf = raw.to_string();
-    for i in 1..=segs.len() {
+    let buf = raw.to_string();
+    // 缺失的父级一次性写入:分步补空 map 会把父节点渲染成 flow 风格
+    // (`plugins: { http-guard: { .. } }`),之后对它的子树做任何 Replace 都会报错。
+    let missing = (1..=segs.len()).find(|i| !subtree_exists(&buf, &segs[..*i]).unwrap_or(false));
+    if let Some(i) = missing {
         let child = match &segs[i - 1] {
+            // 下标父级不会"缺失"(列表项只能已存在)。
+            Seg::I(_) => return Err(ConfigError::Patch("list parent is missing".into())),
             Seg::K(k) => (*k).to_string(),
-            // 下标父级不会"缺失"(列表项只能已存在),到此为止。
-            Seg::I(_) => break,
         };
-        if subtree_exists(&buf, &segs[..i])? {
-            continue;
+        let mut nested = serde_json::json!({ key: value });
+        for seg in segs[i..].iter().rev() {
+            let Seg::K(k) = seg else {
+                return Err(ConfigError::Patch("list parent is missing".into()));
+            };
+            nested = serde_json::json!({ &k[..]: nested });
         }
-        buf = apply(
+        return apply(
             &buf,
             to_route(&segs[..i - 1]),
             Op::Add {
                 key: child,
-                value: json_to_yaml_value(&serde_json::json!({}))?,
+                value: json_to_yaml_value(&nested)?,
             },
-        )?;
+        );
     }
     apply(
         &buf,
@@ -352,6 +430,51 @@ local:
         assert!(out.contains("id: r"));
         let parsed: serde_json::Value = serde_norway::from_str(&out).unwrap();
         assert_eq!(parsed["local"]["forwards"][0]["id"], "r");
+    }
+
+    #[test]
+    fn nested_replace_recovers_from_flow_ancestor() {
+        // 早期版本会把自动补出的父 map 写成 flow 风格,之后对子树的任何
+        // 替换都会失败(Nginx 接入第二个站点时的 409)。两条路径都要能走通。
+        let flow = "managed:\n  sites: []\n  plugins: { http-guard: { enabled: true, listen-http: \"127.0.0.1:18080\" } }\n";
+        let guard = json!({"enabled": true, "listen-http": "127.0.0.1:18081", "trusted-proxies": ["127.0.0.1/32"]});
+        let out = replace_subtree(
+            flow,
+            &[Seg::K("managed"), Seg::K("plugins"), Seg::K("http-guard")],
+            &guard,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_norway::from_str(&out).unwrap();
+        assert_eq!(parsed["managed"]["plugins"]["http-guard"]["listen-http"], "127.0.0.1:18081");
+        // 修好后的文档还能继续接受同一路径的补丁。
+        let again = replace_subtree(
+            &out,
+            &[Seg::K("managed"), Seg::K("plugins"), Seg::K("http-guard")],
+            &guard,
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_norway::from_str(&again).unwrap();
+        assert_eq!(parsed["managed"]["plugins"]["http-guard"]["listen-http"], "127.0.0.1:18081");
+    }
+
+    #[test]
+    fn add_key_does_not_create_flow_parents() {
+        let out = add_key(
+            "managed:\n  sites: []\n",
+            &[Seg::K("managed"), Seg::K("plugins")],
+            "http-guard",
+            &json!({"enabled": true, "trusted-proxies": ["127.0.0.1/32"]}),
+        )
+        .unwrap();
+        assert!(out.contains("plugins:\n    http-guard:"), "{out}");
+        // 新建的父节点下的子树必须可以直接再打一次补丁。
+        let again = replace_subtree(
+            &out,
+            &[Seg::K("managed"), Seg::K("plugins"), Seg::K("http-guard")],
+            &json!({"enabled": false}),
+        )
+        .unwrap();
+        assert!(again.contains("enabled: false"), "{again}");
     }
 
     #[test]

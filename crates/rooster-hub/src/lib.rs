@@ -229,6 +229,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         .init();
 
     let db = store::open(&cfg.data_dir.join("hub.redb")).map_err(|e| format!("open redb: {e}"))?;
+    cfg.warn_bad_trusted_proxies();
     let store = store::Store::with_retention(db, cfg.audit_retention());
     let pki = pki::HubPki::ensure(&cfg.data_dir)?;
     let (events_tx, _) = tokio::sync::broadcast::channel(1024);

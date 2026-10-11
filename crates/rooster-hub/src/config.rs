@@ -30,6 +30,11 @@ pub struct HubConfig {
     pub secret_key: Option<String>,
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+    /// 可信反向代理 CIDR 列表。只有长连接的 TCP peer 落在这些网段里时,
+    /// 才从 `X-Forwarded-For` 取节点真实地址(面板节点 IP 列)。
+    /// 不配就是纯 TCP peer —— TLS 终结在 nginx 上时,所有节点都会显示成代理地址。
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
     /// 面板会话有效期(默认 30 天)。token 落 redb,Hub 重启不丢会话。
     #[serde(default, with = "humantime_serde", skip_serializing_if = "Option::is_none")]
     pub session_ttl: Option<Duration>,
@@ -122,6 +127,23 @@ pub struct PolicyMatch {
 }
 
 impl HubConfig {
+    /// 解析 `trusted-proxies`;非法条目跳过(启动时由 [`Self::warn_bad_trusted_proxies`] 报出)。
+    pub fn trusted_nets(&self) -> Vec<ipnet::IpNet> {
+        self.trusted_proxies
+            .iter()
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    }
+
+    /// 配置里写错网段会静默失去 XFF 解析能力,启动时主动报一次。
+    pub fn warn_bad_trusted_proxies(&self) {
+        for raw in &self.trusted_proxies {
+            if raw.trim().parse::<ipnet::IpNet>().is_err() {
+                tracing::warn!(proxy = raw, "hub trusted-proxies entry is not a CIDR; ignored");
+            }
+        }
+    }
+
     /// 注册/安装入口的公开 origin。请求 Host 头优先:调用方用哪个地址访问
     /// hub,agent 就拨哪个地址;public-url 只在请求不带 Host 时兑底。
     /// scheme:static TLS 恒 https;plain 模式回环按 http、其余按 https——
@@ -214,6 +236,8 @@ tls:
   # ca: /etc/rooster/hub-ca.crt   # 自签/私有 CA 时公开给 install.sh 的信任锚
 secret-key: ""            # 明文会在首次启动时自动哈希
 cors-allowed-origins: []
+# 可信反向代理 CIDR:hub 在 L7 代理后面时,节点 IP 会从 X-Forwarded-For 解析。
+# trusted-proxies: ["127.0.0.0/8", "10.0.0.0/8"]
 # 面板会话有效期;会话存 redb(绝对过期时间戳),Hub 重启不失效。
 session-ttl: 30d
 panel-dir: web/dist

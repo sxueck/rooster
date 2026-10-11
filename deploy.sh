@@ -295,9 +295,12 @@ nginx_hint() {
   say "          proxy_set_header Upgrade \$http_upgrade;"
   say "          proxy_set_header Connection \"upgrade\";"
   say "          proxy_set_header Host \$host;"
+  say "          proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
   say "          proxy_read_timeout 3600s; ${DIM}# keep agent WebSockets alive${N}"
   say "      }"
   say "  }"
+  say "  ${DIM}the panel shows each node's real address only when hub.yaml lists this proxy:${N}"
+  say "  ${DIM}  trusted-proxies: [\"127.0.0.0/8\"]   # peer must be trusted before X-Forwarded-For is read${N}"
   say "  ${DIM}alternative — use a static-TLS hub for L4 passthrough + client-cert auth:${N}"
   say "  ${DIM}  stream { server { listen $pubport; proxy_pass 127.0.0.1:$port; } }${N}"
 }

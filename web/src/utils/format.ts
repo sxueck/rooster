@@ -128,12 +128,17 @@ export function eventSummary(ev: RoosterEvent): string {
     case 'ban':
       return `封禁 ${ev.ip}${geo}（${ev.plugin}，${fmtDuration(ev.ttl_secs)}）：${ev.reason}`
     case 'block': {
-      // 新版 block 事件带 path / hits / score；旧数据缺失时保持原样，不显示 undefined
+      // 新版 block 事件带 path / hits / hit_msgs / score；旧数据缺失时保持原样，不显示 undefined
       const hitN = ev.hits?.length ?? 0
       const rule = hitN > 1 ? `${ev.rule_id} 等 ${hitN} 条` : String(ev.rule_id)
       let s = `拦截 ${ev.ip}${geo}，命中规则 ${rule} @ ${ev.site}`
       if (ev.path) s += `，路径 ${ev.path}`
       if (ev.score !== null && ev.score !== undefined) s += `，异常评分 ${ev.score}`
+      const msgs = (ev.hit_msgs ?? []).filter((m) => m !== '')
+      if (msgs.length > 0) {
+        const shown = msgs.slice(0, 2).join('；')
+        s += `：${shown}${msgs.length > 2 ? ` 等 ${msgs.length} 条` : ''}`
+      }
       return s
     }
     case 'config_changed':

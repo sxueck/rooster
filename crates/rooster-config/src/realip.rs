@@ -10,7 +10,7 @@ use std::net::IpAddr;
 
 use ipnet::IpNet;
 
-pub(crate) fn real_ip(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> IpAddr {
+pub fn real_ip(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> IpAddr {
     let Some(xff) = xff else { return peer };
     if !trusted.iter().any(|net| net.contains(&peer)) {
         return peer;

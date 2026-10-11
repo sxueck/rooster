@@ -21,12 +21,29 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub async fn agent_ws(
     State(state): State<Arc<HubState>>,
     Extension(meta): Extension<ConnMeta>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |sock| agent_session(state, meta, sock))
+    let client_ip = agent_client_ip(&state.cfg, meta.peer.ip(), &headers);
+    ws.on_upgrade(move |sock| agent_session(state, meta, client_ip, sock))
 }
 
-async fn agent_session(state: Arc<HubState>, meta: ConnMeta, mut sock: WebSocket) {
+/// 节点展示 IP:经 L7 代理时 TCP peer 是代理地址,只有 peer 本身在
+/// `trusted-proxies` 里才采纳 XFF(否则客户端可以随便伪造自己的来源 IP)。
+fn agent_client_ip(cfg: &crate::config::HubConfig, peer: std::net::IpAddr, headers: &HeaderMap) -> std::net::IpAddr {
+    let xff = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty());
+    rooster_config::realip::real_ip(peer, xff, &cfg.trusted_nets())
+}
+
+async fn agent_session(
+    state: Arc<HubState>,
+    meta: ConnMeta,
+    client_ip: std::net::IpAddr,
+    mut sock: WebSocket,
+) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Frame>();
 
     // 等待 Hello 并认证。
@@ -64,7 +81,7 @@ async fn agent_session(state: Arc<HubState>, meta: ConnMeta, mut sock: WebSocket
     let conn = crate::registry::Conn::new_with_peer_ip(
         &node_id,
         tx.clone(),
-        Some(meta.peer.ip()),
+        Some(client_ip),
     );
     state.registry.register(&node_id, conn.clone());
 
@@ -73,7 +90,7 @@ async fn agent_session(state: Arc<HubState>, meta: ConnMeta, mut sock: WebSocket
         rec.version = version.clone();
         rec.config_hash = config_hash;
         rec.last_seen = now_secs();
-        rec.last_ip = Some(meta.peer.ip().to_string());
+        rec.last_ip = Some(client_ip.to_string());
         let _ = state.store.upsert_node(&rec);
     }
     let _ = state.events_tx.send(serde_json::json!({
@@ -395,6 +412,47 @@ mod tests {
     use super::*;
     use crate::store::NodeRecord;
 
+    fn cfg_with_trusted(list: &[&str]) -> crate::config::HubConfig {
+        let mut cfg: crate::config::HubConfig =
+            serde_norway::from_str(&crate::config::default_hub_config_template()).unwrap();
+        cfg.trusted_proxies = list.iter().map(|s| s.to_string()).collect();
+        cfg
+    }
+
+    fn hdr(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn node_ip_follows_xff_only_through_a_trusted_proxy() {
+        // TLS 在 nginx 上终结时 peer 永远是代理地址;配了 trusted-proxies
+        // 才能把节点真实 IP 从 XFF 里读出来。
+        let cfg = cfg_with_trusted(&["127.0.0.0/8"]);
+        let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            agent_client_ip(&cfg, peer, &hdr("203.0.113.7")).to_string(),
+            "203.0.113.7"
+        );
+        // 没配可信代理:客户端伪造的 XFF 必须被忽略。
+        let plain = cfg_with_trusted(&[]);
+        assert_eq!(
+            agent_client_ip(&plain, peer, &hdr("203.0.113.7")).to_string(),
+            "127.0.0.1"
+        );
+        let untrusted: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        assert_eq!(
+            agent_client_ip(&cfg, untrusted, &hdr("203.0.113.7")).to_string(),
+            "198.51.100.9"
+        );
+        // 空 XFF 回退 peer。
+        assert_eq!(
+            agent_client_ip(&cfg, peer, &hdr("")).to_string(),
+            "127.0.0.1"
+        );
+    }
+
     /// 明文模式的测试状态:节点表 + 吊销表可直接驱动 authorize。
     fn test_state(tag: &str) -> Arc<HubState> {
         let dir = std::env::temp_dir().join(format!("rooster-ws-test-{tag}-{}", std::process::id()));
@@ -411,6 +469,7 @@ mod tests {
                 tls: Default::default(),
                 secret_key: None,
                 cors_allowed_origins: vec![],
+                trusted_proxies: vec![],
                 session_ttl: None,
                 panel_dir: dir.clone(),
                 auto_confirm_delay_secs: 0,

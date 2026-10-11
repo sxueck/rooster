@@ -57,27 +57,48 @@ const cols = computed<RColumn[]>(() => [
       ]),
   },
   {
+    title: 'IP',
+    key: 'ip',
+    width: 150,
+    render: (row) =>
+      h(
+        'span',
+        {
+          class: 'mono muted',
+          title: '节点最近一次长连接的来源地址。Hub 在 Nginx 等 L7 代理后面时，这列是代理地址；在 hub.yaml 里配 trusted-proxies 后才会从 X-Forwarded-For 解析出节点真实 IP。',
+        },
+        row.ip ?? '—',
+      ),
+  },
+  {
     title: 'LABELS',
     key: 'labels',
     render: (row) =>
       h(
         'span',
         { class: 'row-tight labels-cell' },
-        [
-          row.ip ? h('span', { class: 'mono muted node-ip' }, row.ip) : null,
-          ...Object.entries(row.labels).map(([k, v]) =>
-            h(RTag, { key: k }, { default: () => `${k}=${v}` }),
-          ),
-        ].filter((x) => x !== null),
+        Object.entries(row.labels).map(([k, v]) => h(RTag, { key: k }, { default: () => `${k}=${v}` })),
       ),
   },
   { title: 'VERSION', key: 'version', width: 90, mono: true },
   { title: 'CONFIG HASH', key: 'config_hash', width: 120, mono: true },
   {
-    title: 'PENDING TPL',
+    title: 'PENDING TEMPLATE',
     key: 'pending_template',
-    width: 130,
-    render: (row) => (row.pending_template ? h(RTag, { tone: 'warn' }, { default: () => row.pending_template }) : '—'),
+    width: 150,
+    // 下发时节点离线就会排队，重连后自动补发；长期停留在这里表示模板始
+    // 终没应用成功（下发失败 / 未确认），不是“已经生效”。
+    render: (row) =>
+      row.pending_template
+        ? h(
+            RTag,
+            {
+              tone: 'warn',
+              title: '已排队待下发的模板：下发时节点离线或未确认成功，节点重连后会自动补发；长期显示表示尚未应用成功，详见模板下发记录。',
+            },
+            { default: () => row.pending_template },
+          )
+        : '—',
   },
   {
     title: 'LAST SEEN',
@@ -352,9 +373,5 @@ onUnmounted(stopRegistration)
 /* tag chips in the LABELS column flow inline with small gaps */
 :deep(.rt tbody td .rtg + .rtg) {
   margin-left: 6px;
-}
-.node-ip {
-  margin-right: 2px;
-  white-space: nowrap;
 }
 </style>

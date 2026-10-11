@@ -6,7 +6,7 @@ use rooster_config::{hash_content, writer, Seg, Site, WafMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -402,17 +402,22 @@ struct LocPlan {
     ordinal: usize,
     /// 面板展示用的 location 声明(如 "location /api")。
     label: String,
+    location_path: String,
     /// 该 location 的 proxy_pass 指令(原文 span)。
     proxy: Directive,
-    /// 解析后的上游(scheme://host:port)。
+    /// 解析后的上游(scheme://host:port,不含 URI 前缀)。
     upstream: String,
     /// nginx $proxy_host(字面量上游是 host:port,命名组是组名)。
     proxy_host: String,
+    /// proxy_pass 自带的 URI 前缀(nginx 用它替换 location 前缀)。
+    proxy_uri: String,
     /// 该 location 生效的转发头(own → server → http 继承)。
-    headers: Vec<Directive>,
+    headers: Vec<Node>,
     /// location 内是否有自己的 proxy_set_header(决定注入时是否物化继承头)。
     own_headers: bool,
     redirect_off: bool,
+    /// 接入时对原文件的补充改写($proxy_host 字面量化等)。
+    fixups: Vec<Fixup>,
 }
 
 impl LocPlan {
@@ -462,48 +467,363 @@ pub struct Snapshot {
     pub running: bool,
     pub sites: Vec<NginxSite>,
 }
+
+/// 一条指令及其所在文件原文。include 展开出来的指令也带着来源文件,
+/// 这样跨文件继承的 `proxy_set_header` 依然能原样物化。
+#[derive(Clone)]
+struct Node {
+    d: Directive,
+    src: Arc<String>,
+    /// 由本层的这条 include 引入;直接书写时为 None。
+    via: Option<Directive>,
+}
+
+impl Node {
+    fn words(&self) -> &[String] {
+        &self.d.words
+    }
+    fn name(&self) -> &str {
+        &self.words()[0]
+    }
+    /// 指令原文(保留引号与对齐),物化/改写时按它匹配。
+    fn text(&self) -> &str {
+        self.src.get(self.d.start..self.d.end).unwrap_or_default()
+    }
+    fn header_name(&self) -> Option<&str> {
+        self.words().get(1).map(String::as_str)
+    }
+}
+
+fn node_named<'a>(nodes: &'a [Node], name: &str) -> Vec<&'a Node> {
+    nodes.iter().filter(|n| n.name() == name).collect()
+}
+
+/// nginx 风格通配:`*` 不跨 `/`,`?` 匹配单个字符。
+fn glob_match(pat: &str, text: &str) -> bool {
+    fn m(p: &[u8], t: &[u8]) -> bool {
+        match (p.first(), t.first()) {
+            (None, _) => t.is_empty(),
+            (_, None) => p == b"*",
+            (Some(b'*'), _) => m(&p[1..], t) || (!t.is_empty() && t[0] != b'/' && m(p, &t[1..])),
+            (Some(b'?'), _) => !t.is_empty() && t[0] != b'/' && m(&p[1..], &t[1..]),
+            (Some(c), Some(x)) => c == x && m(&p[1..], &t[1..]),
+        }
+    }
+    m(pat.as_bytes(), text.as_bytes())
+}
+
+/// include 目标解析:只在 `nginx -T` 转储出的文件里查找,绝不按调用方给的
+/// 路径读磁盘。相对目标按主配置所在目录(即 nginx prefix)展开。
+struct Includes {
+    files: BTreeMap<PathBuf, Arc<String>>,
+    prefix: PathBuf,
+}
+
+impl Includes {
+    fn resolve(&self, spec: &str) -> Result<Vec<(PathBuf, Arc<String>)>> {
+        if spec.is_empty() || spec.contains('$') {
+            return Err("include 目标含变量,需要手动接入".into());
+        }
+        let pat = if spec.starts_with('/') {
+            PathBuf::from(spec)
+        } else {
+            self.prefix.join(spec)
+        };
+        let pat = pat.to_string_lossy().to_string();
+        let wild = pat.contains('*') || pat.contains('?');
+        let mut hits: Vec<(PathBuf, Arc<String>)> = self
+            .files
+            .iter()
+            .filter(|(p, _)| {
+                let p = p.to_string_lossy();
+                if wild {
+                    glob_match(&pat, &p)
+                } else {
+                    *p == pat
+                }
+            })
+            .map(|(p, s)| (p.clone(), s.clone()))
+            .collect();
+        hits.sort();
+        if hits.is_empty() && !wild {
+            return Err("include 目标不在 nginx -T 转储中,需要手动接入".into());
+        }
+        Ok(hits)
+    }
+}
+
+/// HTTP 上下文的代理设置。sites-enabled 下的独立 server 文件本身不含 http{},
+/// 必须沿主配置的 include 链确定它到底继承了什么。
+struct HttpCtx {
+    /// http 层 `proxy_set_header`:server/location 层没有自己的指令时被继承。
+    headers: Vec<Node>,
+    /// http 层存在 `proxy_set_header` 之外的 proxy_* 指令:接入后它们作用在
+    /// Nginx→Rooster 这一跳上,语义会变,只能交给手动接入。
+    complex: bool,
+    /// 无法建立唯一的 http 上下文(多个 http 块 / 主配置不可辨认)。
+    ambiguous: bool,
+}
+
+fn http_context(inc: &Includes) -> HttpCtx {
+    let mut ctx = HttpCtx {
+        headers: Vec::new(),
+        complex: false,
+        ambiguous: false,
+    };
+    let mains: Vec<&PathBuf> = inc
+        .files
+        .iter()
+        .filter(|(_, s)| {
+            parse(s)
+                .ok()
+                .is_some_and(|ns| ns.iter().any(|n| n.words[0] == "http"))
+        })
+        .map(|(p, _)| p)
+        .collect();
+    // 转储里没有 http{} 时没有可继承的 HTTP 层设置(单文件片段);多个 http{}
+    // 时无法判定 server 块属于哪一个,只能手动接入。
+    let Some(main) = mains.first().copied() else {
+        return ctx;
+    };
+    if mains.len() > 1 {
+        ctx.ambiguous = true;
+        return ctx;
+    }
+    let Ok(ns) = inc.files.get(main).map(|s| parse(s)).unwrap_or_else(|| Err(String::new())) else {
+        ctx.ambiguous = true;
+        return ctx;
+    };
+    let Some(http) = ns.iter().find(|n| n.words[0] == "http") else {
+        ctx.ambiguous = true;
+        return ctx;
+    };
+    let main_src = inc.files[main].clone();
+    let mut queue: Vec<(Vec<Directive>, Arc<String>)> =
+        vec![(http.children.clone().unwrap_or_default(), main_src)];
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    while let Some((kids, src)) = queue.pop() {
+        for d in &kids {
+            let name = d.words[0].as_str();
+            if name == "include" {
+                let Some(spec) = d.words.get(1) else {
+                    ctx.ambiguous = true;
+                    continue;
+                };
+                let targets = match inc.resolve(spec) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        ctx.ambiguous = true;
+                        continue;
+                    }
+                };
+                for (path, text) in targets {
+                    if !seen.insert(path.clone()) {
+                        continue;
+                    }
+                    match parse(&text) {
+                        Ok(k) => queue.push((k, text)),
+                        Err(_) => ctx.ambiguous = true,
+                    }
+                }
+                continue;
+            }
+            if name == "proxy_set_header" {
+                ctx.headers.push(Node {
+                    d: d.clone(),
+                    src: src.clone(),
+                    via: None,
+                });
+            } else if name == "http"
+                || (name.starts_with("proxy_") && name != "proxy_set_header")
+                || (d.children.is_none()
+                    && mentions_proxy_vars(&src[d.start..d.end]))
+            {
+                ctx.complex = true;
+            }
+        }
+    }
+    ctx
+}
+
+/// 展开本层 include,返回该层生效的指令列表。目标不可定位、含嵌套块或含
+/// 变量时返回 Err,由调用方按复杂配置拒绝。
+fn scope(kids: &[Directive], src: &Arc<String>, inc: &Includes) -> Result<Vec<Node>> {
+    let mut out = Vec::new();
+    for d in kids {
+        if d.words[0] != "include" {
+            out.push(Node {
+                d: d.clone(),
+                src: src.clone(),
+                via: None,
+            });
+            continue;
+        }
+        let Some(spec) = d.words.get(1) else {
+            return Err("include 缺少目标,需要手动接入".into());
+        };
+        for (_path, text) in inc.resolve(spec)? {
+            for k in parse(&text)? {
+                if k.children.is_some() {
+                    return Err(format!("include {spec} 内含块指令,需要手动接入"));
+                }
+                out.push(Node {
+                    d: k,
+                    src: text.clone(),
+                    via: Some(d.clone()),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 一次事务里对原文件的补充改写(把 `$proxy_host` 字面量化等)。
+/// `injected` 自带站点标记,恢复时按文本唯一匹配。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Fixup {
+    start: usize,
+    end: usize,
+    original: String,
+    injected: String,
+}
+
+/// `$proxy_host`/`$proxy_port` 的四种书写形式。
+const PROXY_VARS: [&str; 4] = ["$proxy_host", "${proxy_host}", "$proxy_port", "${proxy_port}"];
+
+fn mentions_proxy_vars(text: &str) -> bool {
+    PROXY_VARS.iter().any(|v| text.contains(v))
+}
+
+/// 把变量换成接入前的字面量,其余文本(对齐、引号)原样保留。
+fn substitute_proxy_vars(text: &str, host: &str, port: &str) -> String {
+    text.replace("${proxy_host}", host)
+        .replace("${proxy_port}", port)
+        .replace("$proxy_host", host)
+        .replace("$proxy_port", port)
+}
+
+/// 上游端口(nginx $proxy_port 在缺省端口时给 80/443)。
+fn proxy_port(upstream: &str) -> String {
+    let uri = upstream.parse::<http::Uri>().ok();
+    if let Some(port) = uri.as_ref().and_then(|u| u.port_u16()) {
+        return port.to_string();
+    }
+    if upstream.starts_with("https://") {
+        "443"
+    } else {
+        "80"
+    }
+    .into()
+}
+
+fn line_indent(source: &str, start: usize) -> String {
+    let head = source.get(..start.min(source.len())).unwrap_or_default();
+    let line_start = head.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    source[line_start..]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
+}
+
+/// 生效转发头里出现 `$proxy_host`/`$proxy_port` 时,接入后这两个变量会变成回环
+/// 守卫地址。把那条指令改写成接入前的字面量;指令来自 include 文件时改写
+/// 目标是本层的 include 行(就地展开共享文件),不修改共享文件本身。
+fn proxy_host_fixups(
+    nodes: &[Node],
+    proxy_host: &str,
+    port: &str,
+    tag: &str,
+    source: &str,
+) -> Vec<Fixup> {
+    let span_of = |n: &Node| match &n.via {
+        Some(inc) => (inc.start, inc.end),
+        None => (n.d.start, n.d.end),
+    };
+    let mut out: Vec<Fixup> = Vec::new();
+    let mut done: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for n in nodes {
+        if n.name() != "proxy_set_header" || !mentions_proxy_vars(n.text()) {
+            continue;
+        }
+        let (start, end) = span_of(n);
+        if !done.insert((start, end)) {
+            continue;
+        }
+        let Some(range) = source.get(start..end) else {
+            continue;
+        };
+        let indent = line_indent(source, start);
+        let mut lines = vec![format!("# rooster-waf host {tag}")];
+        for m in nodes.iter().filter(|m| span_of(m) == (start, end)) {
+            for line in substitute_proxy_vars(m.text(), proxy_host, port).lines() {
+                if !line.trim().is_empty() {
+                    lines.push(format!("{indent}{line}"));
+                }
+            }
+        }
+        out.push(Fixup {
+            start,
+            end,
+            original: range.to_string(),
+            injected: lines.join("\n"),
+        });
+    }
+    out
+}
+
 fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
     fn servers<'a>(
         nodes: &'a [Directive],
-        inherited: &[Directive],
-        out: &mut Vec<(&'a Directive, Vec<Directive>)>,
+        inherited: &[Node],
+        out: &mut Vec<(&'a Directive, Vec<Node>)>,
     ) {
-        let own: Vec<_> = named(nodes, "proxy_set_header")
-            .into_iter()
-            .cloned()
-            .collect();
-        let headers = if own.is_empty() {
-            inherited.to_vec()
-        } else {
-            own
-        };
         for n in nodes {
             if n.words[0] == "server" && n.children.is_some() {
-                out.push((n, headers.clone()));
+                out.push((n, inherited.to_vec()));
             } else if n.words[0] == "http" {
                 if let Some(kids) = &n.children {
-                    servers(kids, &headers, out);
+                    servers(kids, inherited, out);
                 }
             }
         }
     }
-    // Conservatively decline inheritance through includes when HTTP-level proxy
-    // settings exist: a standalone server file cannot establish its ancestry.
-    let global_proxy_settings = files.values().any(|s| {
-        parse(s).ok().is_some_and(|ns| {
-            ns.iter().filter(|n| n.words[0] == "http").any(|n| {
-                n.children
-                    .as_ref()
-                    .is_some_and(|cs| cs.iter().any(|c| c.words[0].starts_with("proxy_")))
-            })
+    let arc_files: BTreeMap<PathBuf, Arc<String>> = files
+        .iter()
+        .map(|(p, s)| (p.clone(), Arc::new(s.clone())))
+        .collect();
+    // 主配置所在目录即 nginx 的 prefix,相对 include 以它为基准。
+    let prefix = arc_files
+        .keys()
+        .find(|p| {
+            arc_files
+                .get(*p)
+                .map(|s| parse(s).ok().is_some_and(|ns| ns.iter().any(|n| n.words[0] == "http")))
+                .unwrap_or(false)
         })
-    });
+        .or_else(|| {
+            arc_files
+                .keys()
+                .find(|p| p.to_string_lossy().ends_with("nginx.conf"))
+        })
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/nginx"));
+    let inc = Includes {
+        files: arc_files,
+        prefix,
+    };
+    let ctx = http_context(&inc);
     let groups = upstream_groups(files);
     let mut rows = Vec::new();
     for (path, source) in files {
+        let file_src = inc
+            .files
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(source.clone()));
         let ns = parse(source)?;
         let mut found = Vec::new();
-        servers(&ns, &[], &mut found);
+        servers(&ns, &ctx.headers, &mut found);
         for (ordinal, (server, inherited)) in found.iter().enumerate() {
             let id = format!(
                 "nginx-{}",
@@ -521,20 +841,36 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
                 .iter()
                 .map(|n| n.words[1..].join(" "))
                 .collect();
-            let locations = named(kids, "location");
+            let mut server_headers: Vec<Node> = Vec::new();
+            let mut server_nodes: Vec<Node> = Vec::new();
+            let mut server_scope_err: Option<String> = None;
+            let locations: Vec<Node> = match scope(kids, &file_src, &inc) {
+                Ok(nodes) => {
+                    let found = node_named(&nodes, "location")
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    server_headers = node_named(&nodes, "proxy_set_header")
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    server_nodes = nodes;
+                    found
+                }
+                Err(e) => {
+                    server_scope_err = Some(e);
+                    Vec::new()
+                }
+            };
             let catchall = locations
                 .iter()
-                .position(|n| n.words == ["location", "/"] || n.words == ["location", "^~", "/"]);
+                .position(|n| n.words() == ["location", "/"] || n.words() == ["location", "^~", "/"]);
             // 逐 location 分类：纯代理（可接管，逐个注入）/ 无 proxy_pass
             // （留在 Nginx 不经过 WAF，计数透出）/ 其余（含不支持的指令或上游）
             // 则拒绝。这样常见形态（location / 代理 + /static 静态 + /api 代理
             // 到另一个上游）不再整体拒绝，而量词复杂的 location 仍交给手动接入。
-            let server_headers: Vec<_> = named(kids, "proxy_set_header")
-                .into_iter()
-                .cloned()
-                .collect();
             // Any routing, code/module hook, cache, or nested location needs manual onboarding.
-            const SAFE_LOCATION: [&str; 15] = [
+            const SAFE_LOCATION: [&str; 19] = [
                 "proxy_pass",
                 "proxy_set_header",
                 "proxy_http_version",
@@ -544,20 +880,37 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
                 "proxy_buffering",
                 "proxy_buffers",
                 "proxy_buffer_size",
+                "proxy_busy_buffers_size",
+                "proxy_max_temp_file_size",
+                "proxy_request_buffering",
                 "client_max_body_size",
+                "client_body_buffer_size",
                 "access_log",
                 "error_log",
                 "add_header",
-                "proxy_request_buffering",
+                "set_header",
                 "proxy_redirect",
             ];
             let mut locs: Vec<LocPlan> = Vec::new();
             let mut bypassed = 0usize;
-            let mut reason = None;
+            let mut reason = server_scope_err.clone();
             for (ordinal, l) in locations.iter().enumerate() {
-                let lk = l.children.as_deref().unwrap_or(&[]);
-                let label = format!("location {}", l.words[1..].join(" "));
-                let proxies = named(lk, "proxy_pass");
+                let label = format!("location {}", l.words()[1..].join(" "));
+                if l.via.is_some() {
+                    reason = Some(format!("{label} 定义在 include 文件里，需要手动接入"));
+                    continue;
+                }
+                let (lk, include_err) = match scope(l.d.children.as_deref().unwrap_or(&[]), &l.src, &inc) {
+                    Ok(nodes) => (nodes, None),
+                    Err(e) => (Vec::new(), Some(e)),
+                };
+                let proxies = node_named(&lk, "proxy_pass");
+                if let Some(err) = include_err {
+                    if !proxies.is_empty() || reason.is_none() {
+                        reason = Some(err);
+                    }
+                    continue;
+                }
                 if proxies.is_empty() {
                     bypassed += 1;
                     continue;
@@ -567,21 +920,28 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
                 }
                 if reason.is_none()
                     && lk.iter().any(|n| {
-                        n.children.is_some()
-                            || !SAFE_LOCATION.contains(&n.words[0].as_str())
-                            || (n.words[0] == "proxy_redirect"
-                                && n.words != ["proxy_redirect", "off"])
+                        n.d.children.is_some()
+                            || !SAFE_LOCATION.contains(&n.name())
+                            || (n.name() == "proxy_redirect"
+                                && n.words() != ["proxy_redirect", "off"])
                     })
                 {
                     reason = Some(format!(
-                        "{label} 含 include、重写、缓存或其他复杂指令，需要手动接入"
+                        "{label} 含重写、缓存或其他复杂指令，需要手动接入"
                     ));
                 }
                 if reason.is_some() {
                     continue;
                 }
                 let proxy = *proxies.first().unwrap();
-                let own_headers: Vec<_> = named(lk, "proxy_set_header").into_iter().cloned().collect();
+                if proxy.via.is_some() {
+                    reason = Some(format!("{label} 的 proxy_pass 写在 include 文件里，需要手动接入"));
+                    continue;
+                }
+                let own_headers: Vec<Node> = node_named(&lk, "proxy_set_header")
+                    .into_iter()
+                    .cloned()
+                    .collect();
                 let headers = if !own_headers.is_empty() {
                     own_headers.clone()
                 } else if !server_headers.is_empty() {
@@ -589,104 +949,101 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
                 } else {
                     inherited.clone()
                 };
-                if reason.is_none()
-                    && headers.iter().any(|h| {
-                        h.words.iter().any(|w| {
-                            w.contains("$proxy_host")
-                                || w.contains("$proxy_port")
-                                || w.contains("${proxy_host}")
-                                || w.contains("${proxy_port}")
-                        })
-                    })
-                {
-                    reason = Some(format!(
-                        "{label} 转发头使用 $proxy_host/$proxy_port，修改上游会改变语义，请手动接入"
-                    ));
-                }
-                let resolved = proxy.words.get(1).map(|u| resolve_upstream(u, &groups));
+                let resolved = proxy.words().get(1).map(|u| resolve_upstream(u, &groups));
                 if reason.is_none() {
                     if let Some(Err(msg)) = &resolved {
                         reason = Some(msg.clone());
                     }
                 }
+                let (upstream, proxy_host, proxy_uri) = match &resolved {
+                    Some(Ok(r)) => r.clone(),
+                    _ => (String::new(), String::new(), String::new()),
+                };
+                // $proxy_host/$proxy_port 只能出现在 proxy_set_header 里:其余
+                // 指令(如 add_header)取值会随 proxy_pass 改变,无法补偿。
+                if reason.is_none()
+                    && lk.iter().any(|n| {
+                        n.name() != "proxy_set_header" && mentions_proxy_vars(n.text())
+                    })
+                {
+                    reason = Some(format!(
+                        "{label} 在非 proxy_set_header 指令里使用 $proxy_host/$proxy_port，请手动接入"
+                    ));
+                }
                 if reason.is_none()
                     && headers.iter().any(|h| {
-                    h.words
-                        .get(1)
+                    h.header_name()
                         .is_some_and(|k| k.eq_ignore_ascii_case(ROUTE_HEADER))
                         || (h
-                            .words
-                            .get(1)
+                            .header_name()
                             .is_some_and(|k| k.eq_ignore_ascii_case("X-Forwarded-For"))
-                            && h.words.get(2).is_none_or(|v| {
+                            && h.words().get(2).is_none_or(|v| {
                                 !["$remote_addr", "$proxy_add_x_forwarded_for"].contains(&v.as_str())
                             }))
                         || (h
-                            .words
-                            .get(1)
+                            .header_name()
                             .is_some_and(|k| k.eq_ignore_ascii_case("X-Forwarded-Proto"))
                             && h
-                                .words
+                                .words()
                                 .get(2)
                                 .is_none_or(|v| !["$scheme", "http", "https"].contains(&v.as_str())))
                 }) {
                     reason = Some("内部路由头或自定义客户端来源头需要手动接入".into());
                 }
-                let (upstream, proxy_host) = match &resolved {
-                    Some(Ok((u, h))) => (u.clone(), h.clone()),
-                    _ => (String::new(), String::new()),
+                let fixups = if reason.is_none() {
+                    proxy_host_fixups(&lk, &proxy_host, &proxy_port(&upstream), &format!("{id}-l{ordinal}"), source)
+                } else {
+                    Vec::new()
                 };
+                if reason.is_some() {
+                    continue;
+                }
                 locs.push(LocPlan {
                     ordinal,
                     label,
-                    proxy: proxy.clone(),
+                    location_path: l.words().last().cloned().unwrap_or_default(),
+                    proxy: proxy.d.clone(),
                     upstream,
                     proxy_host,
+                    proxy_uri,
                     headers,
                     own_headers: !own_headers.is_empty(),
-                    redirect_off: named(lk, "proxy_redirect")
+                    redirect_off: node_named(&lk, "proxy_redirect")
                         .iter()
-                        .any(|n| n.words == ["proxy_redirect", "off"]),
+                        .any(|n| n.words() == ["proxy_redirect", "off"]),
+                    fixups,
                 });
             }
             if reason.is_none() && locs.is_empty() {
                 reason =
                     Some("该 server 块没有 proxy_pass 转发（跳转/ACME/静态站点），不是 WAF 接入对象".into());
             }
+            if reason.is_none() && ctx.ambiguous && !locs.is_empty() {
+                reason = Some("无法确定 HTTP 层上下文（多个 http 块），需要手动接入".into());
+            }
+            if reason.is_none() && ctx.complex && !locs.is_empty() {
+                reason = Some("HTTP 层包含 proxy_set_header 之外的代理设置，需要手动接入".into());
+            }
             if reason.is_none()
-                && ns.iter().filter(|n| n.words[0] == "http").any(|n| {
-                    n.children.as_ref().is_some_and(|cs| {
-                        cs.iter().any(|c| {
-                            (c.words[0].starts_with("proxy_") && c.words[0] != "proxy_set_header")
-                                || ["rewrite", "if", "set"].contains(&c.words[0].as_str())
-                        })
+                && server_nodes
+                    .iter()
+                    .any(|n| {
+                        [
+                            "rewrite",
+                            "if",
+                            "set",
+                            "try_files",
+                            "error_page",
+                            "return",
+                        ]
+                        .contains(&n.name())
+                            || n.name().contains("_by_lua")
+                            || n.name().starts_with("js_")
+                            || (n.name().starts_with("proxy_") && n.name() != "proxy_set_header")
+                            || (n.d.children.is_none()
+                                && n.name() != "proxy_set_header"
+                                && mentions_proxy_vars(n.text()))
                     })
-                })
-            {
-                reason = Some("HTTP 层包含复杂代理设置，需要手动接入".into());
-            }
-            if reason.is_none()
-                && global_proxy_settings
-                && ns.iter().any(|n| n.words[0] == "server")
-            {
-                reason = Some("HTTP 层包含代理设置，无法安全确定 include 继承关系".into());
-            }
-            if reason.is_none()
-                && kids.iter().any(|n| {
-                    [
-                        "include",
-                        "rewrite",
-                        "if",
-                        "set",
-                        "try_files",
-                        "error_page",
-                        "return",
-                    ]
-                    .contains(&n.words[0].as_str())
-                        || n.words[0].contains("_by_lua")
-                        || n.words[0].starts_with("js_")
-                        || (n.words[0].starts_with("proxy_") && n.words[0] != "proxy_set_header")
-                })
             {
                 reason = Some("存在 include、重写、缓存或其他复杂指令，需要手动接入".into());
             }
@@ -754,22 +1111,33 @@ fn upstream_groups(files: &BTreeMap<PathBuf, String>) -> BTreeMap<String, Vec<(S
 
 /// 把 proxy_pass 的上游解析为可转发字面量，返回 (带 scheme 的上游， nginx $proxy_host)。
 /// 命名上游组只接受恰好一台非 backup/down 的 server，否则负载均衡/故障转移语义会变。
+/// 把 proxy_pass 解析为 (可转发上游, nginx $proxy_host, URI 前缀)。
+/// 命名上游组只接受恰好一台非 backup/down 的 server，否则负载均衡/故障转移语义会变。
 fn resolve_upstream(
     u: &str,
     groups: &BTreeMap<String, Vec<(String, bool)>>,
-) -> std::result::Result<(String, String), String> {
+) -> std::result::Result<(String, String, String), String> {
     let Some((scheme, rest)) = u.split_once("://") else {
         return Err("只支持 http:// 或 https:// 上游".into());
     };
     if scheme != "http" && scheme != "https" {
         return Err("只支持 http:// 或 https:// 上游".into());
     }
-    if rest.is_empty() || rest.contains(['/', '$', '@', '\\', '"', '\'', '?', '#']) {
+    if rest.is_empty() || rest.contains(['$', '@', '\\', '"', '\'', '?', '#']) {
         return Err(
-            "只支持 http://主机:端口 字面上游或单服务器 upstream 组，URI 后缀和变量不支持".into(),
+            "只支持 http://主机:端口 字面上游或单服务器 upstream 组，变量上游不支持".into(),
         );
     }
-    if let Some(servers) = groups.get(rest) {
+    // proxy_pass 自带的 URI 前缀由 Nginx 继续用于替换 location 前缀,Rooster
+    // 只原样转发收到的路径,因此站点上游不包含这段前缀。
+    let (authority, proxy_uri) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, String::new()),
+    };
+    if authority.is_empty() {
+        return Err("上游缺少主机".into());
+    }
+    if let Some(servers) = groups.get(authority) {
         let usable = servers
             .first()
             .filter(|(_addr, flagged)| servers.len() == 1 && !*flagged)
@@ -788,13 +1156,19 @@ fn resolve_upstream(
         if !has_port {
             addr.push_str(":80");
         }
-        return Ok((format!("{scheme}://{addr}"), rest.to_string()));
+        return Ok((
+            format!("{scheme}://{addr}"),
+            authority.to_string(),
+            proxy_uri,
+        ));
     }
-    if rest.contains(':') {
-        return u.parse::<http::Uri>()
+    if authority.contains(':') {
+        let literal = format!("{scheme}://{authority}");
+        return literal
+            .parse::<http::Uri>()
             .ok()
             .filter(|parsed| parsed.authority().is_some())
-            .map(|_| (u.to_string(), rest.to_string()))
+            .map(|_| (literal, authority.to_string(), proxy_uri))
             .ok_or_else(|| "上游地址无法解析".into());
     }
     Err("无端口字面上游会被当成 DNS 主机名；请显式写端口或定义 upstream 组".into())
@@ -808,6 +1182,9 @@ struct JournalSpan {
     original: String,
     /// 注入片段(含 begin/end 标记,每 location 一段)。
     injected: String,
+    /// 同一事务对原文件其他位置的补充改写(如 $proxy_host 字面量化)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fixups: Vec<Fixup>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -830,6 +1207,21 @@ struct Journal {
 }
 
 impl Journal {
+    /// 事务写进文件的全部片段:(原文, 注入后)。注入主体与补充改写一起算,
+    /// 漂移检测和恢复都走这一份视图。
+    fn fragments(&self) -> Vec<(String, String)> {
+        self.effective_spans()
+            .into_iter()
+            .flat_map(|sp| {
+                std::iter::once((sp.original, sp.injected)).chain(
+                    sp.fixups
+                        .into_iter()
+                        .map(|f| (f.original, f.injected)),
+                )
+            })
+            .collect()
+    }
+
     /// 生效的注入面:新日志直接用 spans,旧日志把 original/injected 迁移成
     /// 单元素 spans(所有读写只走这一份视图)。
     fn effective_spans(&self) -> Vec<JournalSpan> {
@@ -842,6 +1234,7 @@ impl Journal {
                 upstream: self.upstream.clone(),
                 original: original.clone(),
                 injected: injected.clone(),
+                fixups: Vec::new(),
             }],
             _ => vec![],
         }
@@ -935,21 +1328,15 @@ pub fn snapshot(state: &AgentState) -> Result<Snapshot> {
         if let Some(j) = load_journal(state, &row.id)? {
             let current = fs::read_to_string(&j.file).map_err(|e| e.to_string())?;
             let spans = j.effective_spans();
-            // 每个 location 的注入片段都必须在文件里恰好出现一次。
-            let in_location = !spans.is_empty()
-                && spans
+            // 注入片段与补充改写都必须在文件里恰好出现一次。
+            let frags = j.fragments();
+            let in_location = !frags.is_empty()
+                && frags
                     .iter()
-                    .all(|sp| current.matches(&sp.injected).count() == 1);
-            let mut restored = current.clone();
-            for sp in &spans {
-                restored = restored.replacen(&sp.injected, &sp.original, 1);
-            }
+                    .all(|(_, injected)| current.matches(injected).count() == 1);
             // 注入后的配置在发现层必然被拒(路由头/非 off 的 proxy_redirect),
             // 站点真实形态以去掉注入片段的恢复版为准。
-            let restored_site =
-                discover_sites(&BTreeMap::from([(PathBuf::from(&row.file), restored)]))
-                    .ok()
-                    .and_then(|rows| rows.into_iter().find(|s| s.id == row.id));
+            let restored_site = restored_site(&files, &j, &current).ok().flatten();
             let context_supported = restored_site.as_ref().is_some_and(|s| s.supported);
             // 接入面必须与 journal spans 完全一致:接入后新增的 proxy location
             // 不在 spans 内,流量会绕过 WAF 而面板仍显示已接入。
@@ -1107,7 +1494,7 @@ fn config_with_sites(raw: &str, new_sites: &[Site], listener: &str) -> Result<St
 fn quoted(word: &str) -> String {
     format!("\"{}\"", word.replace('"', "\\\""))
 }
-fn injection(plan: &LocPlan, site_id: &str, source: &str, listener: &str) -> Result<String> {
+fn injection(plan: &LocPlan, site_id: &str, listener: &str) -> Result<String> {
     // 命名上游组的 nginx $proxy_host 是组名而非解析后的地址，
     // 后端常按 Host 路由，必须原样保留。
     let proxy_host = plan.proxy_host.as_str();
@@ -1116,37 +1503,32 @@ fn injection(plan: &LocPlan, site_id: &str, source: &str, listener: &str) -> Res
     }
     let scheme = plan.upstream.split("://").next().unwrap_or("http");
     let mut out = format!(
-        "# rooster-waf begin {site_id}\nproxy_pass http://{listener};\n"
+        "# rooster-waf begin {site_id}\nproxy_pass http://{listener}{};\n",
+        plan.proxy_uri
     );
     // Materialize inherited headers before adding any header at location level:
     // Nginx stops inheriting the entire proxy_set_header array at that point.
     if !plan.own_headers {
         for h in &plan.headers {
-            if h.words.get(1).is_some_and(|k| {
+            if h.header_name().is_some_and(|k| {
                 k.eq_ignore_ascii_case(ROUTE_HEADER)
                     || k.eq_ignore_ascii_case("X-Forwarded-For")
                     || k.eq_ignore_ascii_case("X-Forwarded-Proto")
             }) {
                 continue;
             }
-            out.push_str(
-                source
-                    .get(h.start..h.end)
-                    .ok_or("inherited header offsets changed")?,
-            );
+            out.push_str(&substitute_proxy_vars(h.text(), proxy_host, &proxy_port(&plan.upstream)));
             out.push('\n');
         }
     }
     if plan.headers.iter().any(|h| {
-        h.words
-            .get(1)
+        h.header_name()
             .is_some_and(|k| k.eq_ignore_ascii_case(ROUTE_HEADER))
     }) {
         return Err("X-Rooster-Site is reserved for managed onboarding".into());
     }
     if !plan.headers.iter().any(|h| {
-        h.words
-            .get(1)
+        h.header_name()
             .is_some_and(|k| k.eq_ignore_ascii_case("Host"))
     }) {
         out.push_str(&format!(
@@ -1154,32 +1536,35 @@ fn injection(plan: &LocPlan, site_id: &str, source: &str, listener: &str) -> Res
             quoted(proxy_host)
         ));
     }
-    // Preserve Nginx's original implicit redirect mapping after changing proxy_pass.
-    // Explicit proxy_redirect off is tracked separately by the discovery row.
+    // Changing proxy_pass authority also changes Nginx's implicit redirect match.
     if !plan.redirect_off {
-        // nginx 隐式 proxy_redirect 以 $proxy_host 为基准：字面上游是 host:port，
-        // 命名上游组是组名。
-        out.push_str(&format!("proxy_redirect {scheme}://{proxy_host}/ /;\n"));
+        if plan.proxy_uri.is_empty() {
+            out.push_str(&format!("proxy_redirect {scheme}://{proxy_host}/ /;\n"));
+        } else {
+            out.push_str(&format!(
+                "proxy_redirect {} {};\n",
+                quoted(&format!("{scheme}://{proxy_host}{}", plan.proxy_uri)),
+                quoted(&plan.location_path)
+            ));
+        }
     }
     out.push_str(&format!(
         "proxy_set_header {ROUTE_HEADER} {};\n",
         quoted(site_id)
     ));
     if !plan.own_headers
-        || !plan.headers.iter().any(|h| {
-            h.words
-                .get(1)
-                .is_some_and(|k| k.eq_ignore_ascii_case("X-Forwarded-For"))
-        })
+        || !plan
+            .headers
+            .iter()
+            .any(|h| h.header_name().is_some_and(|k| k.eq_ignore_ascii_case("X-Forwarded-For")))
     {
         out.push_str("proxy_set_header X-Forwarded-For $remote_addr;\n");
     }
     if !plan.own_headers
-        || !plan.headers.iter().any(|h| {
-            h.words
-                .get(1)
-                .is_some_and(|k| k.eq_ignore_ascii_case("X-Forwarded-Proto"))
-        })
+        || !plan
+            .headers
+            .iter()
+            .any(|h| h.header_name().is_some_and(|k| k.eq_ignore_ascii_case("X-Forwarded-Proto")))
     {
         out.push_str("proxy_set_header X-Forwarded-Proto $scheme;\n");
     }
@@ -1217,12 +1602,13 @@ pub fn change(
             return detach(&state, j, &raw, &rt);
         }
         let spans = j.effective_spans();
+        let frags = j.fragments();
         let current = fs::read_to_string(&j.file).map_err(|e| e.to_string())?;
         if j.phase != "active"
-            || spans.is_empty()
-            || spans
+            || frags.is_empty()
+            || frags
                 .iter()
-                .any(|sp| current.matches(&sp.injected).count() != 1)
+                .any(|(_, injected)| current.matches(injected).count() != 1)
         {
             return Err("configuration drift detected; restore before changing WAF mode".into());
         }
@@ -1324,6 +1710,7 @@ pub fn change(
         upstream: String,
         original: String,
         injected: String,
+        fixups: Vec<Fixup>,
     }
     let listener_port = listener
         .parse::<std::net::SocketAddr>()
@@ -1355,7 +1742,7 @@ pub fn change(
             .get(plan.proxy.start..plan.proxy.end)
             .ok_or("configuration offsets changed")?
             .to_string();
-        let injected = injection(plan, &site_id, &source, &listener)?;
+        let injected = injection(plan, &site_id, &listener)?;
         // https 上游默认 skip-verify：nginx 本就不校验上游证书，接入不应
         // 改变现有转发语义（内网自签源站若无此项会直接 502）。
         let skip_verify = plan.upstream.starts_with("https://");
@@ -1368,13 +1755,18 @@ pub fn change(
             upstream: plan.upstream.clone(),
             original,
             injected,
+            fixups: plan.fixups.clone(),
         });
     }
     // 多段注入从后往前拼接,前面的字节偏移不被破坏。prepared 按文档序
     // (location 顺序)生成,主 location 被提前后不一定仍在最前。
     let replacements = prepared
         .iter()
-        .map(|p| (p.start, p.end, p.injected.clone()))
+        .flat_map(|p| {
+            std::iter::once((p.start, p.end, p.injected.clone())).chain(p.fixups.iter().map(|f| {
+                (f.start, f.end, f.injected.clone())
+            }))
+        })
         .collect::<Vec<_>>();
     let changed = splice(&source, &replacements)?;
     let site_ids: Vec<String> = prepared.iter().map(|p| p.site_id.clone()).collect();
@@ -1399,6 +1791,7 @@ pub fn change(
                 upstream: p.upstream,
                 original: p.original,
                 injected: p.injected,
+                fixups: p.fixups,
             })
             .collect(),
         phase: "prepared".into(),
@@ -1532,16 +1925,29 @@ fn verify(
 }
 fn restore_all(j: &Journal, source: &str) -> String {
     let mut restored = source.to_string();
-    for sp in j.effective_spans() {
-        restored = restored.replacen(&sp.injected, &sp.original, 1);
+    for (original, injected) in j.fragments() {
+        restored = restored.replacen(&injected, &original, 1);
     }
     restored
 }
+fn restored_site(
+    files: &BTreeMap<PathBuf, String>,
+    j: &Journal,
+    current: &str,
+) -> Result<Option<NginxSite>> {
+    // Keep include/upstream context and other servers' injections intact.
+    let mut restored = files.clone();
+    restored.insert(j.file.clone(), restore_all(j, current));
+    Ok(discover_sites(&restored)?.into_iter().find(|s| s.id == j.id))
+}
 fn restore_fragment(j: &Journal) -> Result<()> {
     let source = fs::read_to_string(&j.file).map_err(|e| e.to_string())?;
-    let spans = j.effective_spans();
-    let counts: Vec<usize> = spans.iter().map(|sp| source.matches(&sp.injected).count()).collect();
-    if !spans.is_empty() && counts.iter().all(|c| *c == 1) {
+    let counts: Vec<usize> = j
+        .fragments()
+        .iter()
+        .map(|(_, injected)| source.matches(injected).count())
+        .collect();
+    if !counts.is_empty() && counts.iter().all(|c| *c == 1) {
         return atomic_write(&j.file, restore_all(j, &source).as_bytes(), false);
     }
     if counts.iter().all(|c| *c == 0)
@@ -1571,7 +1977,11 @@ fn detach(
         return Err("recovery record has no injection spans; reconcile manually".into());
     }
     // Validate exact fragments before preparing changes; preserve other site edits.
-    let counts: Vec<usize> = spans.iter().map(|sp| source.matches(&sp.injected).count()).collect();
+    let counts: Vec<usize> = j
+        .fragments()
+        .iter()
+        .map(|(_, injected)| source.matches(injected).count())
+        .collect();
     if !counts.iter().all(|c| *c == 1)
         && !(j.phase == "prepared" && hash_content(&source) == j.original_hash)
     {
@@ -1645,7 +2055,248 @@ mod tests {
     }
     #[test]
     fn excludes_ambiguous_routing_and_upstreams() {
-        for conf in ["server { location / { proxy_pass http://backend; } }", "server { location / { proxy_pass http://127.0.0.1:3000/api/; } }", "server { location / { proxy_pass http://$upstream:3000; } }", "server { location / { rewrite ^ /a; proxy_pass http://127.0.0.1:3000; } }"] { assert!(!rows(conf)[0].supported, "{conf}"); }
+        for conf in ["server { location / { proxy_pass http://backend; } }", "server { location / { proxy_pass http://$upstream:3000; } }", "server { location / { rewrite ^ /a; proxy_pass http://127.0.0.1:3000; } }", "server { location / { proxy_pass http://127.0.0.1:3000/x?a=1; } }"] { assert!(!rows(conf)[0].supported, "{conf}"); }
+    }
+    #[test]
+    fn proxy_pass_uri_prefix_is_preserved_on_the_loopback_hop() {
+        // nginx 用 proxy_pass 的 URI 前缀替换 location 前缀;接入后这段替换仍在
+        // Nginx 里发生,Rooster 收到的已经是改写后的路径,所以站点上游不带前缀。
+        let r = rows("server { location /app/ { proxy_pass http://127.0.0.1:3006/api/; } }");
+        assert!(r[0].supported, "{}", r[0].reason.clone().unwrap_or_default());
+        assert_eq!(r[0].locs[0].upstream, "http://127.0.0.1:3006");
+        assert_eq!(r[0].locs[0].proxy_uri, "/api/");
+        let inj = injection(&r[0].locs[0], &r[0].id, LISTEN).unwrap();
+        assert!(inj.contains("proxy_pass http://127.0.0.1:18080/api/;"), "{inj}");
+        assert!(inj.contains("proxy_redirect \"http://127.0.0.1:3006/api/\" \"/app/\";"), "{inj}");
+    }
+    #[test]
+    fn inherited_proxy_variables_are_literalized_per_location() {
+        for (main, server) in [
+            ("http { include /etc/nginx/sites-enabled/*; }", "proxy_set_header Host $proxy_host; proxy_set_header X-Port ${proxy_port};"),
+            ("http { include /etc/nginx/headers.conf; include /etc/nginx/sites-enabled/*; }", ""),
+        ] {
+            let r = rows_in(&[
+                ("/etc/nginx/nginx.conf", main),
+                ("/etc/nginx/headers.conf", "proxy_set_header Host $proxy_host; proxy_set_header X-Port ${proxy_port};"),
+                ("/etc/nginx/sites-enabled/a.conf", &format!("server {{ {server} location / {{ proxy_pass http://127.0.0.1:3001; }} location /api/ {{ proxy_pass https://127.0.0.1:443; }} }}")),
+            ]);
+            assert!(r[0].supported, "{:?}", r[0].reason);
+            for (plan, host, port) in [(&r[0].locs[0], "127.0.0.1:3001", "3001"), (&r[0].locs[1], "127.0.0.1:443", "443")] {
+                assert!(plan.fixups.is_empty());
+                let inj = injection(plan, &r[0].id, LISTEN).unwrap();
+                assert!(inj.contains(&format!("proxy_set_header Host {host};")), "{inj}");
+                assert!(inj.contains(&format!("proxy_set_header X-Port {port};")), "{inj}");
+                assert!(!mentions_proxy_vars(&inj), "{inj}");
+            }
+        }
+    }
+    #[test]
+    fn uri_redirect_mapping_preserves_prefix_and_off() {
+        for modifier in ["", "^~ ", "= "] {
+            let r = rows(&format!("server {{ location {modifier}/app/ {{ proxy_pass https://127.0.0.1:3443/api/; }} }}"));
+            assert!(r[0].supported, "{:?}", r[0].reason);
+            let inj = injection(&r[0].locs[0], &r[0].id, LISTEN).unwrap();
+            assert!(inj.contains("proxy_redirect \"https://127.0.0.1:3443/api/\" \"/app/\";"), "{inj}");
+        }
+        let r = rows_in(&[
+            ("/etc/nginx/nginx.conf", "http { upstream g { server 127.0.0.1:3001; } include /etc/nginx/sites-enabled/*; }"),
+            ("/etc/nginx/sites-enabled/a.conf", "server { location /app/ { proxy_pass http://g/api/; } }"),
+        ]);
+        assert!(r[0].supported, "{:?}", r[0].reason);
+        assert!(injection(&r[0].locs[0], &r[0].id, LISTEN).unwrap().contains("proxy_redirect \"http://g/api/\" \"/app/\";"));
+        let r = rows("server { location /app/ { proxy_pass http://127.0.0.1:3001/api/; proxy_redirect off; } }");
+        assert!(r[0].supported);
+        assert!(!injection(&r[0].locs[0], &r[0].id, LISTEN).unwrap().contains("proxy_redirect"));
+    }
+    #[test]
+    fn empty_and_large_glob_includes_remain_supported() {
+        let mut files = BTreeMap::from([(
+            PathBuf::from("/etc/nginx/nginx.conf"),
+            "http { include /etc/nginx/conf.d/*.conf; include /etc/nginx/sites-enabled/*; }".to_string(),
+        )]);
+        for i in 0..17 {
+            files.insert(PathBuf::from(format!("/etc/nginx/sites-enabled/{i}.conf")), "server { location / { proxy_pass http://127.0.0.1:3001; } }".into());
+        }
+        let r = discover_sites(&files).unwrap();
+        assert_eq!(r.len(), 17);
+        assert!(r.iter().all(|s| s.supported), "{:?}", r.iter().map(|s| &s.reason).collect::<Vec<_>>());
+        files.insert(PathBuf::from("/etc/nginx/nginx.conf"), "http { include /etc/nginx/missing.conf; include /etc/nginx/sites-enabled/*; }".into());
+        assert!(discover_sites(&files).unwrap().iter().all(|s| !s.supported));
+    }
+    #[test]
+    fn inherited_proxy_variables_outside_headers_stay_manual() {
+        let r = rows("server { add_header X-Backend $proxy_host; location / { proxy_pass http://127.0.0.1:3001; } }");
+        assert!(!r[0].supported);
+        let r = rows_in(&[
+            ("/etc/nginx/nginx.conf", "http { add_header X-Backend $proxy_port; include /etc/nginx/sites-enabled/*; }"),
+            ("/etc/nginx/sites-enabled/a.conf", "server { location / { proxy_pass http://127.0.0.1:3001; } }"),
+        ]);
+        assert!(!r[0].supported);
+    }
+    #[test]
+    fn http_level_headers_from_included_files_are_materialized() {
+        // sites-enabled 文件自身没有 http{},继承必须沿主配置的 include 链解析。
+        let r = rows_in(&[
+            (
+                "/etc/nginx/nginx.conf",
+                "http { include /etc/nginx/conf.d/*.conf; include /etc/nginx/sites-enabled/*; }",
+            ),
+            (
+                "/etc/nginx/conf.d/00-proxy.conf",
+                "proxy_set_header Host $http_host;\nproxy_set_header X-Inherited yes;",
+            ),
+            (
+                "/etc/nginx/sites-enabled/a.conf",
+                "server { location / { proxy_pass http://127.0.0.1:3001; } }",
+            ),
+        ]);
+        assert!(r[0].supported, "{}", r[0].reason.clone().unwrap_or_default());
+        let inj = injection(&r[0].locs[0], &r[0].id, LISTEN).unwrap();
+        // 不物化就会让 Nginx 停止继承,上游会丢掉 Host 与自定义头。
+        assert!(inj.contains("proxy_set_header Host $http_host;"), "{inj}");
+        assert!(inj.contains("proxy_set_header X-Inherited yes;"), "{inj}");
+        assert!(!inj.contains("proxy_set_header Host \"127.0.0.1:3001\""), "{inj}");
+    }
+    #[test]
+    fn http_level_proxy_settings_beyond_headers_stay_manual() {
+        let r = rows_in(&[
+            (
+                "/etc/nginx/nginx.conf",
+                "http { proxy_bind 10.0.0.1; include /etc/nginx/sites-enabled/*; }",
+            ),
+            (
+                "/etc/nginx/sites-enabled/a.conf",
+                "server { location / { proxy_pass http://127.0.0.1:3001; } }",
+            ),
+        ]);
+        assert!(!r[0].supported);
+        assert!(
+            r[0].reason.as_deref().is_some_and(|s| s.contains("HTTP 层")),
+            "reason={:?}",
+            r[0].reason
+        );
+    }
+    #[test]
+    fn location_include_of_proxy_params_onboards_and_literals_proxy_host() {
+        // Debian 的 proxy_params 用 $proxy_host:接入后它会变成回环守卫地址,
+        // 必须就地展开并字面量化,且不去改共享文件。
+        let files = BTreeMap::from([
+            (
+                PathBuf::from("/etc/nginx/nginx.conf"),
+                "http { include /etc/nginx/sites-enabled/*; }".to_string(),
+            ),
+            (
+                PathBuf::from("/etc/nginx/proxy_params"),
+                "proxy_set_header Host $proxy_host;\nproxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n".to_string(),
+            ),
+            (
+                PathBuf::from("/etc/nginx/sites-enabled/a.conf"),
+                "upstream g { server 10.0.0.7:8080; }\nserver { location / { include /etc/nginx/proxy_params; proxy_pass http://g; } }\nserver { location / { include /etc/nginx/proxy_params; proxy_pass http://g; } }".to_string(),
+            ),
+        ]);
+        let r = discover_sites(&files).unwrap();
+        assert!(r[0].supported, "{}", r[0].reason.clone().unwrap_or_default());
+        // include 里的 proxy_set_header 算本层指令,不再叠加 http 层继承头。
+        assert!(r[0].locs[0].own_headers);
+        assert_eq!(r[0].locs[0].fixups.len(), 1);
+        let fix = &r[0].locs[0].fixups[0];
+        assert_eq!(fix.original, "include /etc/nginx/proxy_params;");
+        assert!(fix.injected.contains("proxy_set_header Host g;"), "{}", fix.injected);
+        assert!(
+            fix.injected
+                .contains("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"),
+            "{}",
+            fix.injected
+        );
+        let inj = injection(&r[0].locs[0], &r[0].id, LISTEN).unwrap();
+        // 已有 Host 指令时不再叠加(同名指令会重复发出)。
+        assert!(!inj.contains("proxy_set_header Host"), "{inj}");
+        let changed = splice(
+            &files[&PathBuf::from("/etc/nginx/sites-enabled/a.conf")],
+            &[
+                vec![(
+                    r[0].locs[0].proxy.start,
+                    r[0].locs[0].proxy.end,
+                    inj.clone(),
+                )],
+                r[0].locs[0]
+                    .fixups
+                    .iter()
+                    .map(|f| (f.start, f.end, f.injected.clone()))
+                    .collect::<Vec<_>>(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert!(parse(&changed).is_ok(), "{changed}");
+        assert!(changed.contains("proxy_set_header Host g;"), "{changed}");
+        // 恢复:注入片段与补充改写都回到原文。
+        let j = Journal {
+            id: r[0].id.clone(),
+            instance: Instance {
+                binary: "/usr/sbin/nginx".into(),
+                args: vec![],
+                running: true,
+                pid: Some(1),
+            },
+            file: "/etc/nginx/sites-enabled/a.conf".into(),
+            original: None,
+            injected: None,
+            upstream: String::new(),
+            spans: vec![JournalSpan {
+                site_id: r[0].id.clone(),
+                upstream: r[0].locs[0].upstream.clone(),
+                original: files[&PathBuf::from("/etc/nginx/sites-enabled/a.conf")][r[0].locs[0].proxy.start..r[0].locs[0].proxy.end].to_string(),
+                injected: inj,
+                fixups: r[0].locs[0].fixups.clone(),
+            }],
+            phase: "active".into(),
+            original_hash: String::new(),
+            listener: LISTEN.into(),
+        };
+        assert_eq!(restore_all(&j, &changed), files[&PathBuf::from("/etc/nginx/sites-enabled/a.conf")]);
+        let restored = restored_site(&files, &j, &changed).unwrap().unwrap();
+        assert!(restored.supported, "{:?}", restored.reason);
+        assert_eq!(restored.locs[0].upstream, r[0].locs[0].upstream);
+        assert_eq!(restored.locs[0].fixups[0].original, fix.original);
+        let other = injection(&r[1].locs[0], &r[1].id, LISTEN).unwrap();
+        let both = changed.replacen("proxy_pass http://g;", &other, 1);
+        let mut attached_files = files.clone();
+        attached_files.insert(j.file.clone(), both.clone());
+        let restored = restored_site(&attached_files, &j, &both).unwrap().unwrap();
+        assert!(restored.supported, "{:?}", restored.reason);
+        assert_eq!(restored.id, r[0].id);
+        assert!(restore_all(&j, &both).contains(&other));
+        assert!(!discover_sites(&attached_files).unwrap()[1].supported);
+    }
+    #[test]
+    fn same_file_proxy_host_header_is_literalized_in_place() {
+        let r = rows("server { location / { proxy_set_header Host $proxy_host; proxy_pass http://127.0.0.1:3001; } }");
+        assert!(r[0].supported, "{}", r[0].reason.clone().unwrap_or_default());
+        assert_eq!(r[0].locs[0].fixups.len(), 1);
+        let fix = &r[0].locs[0].fixups[0];
+        assert_eq!(fix.original, "proxy_set_header Host $proxy_host;");
+        assert!(fix.injected.contains("proxy_set_header Host 127.0.0.1:3001;"), "{fix:?}");
+    }
+    #[test]
+    fn proxy_vars_outside_set_header_stay_manual() {
+        let r = rows("server { location / { add_header X-Backend $proxy_host; proxy_pass http://127.0.0.1:3001; } }");
+        assert!(!r[0].supported);
+        assert!(
+            r[0].reason.as_deref().is_some_and(|s| s.contains("$proxy_host")),
+            "reason={:?}",
+            r[0].reason
+        );
+    }
+    #[test]
+    fn unresolvable_include_stays_manual() {
+        let r = rows("server { location / { include /etc/nginx/snippets/unknown.conf; proxy_pass http://127.0.0.1:3001; } }");
+        assert!(!r[0].supported);
+        assert!(
+            r[0].reason.as_deref().is_some_and(|s| s.contains("include")),
+            "reason={:?}",
+            r[0].reason
+        );
     }
     #[test]
     fn multi_location_servers_onboard_each_proxy_location() {
@@ -1664,8 +2315,8 @@ mod tests {
         let id1 = r[0].locs[1].site_id(&r[0].id, false);
         assert_eq!(id0, r[0].id);
         assert_eq!(id1, format!("{}-l1", r[0].id));
-        let inj0 = injection(&r[0].locs[0], &id0, &r[0].source, LISTEN).unwrap();
-        let inj1 = injection(&r[0].locs[1], &id1, &r[0].source, LISTEN).unwrap();
+        let inj0 = injection(&r[0].locs[0], &id0, LISTEN).unwrap();
+        let inj1 = injection(&r[0].locs[1], &id1, LISTEN).unwrap();
         assert!(inj0.contains(&format!("X-Rooster-Site \"{id0}\"")));
         assert!(inj1.contains(&format!("X-Rooster-Site \"{id1}\"")));
         assert!(inj1.contains("proxy_redirect http://127.0.0.1:4000/ /;"));
@@ -1687,7 +2338,7 @@ mod tests {
                 (
                     p.proxy.start,
                     p.proxy.end,
-                    injection(p, &site_id, source, LISTEN).unwrap(),
+                    injection(p, &site_id, LISTEN).unwrap(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1702,6 +2353,7 @@ mod tests {
                 upstream: String::new(),
                 original: source[start..end].to_string(),
                 injected,
+                fixups: Vec::new(),
             })
             .collect();
         let j = Journal {
@@ -1732,7 +2384,7 @@ mod tests {
     fn inherited_headers_and_comments_are_preserved() {
         let source = "server { proxy_set_header Host $host; proxy_set_header X-Secret 'hello; world'; location / { # proxy_pass fake;\n proxy_pass http://127.0.0.1:3000; } }";
         let r = rows(source);
-        let injected = injection(&r[0].locs[0], &r[0].id, source, LISTEN).unwrap();
+        let injected = injection(&r[0].locs[0], &r[0].id, LISTEN).unwrap();
         assert!(injected.contains("X-Secret 'hello; world'"));
         assert!(injected.contains("proxy_set_header Host $host;"));
         let p = &r[0].locs[0].proxy;
@@ -1745,7 +2397,7 @@ mod tests {
         let r = rows(source);
         assert!(r[0].supported);
         assert_eq!(r[0].domains, ["_"]);
-        let injected = injection(&r[0].locs[0], &r[0].id, source, LISTEN).unwrap();
+        let injected = injection(&r[0].locs[0], &r[0].id, LISTEN).unwrap();
         assert!(!injected.contains("proxy_set_header X-Forwarded-For"));
         assert!(!injected.contains("proxy_set_header X-Forwarded-Proto"));
         assert!(injected.contains("proxy_redirect http://127.0.0.1:3000/ /;"));
@@ -1757,7 +2409,7 @@ mod tests {
         let p = &before[0].locs[0].proxy;
         let new = splice(
             source,
-            &[(p.start, p.end, injection(&before[0].locs[0], &before[0].id, source, LISTEN).unwrap())],
+            &[(p.start, p.end, injection(&before[0].locs[0], &before[0].id, LISTEN).unwrap())],
         )
         .unwrap();
         let after = rows(&new);
@@ -1796,7 +2448,7 @@ mod tests {
         assert!(r[0].supported, "{}", r[0].reason.clone().unwrap_or_default());
         assert_eq!(r[0].upstream.as_deref(), Some("http://10.0.0.5:8080"));
         assert_eq!(r[0].locs[0].proxy_host, "llm_gateway");
-        let injected = injection(&r[0].locs[0], &r[0].id, &r[0].source, LISTEN).unwrap();
+        let injected = injection(&r[0].locs[0], &r[0].id, LISTEN).unwrap();
         // $proxy_host 语义保留：Host 与 proxy_redirect 都用组名。
         assert!(injected.contains("proxy_set_header Host \"llm_gateway\";"));
         assert!(injected.contains("proxy_redirect http://llm_gateway/ /;"));
@@ -1833,7 +2485,7 @@ mod tests {
         ]);
         assert!(r[0].supported);
         assert_eq!(r[0].upstream.as_deref(), Some("https://10.0.0.9:8443"));
-        let injected = injection(&r[0].locs[0], &r[0].id, &r[0].source, LISTEN).unwrap();
+        let injected = injection(&r[0].locs[0], &r[0].id, LISTEN).unwrap();
         assert!(injected.contains("proxy_redirect https://firewall_backend/ /;"));
         let literal = rows(
             "server { location / { proxy_pass https://10.0.0.9:8443; } }",
@@ -1859,7 +2511,7 @@ mod tests {
         assert!(!r[0].supported);
         assert_eq!(
             r[0].reason.as_deref(),
-            Some("location /api 含 include、重写、缓存或其他复杂指令，需要手动接入")
+            Some("location /api 含重写、缓存或其他复杂指令，需要手动接入")
         );
     }
     #[test]
@@ -1949,7 +2601,8 @@ mod lifecycle_tests {
             axum::serve(listener, app).await.unwrap();
         });
         let port = free_port();
-        let source = format!("# preserved comment\nuser root root; worker_processes 1; pid {}/nginx.pid; error_log {}/error.log; events {{ worker_connections 64; }} http {{ access_log off; proxy_set_header Host $host; proxy_set_header X-Inherited 'kept; value'; proxy_set_header X-Observed-Client $remote_addr; server {{ listen 127.0.0.1:{port}; server_name a.test; location / {{ proxy_pass http://{upstream}; }} }} server {{ listen 127.0.0.1:{port}; server_name b.test; location / {{ proxy_pass http://{upstream}; }} }} }}\n", dir.display(), dir.display());
+        let source = format!("# preserved comment\nuser root root; worker_processes 1; pid {}/nginx.pid; error_log {}/error.log; events {{ worker_connections 64; }} http {{ access_log off; proxy_set_header Host $host; proxy_set_header X-Inherited 'kept; value'; proxy_set_header X-Observed-Client $remote_addr; server {{ listen 127.0.0.1:{port}; server_name a.test; location / {{ include {}/proxy_params; proxy_pass http://{upstream}; }} }} server {{ listen 127.0.0.1:{port}; server_name b.test; location / {{ proxy_pass http://{upstream}; }} }} }}\n", dir.display(), dir.display(), dir.display());
+        fs::write(dir.join("proxy_params"), "proxy_set_header Host $host; proxy_set_header X-Inherited 'kept; value'; proxy_set_header X-Observed-Client $remote_addr;\n").unwrap();
         let conf = dir.join("nginx.conf");
         fs::write(&conf, &source).unwrap();
         let nginx = Command::new("/usr/sbin/nginx")

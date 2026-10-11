@@ -2,6 +2,7 @@
 import { computed, h, onMounted, ref, watch } from 'vue'
 import {
   RAlert,
+  RCheckbox,
   REmpty,
   RMetric,
   RMetricStrip,
@@ -53,12 +54,29 @@ const ruleCols: RColumn<WafRule>[] = [
     title: 'SEVERITY',
     key: 'severity',
     width: 110,
-    render: (r) => h(RTag, { tone: SEV_TONE[r.severity] ?? 'muted' }, { default: () => r.severity }),
+    render: (r) =>
+      r.severity
+        ? h(RTag, { tone: SEV_TONE[r.severity] ?? 'muted' }, { default: () => r.severity })
+        : h('span', { class: 'muted' }, '—'),
   },
   { title: 'PL', key: 'min_pl', width: 60, align: 'right', mono: true },
-  { title: 'MSG', key: 'msg' },
+  {
+    title: 'MSG',
+    key: 'msg',
+    render: (r) =>
+      r.msg ?? h('span', { class: 'muted' }, '初始化规则（无 msg，不参与拦截）'),
+  },
   { title: 'TAGS', key: 'tags', mono: true, render: (r) => r.tags.join(' ') },
 ]
+
+/** CRS 的 SecAction 初始化/变量规则：既无 msg 也无 severity，永远不会产生拦截事件。 */
+function isInitRule(r: WafRule): boolean {
+  return !r.msg && !r.severity
+}
+const hideInit = ref(true)
+const initHidden = computed(() =>
+  hideInit.value ? (rules.value?.rules ?? []).filter(isInitRule).length : 0,
+)
 
 const counts = computed(() => {
   // report 为 null 表示 http-guard 未启用
@@ -112,7 +130,8 @@ const filteredRules = computed(() => {
   return all.filter((r) => {
     if (fSeverity.value && r.severity !== fSeverity.value) return false
     if (fPhase.value && String(r.phase) !== fPhase.value) return false
-    if (kw !== '' && !String(r.id).includes(kw) && !r.msg.toLowerCase().includes(kw)) return false
+    if (hideInit.value && isInitRule(r)) return false
+    if (kw !== '' && !String(r.id).includes(kw) && !(r.msg ?? '').toLowerCase().includes(kw)) return false
     return true
   })
 })
@@ -213,6 +232,7 @@ watch(nodeId, () => void load())
         <RInput v-model="keyword" placeholder="按 ID / MSG 过滤" mono :width="200" />
         <RSelect v-model="fSeverity" :options="severityOptions" placeholder="全部 SEVERITY" clearable :width="170" />
         <RSelect v-model="fPhase" :options="phaseOptions" placeholder="全部 PHASE" clearable :width="150" />
+        <RCheckbox v-model="hideInit">隐藏初始化规则</RCheckbox>
       </template>
       <RTable
         :columns="ruleCols"
@@ -222,6 +242,9 @@ watch(nodeId, () => void load())
         :page-size="50"
         empty-text="无匹配规则"
       />
+      <p v-if="initHidden > 0" class="muted init-note">
+        已隐藏 {{ initHidden }} 条 CRS 初始化/变量规则（无 msg 与 severity，不会拦截请求）。
+      </p>
     </RPanel>
 
     <RPanel :title="`规则加载报告：${nodeId ?? ''}`" kicker="LOAD REPORT" flush>
@@ -243,5 +266,9 @@ watch(nodeId, () => void load())
 <style scoped>
 .skip-none {
   padding: 10px 14px 0;
+}
+.init-note {
+  padding: 8px 14px 12px;
+  font-size: 12px;
 }
 </style>

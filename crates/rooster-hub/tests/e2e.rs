@@ -72,6 +72,7 @@ async fn start_hub_with_origin(
         tls,
         secret_key: Some(bcrypt::hash("hub-secret", 4).unwrap()),
         cors_allowed_origins,
+        trusted_proxies: vec![],
         session_ttl: Some(Duration::from_secs(3600)),
         panel_dir: dir.join("no-panel"),
         auto_confirm_delay_secs: 1,

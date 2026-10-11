@@ -179,6 +179,7 @@ mod tests {
             severity: severity.map(str::to_string),
             path: Some("/login".into()),
             hits: vec![942100],
+            hit_msgs: vec![],
             country: None,
             score: Some(5),
         }
@@ -251,6 +252,7 @@ mod tests {
             severity: None,
             path: None,
             hits: vec![],
+            hit_msgs: vec![],
             score: None,
             country: None,
         };

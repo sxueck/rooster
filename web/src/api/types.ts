@@ -251,8 +251,10 @@ export interface WafReportResp {
 export interface WafRule {
   id: number
   phase: number
-  msg: string
-  severity: string
+  /** CRS 初始化/变量规则没有 msg,后端给 null。 */
+  msg: string | null
+  /** 同上:不报严重级别的规则为 null。 */
+  severity: string | null
   tags: string[]
   min_pl: number
 }
@@ -312,6 +314,8 @@ export type RoosterEvent =
       path?: string | null
       /** 本次命中的全部规则 id；旧事件可能缺失 */
       hits?: number[]
+      /** 与 hits 逐项对齐的规则描述;老 Agent 不发。 */
+      hit_msgs?: string[]
       /** 累计异常评分；旧事件可能缺失 */
       score?: number | null
       /** 攻击源国家/地区；无 GeoIP 库时缺失 */

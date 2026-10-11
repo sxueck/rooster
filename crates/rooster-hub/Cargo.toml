@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 rooster-config.workspace = true
+ipnet.workspace = true
 rooster-proto.workspace = true
 axum.workspace = true
 base64 = "0.22"

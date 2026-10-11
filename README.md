@@ -75,6 +75,16 @@ Agents that reach the hub through a dedicated L4-passthrough port must set `agen
 
 Signed agent installation requires an Ed25519 signing key kept outside the hub. Set `upgrade-public-key: "ed25519:<base64-public-key>"` in `hub.yaml`, restart the hub, then upload a signed `rooster-VERSION-ARCH` package through the panel (`ARCH` matches `uname -m`). Missing key/package errors explain these steps. `--allow-unsigned` remains an explicit same-architecture development option.
 
+### Node address shown in the panel
+
+The node list `IP` column is the source address of that node's most recent agent connection, recorded by the hub. Node labels are a separate key/value map edited from the same page; the address is never written into it. When agents reach the hub through an L7 proxy that terminates TLS, every connection's TCP peer is the proxy, so all nodes show the proxy address. Set `trusted-proxies` in `hub.yaml` to the CIDRs of that proxy and make the proxy send `X-Forwarded-For`; the hub then resolves the node address from the header chain (rightmost untrusted hop) and ignores the header entirely for connections that do not come from a trusted proxy.
+
+```yaml
+trusted-proxies: ["127.0.0.0/8", "10.0.3.0/24"]
+```
+
+`PENDING TEMPLATE` marks a config template that was queued for a node that was offline (or whose rollout was never confirmed); the hub replays it on the next connection, so a value that persists means the template has not been applied successfully yet.
+
 Agent reinstalls back up the overwritten binary, config, server CA and systemd unit, write `config.yaml` with mode `0600`, and retain node data/client PKI. The generated config replaces local settings; restore any required custom rules from the printed backup directory. Changing the hub/name with existing client PKI is refused rather than silently reusing another identity. The installer explicitly restarts the service and reports success only after the authenticated local readiness endpoint confirms a live Hub connection. If readiness fails, installation exits nonzero with a journal/backup hint.
 
 ## Build & run

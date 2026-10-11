@@ -700,6 +700,7 @@ mod tests {
                 tls: Default::default(),
                 secret_key: None,
                 cors_allowed_origins: vec![],
+                trusted_proxies: vec![],
                 session_ttl: None,
                 panel_dir: dir.clone(),
                 auto_confirm_delay_secs: 0,

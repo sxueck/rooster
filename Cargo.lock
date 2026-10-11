@@ -2450,6 +2450,7 @@ dependencies = [
  "humantime-serde",
  "hyper",
  "hyper-util",
+ "ipnet",
  "rand 0.10.3",
  "rcgen",
  "redb",
