@@ -23,6 +23,15 @@ interface NginxGroupRow {
   main: NginxSite
   folded: NginxSite[]
 }
+/** Enable WAF 的门控以 Agent 分类结果为准；未上线该字段的旧 Agent 退回 reason 为空。 */
+function attachable(s: NginxSite): boolean {
+  return s.supported ?? s.reason === null
+}
+/** 有（或可能有）转发的块各自占行，显示自己的 reason；只有确认无转发的
+ *  跳转/ACME/静态块才折进首行——否则被拒绝的原因会被同域名的另一行盖掉。 */
+function foldable(s: NginxSite): boolean {
+  return s.has_proxy_pass === undefined ? !s.upstream : !s.has_proxy_pass
+}
 const nginxRows = computed<NginxGroupRow[]>(() => {
   const groups = new Map<string, NginxSite[]>()
   for (const s of nginxSites.value) {
@@ -33,11 +42,11 @@ const nginxRows = computed<NginxGroupRow[]>(() => {
   }
   const rows: NginxGroupRow[] = []
   for (const [key, list] of groups) {
-    const attachable = list.filter((s) => s.upstream)
-    const shown = attachable.length > 0 ? attachable : [list[0]]
+    const mains = list.filter((s) => attachable(s) || !foldable(s))
+    const shown = mains.length > 0 ? mains : [list[0]]
     shown.forEach((main, i) => {
-      // 可接入的块（有 upstream）必须各自占行保留操作入口；其余全部折进首行。
-      const folded = i === 0 ? list.filter((s) => s !== main && !s.upstream) : []
+      // 可接管块与被拒绝的转发块都必须占行保留操作入口；其余折进首行。
+      const folded = i === 0 ? list.filter((s) => !shown.includes(s)) : []
       rows.push({ key: i === 0 ? key : `${key}:${main.id}`, main, folded })
     })
   }
@@ -73,8 +82,8 @@ const nginxCols: RColumn<NginxGroupRow>[] = [
       RButton,
       {
         variant: 'link',
-        disabled: !m.supported || busy.value !== '',
-        title: m.supported ? undefined : m.reason ?? '',
+        disabled: !attachable(m) || busy.value !== '',
+        title: attachable(m) ? undefined : m.reason ?? '',
         onClick: () => { attachSite.value = m; attachShow.value = true },
       },
       { default: () => '启用 WAF' },

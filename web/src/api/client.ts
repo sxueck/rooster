@@ -469,7 +469,11 @@ export interface NginxLocSummary {
 }
 export interface NginxSite {
   id: string; domains: string[]; listen: string[]; file: string
-  upstream: string | null; supported: boolean; reason: string | null
+  upstream: string | null; reason: string | null
+  /** 分类器判定该 server 块可自动接管；旧 Agent 不上线该字段时按 reason 为空推导 */
+  supported?: boolean
+  /** 该 server 块含（或可能含）proxy_pass；旧 Agent 不返回时按 upstream 推导 */
+  has_proxy_pass?: boolean
   mode: 'off' | 'detect' | 'block'
   status: 'discovered' | 'attached' | 'needs-recovery'
   fingerprint: string

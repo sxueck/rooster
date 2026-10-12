@@ -463,9 +463,12 @@ pub struct NginxSite {
     pub extra_locations: Vec<LocSummary>,
     /// 保留在 Nginx、不经过 WAF 的非代理 location 数量(静态文件/ACME 等)。
     pub bypassed_locations: usize,
-    #[serde(skip)]
+    /// 面板 Enable WAF 的门控，前端直接读它，必须上线。
     pub supported: bool,
     pub reason: Option<String>,
+    /// 该 server 块含（或可能含）proxy_pass。面板据此决定折叠：被拒绝的转发块
+    /// 必须独立成行显示自己的 reason。
+    pub has_proxy_pass: bool,
     pub mode: String,
     pub status: String,
     pub fingerprint: String,
@@ -509,6 +512,20 @@ impl Node {
 
 fn node_named<'a>(nodes: &'a [Node], name: &str) -> Vec<&'a Node> {
     nodes.iter().filter(|n| n.name() == name).collect()
+}
+
+/// 该块内是否可能出现 `proxy_pass`。server 块的 include 展开会因块指令提前失败，
+/// 那时看不到 location 里的转发，所以 location 内的 `include` 一律按“有转发”处理：
+/// 宁可多占一行，也不把拒绝原因折进别的行藏起来。
+fn block_may_proxy(d: &Directive, in_location: bool) -> bool {
+    match d.words.first().map(String::as_str) {
+        Some("proxy_pass") => true,
+        Some("include") => in_location,
+        _ => d.children.as_deref().is_some_and(|kids| {
+            let nested = in_location || d.words[0] == "location";
+            kids.iter().any(|k| block_may_proxy(k, nested))
+        }),
+    }
 }
 
 /// nginx 风格通配:`*` 不跨 `/`,`?` 匹配单个字符。
@@ -1125,6 +1142,7 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
                 extra_locations,
                 bypassed_locations: bypassed,
                 supported: reason.is_none(),
+                has_proxy_pass: block_may_proxy(server, false),
                 reason,
                 mode: "off".into(),
                 status: "discovered".into(),
@@ -1494,6 +1512,8 @@ pub fn snapshot(state: &AgentState) -> Result<Snapshot> {
                     extra_locations: vec![],
                     bypassed_locations: 0,
                     supported: false,
+                    // 能进入 journal 的块原本就有转发，保持独立成行。
+                    has_proxy_pass: true,
                     reason: Some("原站点已移动或删除，请检查接入备份".into()),
                     mode: "off".into(),
                     status: "needs-recovery".into(),

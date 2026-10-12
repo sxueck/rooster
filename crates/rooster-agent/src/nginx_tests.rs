@@ -280,6 +280,35 @@ fn dependency_changes_invalidate_scan_and_attached_plan() {
 }
 
 #[test]
+fn wire_gate_and_fold_flag() {
+    let on = row("server { listen 443 ssl; location / { proxy_pass http://127.0.0.1:3001; } }");
+    let on = serde_json::to_value(on).unwrap();
+    assert_eq!(on["supported"].as_bool(), Some(true), "Enable WAF 靠这个字段门控");
+    assert_eq!(on["has_proxy_pass"].as_bool(), Some(true));
+    assert!(on.get("source").is_none() && on.get("locs").is_none(), "完整配置不出节点");
+
+    // 有转发但被分类器拒绝：必须独立成行，原因不能被折进跳转块。
+    let declined = row("server { listen 443 ssl; location / { rewrite ^ /a; proxy_pass http://127.0.0.1:3001; } }");
+    let declined = serde_json::to_value(declined).unwrap();
+    assert_eq!(declined["supported"].as_bool(), Some(false));
+    assert_eq!(declined["has_proxy_pass"].as_bool(), Some(true));
+
+    // 纯静态/跳转块：无转发，允许折叠。
+    let static_row = serde_json::to_value(row("server { listen 80; location / { root /www; } }")).unwrap();
+    assert_eq!(static_row["has_proxy_pass"].as_bool(), Some(false));
+
+    // proxy_pass 藏在展不开的 snippet 里：按有转发处理。
+    let hidden = discover_sites(&files(&[
+        ("/etc/nginx/sites-enabled/a.conf", "server { listen 443 ssl; location / { include /etc/nginx/proxy_params; } }"),
+        ("/etc/nginx/proxy_params", "proxy_pass http://127.0.0.1:3001; proxy_set_header Host $host;"),
+    ]))
+    .unwrap()
+    .remove(0);
+    assert!(!hidden.supported, "{:?}", hidden.reason);
+    assert!(hidden.has_proxy_pass);
+}
+
+#[test]
 fn legacy_journal_without_context_fingerprint_still_checks_upstream() {
     let r = row("server { location / { proxy_pass http://127.0.0.1:3000; } }");
     let mut j = journal(&r, &r.file);
