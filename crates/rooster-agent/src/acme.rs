@@ -348,6 +348,7 @@ mod tests {
             ja4_deny: vec![],
             redirect_https: None,
             max_body_size: None,
+            upstream_connect_timeout: None,
         };
 
         // 没有缓存 → None(拒绝握手)。

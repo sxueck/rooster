@@ -276,13 +276,23 @@ impl AsyncWrite for BoxedIo {
     }
 }
 
-async fn connect_upstream(tls: bool, host: &str, port: u16, skip_verify: bool) -> io::Result<BoxedIo> {
-    let tcp = match tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect((host, port)),
-    )
-    .await
-    {
+/// 上游连接超时默认值(TCP 连接与 TLS 握手共用);站点未配置
+/// `upstream-connect-timeout` 时维持既有 10s 行为。
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn site_connect_timeout(cfg: &rooster_config::Site) -> Duration {
+    cfg.upstream_connect_timeout
+        .unwrap_or(DEFAULT_UPSTREAM_CONNECT_TIMEOUT)
+}
+
+async fn connect_upstream(
+    tls: bool,
+    host: &str,
+    port: u16,
+    skip_verify: bool,
+    connect_timeout: Duration,
+) -> io::Result<BoxedIo> {
+    let tcp = match tokio::time::timeout(connect_timeout, TcpStream::connect((host, port))).await {
         Ok(r) => r?,
         Err(_) => {
             return Err(io::Error::new(
@@ -302,12 +312,9 @@ async fn connect_upstream(tls: bool, host: &str, port: u16, skip_verify: bool) -
         Err(_) => rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad sni: {e}")))?,
     };
-    let tls_stream = tokio::time::timeout(
-        Duration::from_secs(10),
-        connector.connect(name, tcp),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "upstream tls timeout"))??;
+    let tls_stream = tokio::time::timeout(connect_timeout, connector.connect(name, tcp))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "upstream tls timeout"))??;
     Ok(BoxedIo(Box::new(tls_stream)))
 }
 
@@ -354,30 +361,35 @@ async fn route_plain(
         Some(id) => eff.sites.iter().find(|s| s.cfg.id == id).cloned(),
         None => eff.route(host.as_deref()),
     };
+    // 托管路由(可信回环 X-Rooster-Site,即 nginx 接入):挑战路径属于
+    // 业务源站,本地不再拦截应答;公网直连请求仍由本地 ACME 优先应答。
+    let managed = route_id.is_some();
     let Some(site) = selected else {
         return text(StatusCode::NOT_FOUND, "no site configured\n");
     };
     site.stats.requests.fetch_add(1, Ordering::Relaxed);
 
-    // ACME HTTP-01 在一切站点逻辑之前应答(80 端口)。
-    let path = req.uri().path().to_string();
-    if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-        if token.is_empty() || token.contains('/') {
-            return text(StatusCode::NOT_FOUND, "not found\n");
-        }
-        let key_auth = shared.challenges.lock().unwrap().get(token).cloned();
-        return match key_auth {
-            Some(k) => {
-                tracing::info!(token = %token, "acme http-01 challenge answered");
-                let mut resp = full(Bytes::from(k));
-                resp.headers_mut().insert(
-                    http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/plain"),
-                );
-                resp
+    if !managed {
+        // ACME HTTP-01 在一切站点逻辑之前应答(80 端口,仅非托管路由)。
+        let path = req.uri().path().to_string();
+        if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+            if token.is_empty() || token.contains('/') {
+                return text(StatusCode::NOT_FOUND, "not found\n");
             }
-            None => text(StatusCode::NOT_FOUND, "not found\n"),
-        };
+            let key_auth = shared.challenges.lock().unwrap().get(token).cloned();
+            return match key_auth {
+                Some(k) => {
+                    tracing::info!(token = %token, "acme http-01 challenge answered");
+                    let mut resp = full(Bytes::from(k));
+                    resp.headers_mut().insert(
+                        http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/plain"),
+                    );
+                    resp
+                }
+                None => text(StatusCode::NOT_FOUND, "not found\n"),
+            };
+        }
     }
 
     // 站点开关控制 80 → 443 跳转(v1 默认关闭)。
@@ -844,7 +856,15 @@ async fn handle_site_request(
     };
 
     // 连上游 + HTTP/1.1 握手(每请求一条连接,无连接池)。
-    let io_stream = match connect_upstream(up.tls, &up.host, up.port, skip_verify).await {
+    let io_stream = match connect_upstream(
+        up.tls,
+        &up.host,
+        up.port,
+        skip_verify,
+        site_connect_timeout(&site.cfg),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(site = %site.cfg.id, upstream = %up.authority(), error = %e, "upstream connect failed");
@@ -1173,6 +1193,55 @@ mod tests {
         let uri: http::Uri = "http://[2001:db8::1]:8080/x".parse().unwrap();
         let h = request_host(&HeaderMap::new(), &uri).unwrap();
         assert_eq!(strip_port(&h), "2001:db8::1");
+    }
+
+    #[test]
+    fn site_connect_timeout_defaults_and_override() {
+        let mut cfg = rooster_config::Site {
+            id: "s".to_string(),
+            server_names: vec!["s.test".to_string()],
+            tls: Default::default(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            waf: None,
+            rate_limit: vec![],
+            geo: None,
+            proxy_protocol: None,
+            ja4_deny: vec![],
+            redirect_https: None,
+            max_body_size: None,
+            upstream_connect_timeout: None,
+        };
+        assert_eq!(
+            site_connect_timeout(&cfg),
+            Duration::from_secs(10),
+            "unconfigured site must keep the 10s default"
+        );
+        cfg.upstream_connect_timeout = Some(Duration::from_secs(60));
+        assert_eq!(site_connect_timeout(&cfg), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn upstream_connect_timeout_applies_to_stalled_tls_handshake() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        // 接受连接但不读不写:TCP 三次握手成功,ServerHello 永远不来。
+        let _hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s);
+            }
+        });
+        let started = std::time::Instant::now();
+        let err = connect_upstream(true, "127.0.0.1", port, true, Duration::from_millis(300))
+            .await
+            .err()
+            .expect("stalled tls upstream must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "short timeout must fire fast, took {elapsed:?}"
+        );
     }
 }
 

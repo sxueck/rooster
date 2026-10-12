@@ -88,6 +88,7 @@ fn site(id: &str, names: &[&str], upstream: &str) -> Site {
         ja4_deny: vec![],
         redirect_https: None,
         max_body_size: None,
+        upstream_connect_timeout: None,
     }
 }
 
@@ -529,7 +530,108 @@ async fn acme_challenge() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. WAF 模式:block 拦截 / detect 只记录 / 排除列表抵消拦截
+// 3b. 托管路由(nginx X-Rooster-Site)下的 ACME 路径必须转发给业务上游
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_route_forwards_acme_path_to_upstream() {
+    let (up, hits) = echo_upstream().await;
+    let port = free_port();
+    let rt = HttpGuardRuntime::new(None);
+    rt.apply(HttpGuardSettings {
+        listen_http: Some(listen_on(port)),
+        listen_https: None,
+        sites: vec![site("mgmt", &["mgmt.test"], &format!("http://{up}"))],
+        trusted_proxies: vec!["127.0.0.1/32".to_string()],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: Default::default(),
+    })
+    .await;
+    rt.set_challenge("tok123".to_string(), "keyauth-xyz".to_string());
+
+    let client = client();
+    // 托管路由:可信回环 + X-Rooster-Site——即使 token 已注册,挑战路径也
+    // 必须交给业务源站,不得本地拦截应答(业务源自己的 ACME 会回应)。
+    let resp = tokio::time::timeout(TIMEOUT, client
+        .get(format!("http://127.0.0.1:{port}/.well-known/acme-challenge/tok123"))
+        .header("host", "mgmt.test")
+        .header("x-rooster-site", "mgmt")
+        .send())
+    .await
+    .expect("managed acme request within 5s")
+    .expect("managed acme request ok");
+    assert_eq!(resp.status(), 200, "managed acme path must reach upstream");
+    let text = resp.text().await.expect("echo json body");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("upstream echo json, not local key auth");
+    assert_eq!(
+        json["uri"],
+        "/.well-known/acme-challenge/tok123",
+        "challenge path must be forwarded verbatim"
+    );
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+
+    // 同一公网形状但无托管头:本地 ACME 仍生效,未注册 token 保持 404。
+    let resp = tokio::time::timeout(TIMEOUT, client
+        .get(format!("http://127.0.0.1:{port}/.well-known/acme-challenge/unknown"))
+        .header("host", "mgmt.test")
+        .send())
+    .await
+    .expect("public unknown token within 5s")
+    .expect("public unknown token ok");
+    assert_eq!(resp.status(), 404, "ordinary unknown token stays local 404");
+    assert_eq!(hits.load(Ordering::Relaxed), 1, "404 must not touch upstream");
+    rt.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 3c. 站点 upstream-connect-timeout:短超时必须按时以 502 暴露(stalled TLS)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn short_upstream_connect_timeout_fails_fast() {
+    // stalled TLS 上游:accept 后不应答,握手永远完不成。
+    let l = TcpListener::bind("127.0.0.1:0").await.expect("bind stalled upstream");
+    let up = l.local_addr().expect("stalled upstream addr");
+    let _hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            held.push(s);
+        }
+    });
+    let port = free_port();
+    let rt = HttpGuardRuntime::new(None);
+    let mut s = site("slow", &["slow.test"], &format!("https://{up}"));
+    s.tls.skip_verify = true;
+    s.upstream_connect_timeout = Some(Duration::from_millis(300));
+    rt.apply(HttpGuardSettings {
+        listen_http: Some(listen_on(port)),
+        listen_https: None,
+        sites: vec![s],
+        trusted_proxies: vec![],
+        geoip_db: None,
+        body_limit: 0,
+        ban_hook: None,
+        hardening: Default::default(),
+    })
+    .await;
+
+    let client = client();
+    let started = std::time::Instant::now();
+    let resp = tokio::time::timeout(TIMEOUT, client
+        .get(format!("http://127.0.0.1:{port}/x"))
+        .header("host", "slow.test")
+        .send())
+    .await
+    .expect("stalled upstream request within 5s")
+    .expect("stalled upstream request ok");
+    assert_eq!(resp.status(), 502, "stalled tls upstream must yield 502");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "300ms site timeout must fire fast, took {:?}",
+        started.elapsed()
+    );
+    rt.shutdown().await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn waf_modes_and_exclusions() {

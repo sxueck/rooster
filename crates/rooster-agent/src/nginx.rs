@@ -219,6 +219,7 @@ fn read_bounded(mut reader: impl Read) -> Result<String> {
 
 #[derive(Clone, Debug)]
 struct Token {
+    symbol: Option<u8>,
     value: String,
     start: usize,
     end: usize,
@@ -242,6 +243,7 @@ fn tokens(source: &str) -> Result<Vec<Token>> {
         if b"{};".contains(&b[i]) {
             i += 1;
             out.push(Token {
+                symbol: Some(b[start]),
                 value: source[start..i].into(),
                 start,
                 end: i,
@@ -257,22 +259,30 @@ fn tokens(source: &str) -> Result<Vec<Token>> {
                 if i == b.len() {
                     return Err("unterminated nginx escape".into());
                 }
-                // Preserve escapes in quoted values when rendering inherited directives.
-                value.push(b'\\');
-                value.push(b[i]);
+                match b[i] {
+                    b't' => value.push(b'\t'),
+                    b'r' => value.push(b'\r'),
+                    b'n' => value.push(b'\n'),
+                    b'\\' | b'\'' | b'"' => value.push(b[i]),
+                    c => {
+                        value.push(b'\\');
+                        value.push(c);
+                    }
+                }
                 i += 1;
                 continue;
             }
             if let Some(q) = quote {
                 if c == q {
                     quote = None;
-                } else {
-                    value.push(c);
+                    i += 1;
+                    break;
                 }
+                value.push(c);
                 i += 1;
                 continue;
             }
-            if c == b'\'' || c == b'"' {
+            if i == start && (c == b'\'' || c == b'"') {
                 quote = Some(c);
                 i += 1;
                 continue;
@@ -288,7 +298,7 @@ fn tokens(source: &str) -> Result<Vec<Token>> {
                 i = end;
                 continue;
             }
-            if c.is_ascii_whitespace() || b"{};#".contains(&c) {
+            if c.is_ascii_whitespace() || b"{;".contains(&c) {
                 break;
             }
             value.push(c);
@@ -298,6 +308,7 @@ fn tokens(source: &str) -> Result<Vec<Token>> {
             return Err("unterminated nginx quote".into());
         }
         out.push(Token {
+            symbol: None,
             value: String::from_utf8(value).map_err(|e| e.to_string())?,
             start,
             end: i,
@@ -319,7 +330,7 @@ fn parse(source: &str) -> Result<Vec<Directive>> {
         }
         let mut out = Vec::new();
         while *i < ts.len() {
-            if ts[*i].value == "}" {
+            if ts[*i].symbol == Some(b'}') {
                 if !nested {
                     return Err("unexpected nginx closing brace".into());
                 }
@@ -328,19 +339,19 @@ fn parse(source: &str) -> Result<Vec<Directive>> {
             }
             let start = ts[*i].start;
             let mut words = Vec::new();
-            while *i < ts.len() && !["{", "}", ";"].contains(&ts[*i].value.as_str()) {
+            while *i < ts.len() && ts[*i].symbol.is_none() {
                 words.push(ts[*i].value.clone());
                 *i += 1;
             }
             if words.is_empty() || *i == ts.len() {
                 return Err("incomplete nginx directive".into());
             }
-            let children = match ts[*i].value.as_str() {
-                ";" => {
+            let children = match ts[*i].symbol {
+                Some(b';') => {
                     *i += 1;
                     None
                 }
-                "{" => {
+                Some(b'{') => {
                     *i += 1;
                     Some(block(ts, i, true, depth + 1)?)
                 }
@@ -416,6 +427,8 @@ struct LocPlan {
     /// location 内是否有自己的 proxy_set_header(决定注入时是否物化继承头)。
     own_headers: bool,
     redirect_off: bool,
+    proxy_port: String,
+    connect_timeout: Duration,
     /// 接入时对原文件的补充改写($proxy_host 字面量化等)。
     fixups: Vec<Fixup>,
 }
@@ -500,16 +513,10 @@ fn node_named<'a>(nodes: &'a [Node], name: &str) -> Vec<&'a Node> {
 
 /// nginx 风格通配:`*` 不跨 `/`,`?` 匹配单个字符。
 fn glob_match(pat: &str, text: &str) -> bool {
-    fn m(p: &[u8], t: &[u8]) -> bool {
-        match (p.first(), t.first()) {
-            (None, _) => t.is_empty(),
-            (_, None) => p == b"*",
-            (Some(b'*'), _) => m(&p[1..], t) || (!t.is_empty() && t[0] != b'/' && m(p, &t[1..])),
-            (Some(b'?'), _) => !t.is_empty() && t[0] != b'/' && m(&p[1..], &t[1..]),
-            (Some(c), Some(x)) => c == x && m(&p[1..], &t[1..]),
-        }
-    }
-    m(pat.as_bytes(), text.as_bytes())
+    let (Ok(pat), Ok(text)) = (std::ffi::CString::new(pat), std::ffi::CString::new(text)) else {
+        return false;
+    };
+    unsafe { libc::fnmatch(pat.as_ptr(), text.as_ptr(), libc::FNM_PATHNAME | libc::FNM_PERIOD) == 0 }
 }
 
 /// include 目标解析:只在 `nginx -T` 转储出的文件里查找,绝不按调用方给的
@@ -530,7 +537,7 @@ impl Includes {
             self.prefix.join(spec)
         };
         let pat = pat.to_string_lossy().to_string();
-        let wild = pat.contains('*') || pat.contains('?');
+        let wild = pat.contains(['*', '?', '[']);
         let mut hits: Vec<(PathBuf, Arc<String>)> = self
             .files
             .iter()
@@ -598,48 +605,21 @@ fn http_context(inc: &Includes) -> HttpCtx {
         return ctx;
     };
     let main_src = inc.files[main].clone();
-    let mut queue: Vec<(Vec<Directive>, Arc<String>)> =
-        vec![(http.children.clone().unwrap_or_default(), main_src)];
-    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    while let Some((kids, src)) = queue.pop() {
-        for d in &kids {
-            let name = d.words[0].as_str();
-            if name == "include" {
-                let Some(spec) = d.words.get(1) else {
-                    ctx.ambiguous = true;
-                    continue;
-                };
-                let targets = match inc.resolve(spec) {
-                    Ok(t) => t,
-                    Err(_) => {
-                        ctx.ambiguous = true;
-                        continue;
-                    }
-                };
-                for (path, text) in targets {
-                    if !seen.insert(path.clone()) {
-                        continue;
-                    }
-                    match parse(&text) {
-                        Ok(k) => queue.push((k, text)),
-                        Err(_) => ctx.ambiguous = true,
-                    }
-                }
-                continue;
-            }
-            if name == "proxy_set_header" {
-                ctx.headers.push(Node {
-                    d: d.clone(),
-                    src: src.clone(),
-                    via: None,
-                });
-            } else if name == "http"
-                || (name.starts_with("proxy_") && name != "proxy_set_header")
-                || (d.children.is_none()
-                    && mentions_proxy_vars(&src[d.start..d.end]))
-            {
-                ctx.complex = true;
-            }
+    let nodes = match expand_scope(http.children.as_deref().unwrap_or(&[]), &main_src, inc, true) {
+        Ok(nodes) => nodes,
+        Err(_) => {
+            ctx.ambiguous = true;
+            return ctx;
+        }
+    };
+    for n in nodes {
+        if n.name() == "proxy_set_header" {
+            ctx.headers.push(n);
+        } else if n.name() == "http"
+            || (n.name().starts_with("proxy_") && n.name() != "proxy_set_header")
+            || (n.d.children.is_none() && mentions_proxy_vars(n.text()))
+        {
+            ctx.complex = true;
         }
     }
     ctx
@@ -648,32 +628,39 @@ fn http_context(inc: &Includes) -> HttpCtx {
 /// 展开本层 include,返回该层生效的指令列表。目标不可定位、含嵌套块或含
 /// 变量时返回 Err,由调用方按复杂配置拒绝。
 fn scope(kids: &[Directive], src: &Arc<String>, inc: &Includes) -> Result<Vec<Node>> {
-    let mut out = Vec::new();
-    for d in kids {
-        if d.words[0] != "include" {
-            out.push(Node {
-                d: d.clone(),
-                src: src.clone(),
-                via: None,
-            });
-            continue;
-        }
-        let Some(spec) = d.words.get(1) else {
-            return Err("include 缺少目标,需要手动接入".into());
-        };
-        for (_path, text) in inc.resolve(spec)? {
-            for k in parse(&text)? {
-                if k.children.is_some() {
-                    return Err(format!("include {spec} 内含块指令,需要手动接入"));
+    expand_scope(kids, src, inc, false)
+}
+
+fn expand_scope(kids: &[Directive], src: &Arc<String>, inc: &Includes, allow_blocks: bool) -> Result<Vec<Node>> {
+    fn walk(
+        kids: &[Directive], src: &Arc<String>, inc: &Includes, allow_blocks: bool,
+        via: Option<&Directive>, stack: &mut BTreeSet<PathBuf>, budget: &mut usize,
+        out: &mut Vec<Node>,
+    ) -> Result<()> {
+        for d in kids {
+            if d.words[0] != "include" {
+                if via.is_some() && !allow_blocks && d.children.is_some() {
+                    return Err("include 内含块指令,需要手动接入".into());
                 }
-                out.push(Node {
-                    d: k,
-                    src: text.clone(),
-                    via: Some(d.clone()),
-                });
+                out.push(Node { d: d.clone(), src: src.clone(), via: via.cloned() });
+                continue;
+            }
+            let spec = d.words.get(1).ok_or("include 缺少目标,需要手动接入")?;
+            for (path, text) in inc.resolve(spec)? {
+                if stack.len() >= 64 || !stack.insert(path.clone()) {
+                    return Err("include 链循环或超过 64 层,需要手动接入".into());
+                }
+                *budget = budget.checked_sub(text.len()).ok_or("include 展开超过 4 MiB,需要手动接入")?;
+                // Nested includes retain the outer local span, so shared files are never edited.
+                walk(&parse(&text)?, &text, inc, allow_blocks, via.or(Some(d)), stack, budget, out)?;
+                stack.remove(&path);
             }
         }
+        Ok(())
     }
+    let mut out = Vec::new();
+    let mut budget = MAX_CONFIG;
+    walk(kids, src, inc, allow_blocks, None, &mut BTreeSet::new(), &mut budget, &mut out)?;
     Ok(out)
 }
 
@@ -714,6 +701,34 @@ fn proxy_port(upstream: &str) -> String {
         "80"
     }
     .into()
+}
+
+fn inherited_connect_timeout(location: &[Node], server: &[Node]) -> Result<Duration> {
+    let directive = node_named(location, "proxy_connect_timeout").first().copied()
+        .or_else(|| node_named(server, "proxy_connect_timeout").first().copied());
+    let Some(value) = directive.and_then(|n| n.words().get(1)) else {
+        return Ok(Duration::from_secs(60));
+    };
+    let mut rest = value.as_str();
+    let mut millis = 0u64;
+    while !rest.trim().is_empty() {
+        rest = rest.trim_start();
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let number = rest[..digits].parse::<u64>().map_err(|_| "proxy_connect_timeout 无法解析")?;
+        rest = &rest[digits..];
+        let (scale, suffix) = if rest.starts_with("ms") { (1, 2) }
+            else if rest.starts_with('s') { (1000, 1) }
+            else if rest.starts_with('m') { (60_000, 1) }
+            else if rest.starts_with('h') { (3_600_000, 1) }
+            else if rest.starts_with('d') { (86_400_000, 1) }
+            else if rest.starts_with('w') { (604_800_000, 1) }
+            else if rest.trim().is_empty() { (1000, 0) }
+            else { return Err("proxy_connect_timeout 无法解析".into()); };
+        millis = number.checked_mul(scale).and_then(|v| millis.checked_add(v))
+            .ok_or("proxy_connect_timeout 超出范围")?;
+        rest = &rest[suffix..];
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 fn line_indent(source: &str, start: usize) -> String {
@@ -813,7 +828,8 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
         prefix,
     };
     let ctx = http_context(&inc);
-    let groups = upstream_groups(files);
+    let groups = upstream_groups(&inc).unwrap_or_default();
+    let fingerprint = hash_content(&serde_json::to_string(files).map_err(|e| e.to_string())?);
     let mut rows = Vec::new();
     for (path, source) in files {
         let file_src = inc
@@ -912,7 +928,15 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
                     continue;
                 }
                 if proxies.is_empty() {
-                    bypassed += 1;
+                    if lk.iter().any(|n| {
+                        n.d.children.is_some()
+                            || ["fastcgi_pass", "grpc_pass", "uwsgi_pass", "scgi_pass", "memcached_pass"].contains(&n.name())
+                            || n.name().contains("_by_lua") || n.name().starts_with("js_")
+                    }) {
+                        reason = Some(format!("{label} 含嵌套块或动态处理，需要手动接入"));
+                    } else {
+                        bypassed += 1;
+                    }
                     continue;
                 }
                 if reason.is_none() && proxies.len() != 1 {
@@ -990,8 +1014,16 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
                 }) {
                     reason = Some("内部路由头或自定义客户端来源头需要手动接入".into());
                 }
+                let original_port = proxy_port(proxy.words().get(1).map(String::as_str).unwrap_or_default());
+                let connect_timeout = match inherited_connect_timeout(&lk, &server_nodes) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        reason = Some(format!("{label}: {e}"));
+                        continue;
+                    }
+                };
                 let fixups = if reason.is_none() {
-                    proxy_host_fixups(&lk, &proxy_host, &proxy_port(&upstream), &format!("{id}-l{ordinal}"), source)
+                    proxy_host_fixups(&lk, &proxy_host, &original_port, &format!("{id}-l{ordinal}"), source)
                 } else {
                     Vec::new()
                 };
@@ -1008,9 +1040,11 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
                     proxy_uri,
                     headers,
                     own_headers: !own_headers.is_empty(),
-                    redirect_off: node_named(&lk, "proxy_redirect")
-                        .iter()
-                        .any(|n| n.words() == ["proxy_redirect", "off"]),
+                    redirect_off: node_named(&lk, "proxy_redirect").first().copied()
+                        .or_else(|| node_named(&server_nodes, "proxy_redirect").first().copied())
+                        .is_some_and(|n| n.words() == ["proxy_redirect", "off"]),
+                    proxy_port: original_port,
+                    connect_timeout,
                     fixups,
                 });
             }
@@ -1024,28 +1058,46 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
             if reason.is_none() && ctx.complex && !locs.is_empty() {
                 reason = Some("HTTP 层包含 proxy_set_header 之外的代理设置，需要手动接入".into());
             }
-            if reason.is_none()
-                && server_nodes
-                    .iter()
-                    .any(|n| {
-                        [
-                            "rewrite",
-                            "if",
-                            "set",
-                            "try_files",
-                            "error_page",
-                            "return",
-                        ]
-                        .contains(&n.name())
-                            || n.name().contains("_by_lua")
-                            || n.name().starts_with("js_")
-                            || (n.name().starts_with("proxy_") && n.name() != "proxy_set_header")
-                            || (n.d.children.is_none()
-                                && n.name() != "proxy_set_header"
-                                && mentions_proxy_vars(n.text()))
-                    })
-            {
-                reason = Some("存在 include、重写、缓存或其他复杂指令，需要手动接入".into());
+            // Origin connect timeout is copied into the guard; cache/failover cannot be preserved.
+            const SERVER_SAFE_PROXY: [&str; 11] = [
+                "proxy_http_version",
+                "proxy_connect_timeout",
+                "proxy_send_timeout",
+                "proxy_read_timeout",
+                "proxy_buffering",
+                "proxy_buffers",
+                "proxy_buffer_size",
+                "proxy_busy_buffers_size",
+                "proxy_max_temp_file_size",
+                "proxy_request_buffering",
+                "proxy_redirect",
+            ];
+            if reason.is_none() {
+                let bad = server_nodes.iter().find(|n| {
+                    let proxy_unsafe = n.name().starts_with("proxy_")
+                        && n.name() != "proxy_set_header"
+                        && (!SERVER_SAFE_PROXY.contains(&n.name())
+                            || (n.name() == "proxy_redirect"
+                                && n.words() != ["proxy_redirect", "off"]));
+                    [
+                        "rewrite",
+                        "if",
+                        "set",
+                        "try_files",
+                        "error_page",
+                        "return",
+                    ]
+                    .contains(&n.name())
+                        || n.name().contains("_by_lua")
+                        || n.name().starts_with("js_")
+                        || proxy_unsafe
+                        || (n.d.children.is_none()
+                            && n.name() != "proxy_set_header"
+                            && mentions_proxy_vars(n.text()))
+                });
+                if let Some(n) = bad {
+                    reason = Some(format!("server 级 {} 需要手动接入", n.name()));
+                }
             }
             // 主 location（吮底 location /）排在首位，用块 id 作站点 id；
             // 其余依次追加 -l<ordinal>。
@@ -1076,7 +1128,7 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
                 reason,
                 mode: "off".into(),
                 status: "discovered".into(),
-                fingerprint: hash_content(source),
+                fingerprint: fingerprint.clone(),
                 source: source.clone(),
                 locs,
             });
@@ -1086,27 +1138,37 @@ fn discover_sites(files: &BTreeMap<PathBuf, String>) -> Result<Vec<NginxSite>> {
 }
 /// nginx -T 全量配置里的 `upstream` 组：组名 -> (server 地址， 是否不可安全接管)。
 /// down/backup 标记与 unix socket 都让该组不可自动解析。
-fn upstream_groups(files: &BTreeMap<PathBuf, String>) -> BTreeMap<String, Vec<(String, bool)>> {
+fn upstream_groups(inc: &Includes) -> Result<BTreeMap<String, Vec<(String, bool)>>> {
     let mut out = BTreeMap::new();
-    for source in files.values() {
-        let Ok(ns) = parse(source) else { continue };
-        let mut walk: Vec<&Directive> = ns.iter().collect();
-        // upstream 组与 http{} 平级或嵌套在 http{} 内，两种形态都收。
-        walk.extend(ns.iter().filter_map(|n| n.children.as_deref()).flatten());
-        for node in walk {
-            if node.words[0] != "upstream" || node.words.len() != 2 {
-                continue;
-            }
-            let Some(kids) = node.children.as_deref() else { continue };
-            let entry: &mut Vec<(String, bool)> = out.entry(node.words[1].clone()).or_default();
-            for s in kids.iter().filter(|n| n.words[0] == "server" && n.words.len() >= 2) {
-                let flagged = s.words[1].starts_with("unix:")
-                    || s.words[2..].iter().any(|w| w == "down" || w == "backup");
-                entry.push((s.words[1].clone(), flagged));
+    let mut http_nodes = Vec::new();
+    let mut fragments = Vec::new();
+    let mut has_http = false;
+    for source in inc.files.values() {
+        let ns = parse(source)?;
+        for n in ns {
+            if n.words[0] == "http" {
+                has_http = true;
+                http_nodes.extend(expand_scope(n.children.as_deref().unwrap_or(&[]), source, inc, true)?);
+            } else if n.words[0] == "upstream" {
+                fragments.push(Node { d: n, src: source.clone(), via: None });
             }
         }
     }
-    out
+    // Fragment-only tests have no HTTP root; a full dump must follow its HTTP include graph.
+    for n in if has_http { http_nodes } else { fragments } {
+        let node = &n.d;
+        if node.words[0] != "upstream" || node.words.len() != 2 {
+            continue;
+        }
+        let Some(kids) = node.children.as_deref() else { continue };
+        let entry: &mut Vec<(String, bool)> = out.entry(node.words[1].clone()).or_default();
+        for s in kids.iter().filter(|n| n.words[0] == "server" && n.words.len() >= 2) {
+            let flagged = s.words[1].starts_with("unix:")
+                || s.words[2..].iter().any(|w| w == "down" || w == "backup");
+            entry.push((s.words[1].clone(), flagged));
+        }
+    }
+    Ok(out)
 }
 
 /// 把 proxy_pass 的上游解析为可转发字面量，返回 (带 scheme 的上游， nginx $proxy_host)。
@@ -1178,6 +1240,8 @@ fn resolve_upstream(
 struct JournalSpan {
     site_id: String,
     upstream: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_fingerprint: Option<String>,
     /// 原 proxy_pass 指令原文。
     original: String,
     /// 注入片段(含 begin/end 标记,每 location 一段)。
@@ -1232,6 +1296,7 @@ impl Journal {
             (Some(original), Some(injected)) => vec![JournalSpan {
                 site_id: self.id.clone(),
                 upstream: self.upstream.clone(),
+                context_fingerprint: None,
                 original: original.clone(),
                 injected: injected.clone(),
                 fixups: Vec::new(),
@@ -1341,20 +1406,17 @@ pub fn snapshot(state: &AgentState) -> Result<Snapshot> {
             // 接入面必须与 journal spans 完全一致:接入后新增的 proxy location
             // 不在 spans 内,流量会绕过 WAF 而面板仍显示已接入。
             let spans_match_locations = restored_site.as_ref().is_some_and(|s| {
-                let ids = s
-                    .locs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| p.site_id(&s.id, i == 0))
-                    .collect::<Vec<_>>();
-                ids.len() == spans.len()
-                    && ids.iter().zip(spans.iter()).all(|(id, sp)| *id == sp.site_id)
+                spans_match_site(s, &spans)
             });
             let sites_ok = !spans.is_empty()
                 && spans.iter().all(|sp| {
                     eff.sites.iter().any(|s| {
                         s.id == sp.site_id
                             && s.upstream == sp.upstream
+                            && (sp.context_fingerprint.is_none() || restored_site.as_ref().is_some_and(|r| {
+                                r.locs.iter().enumerate().any(|(i, p)| p.site_id(&r.id, i == 0) == sp.site_id
+                                    && s.upstream_connect_timeout == Some(p.connect_timeout))
+                            }))
                             && s.waf.as_ref().is_some_and(|w| w.mode != WafMode::Off)
                     })
                 });
@@ -1517,7 +1579,7 @@ fn injection(plan: &LocPlan, site_id: &str, listener: &str) -> Result<String> {
             }) {
                 continue;
             }
-            out.push_str(&substitute_proxy_vars(h.text(), proxy_host, &proxy_port(&plan.upstream)));
+            out.push_str(&substitute_proxy_vars(h.text(), proxy_host, &plan.proxy_port));
             out.push('\n');
         }
     }
@@ -1711,6 +1773,7 @@ pub fn change(
         original: String,
         injected: String,
         fixups: Vec<Fixup>,
+        context_fingerprint: String,
     }
     let listener_port = listener
         .parse::<std::net::SocketAddr>()
@@ -1746,7 +1809,7 @@ pub fn change(
         // https 上游默认 skip-verify：nginx 本就不校验上游证书，接入不应
         // 改变现有转发语义（内网自签源站若无此项会直接 502）。
         let skip_verify = plan.upstream.starts_with("https://");
-        let site: Site = serde_json::from_value(json!({"id": site_id, "server-names": row.domains, "tls": {"mode": "terminate", "skip-verify": skip_verify}, "upstream": plan.upstream, "waf": {"mode": mode_name(mode)}})).map_err(|e| e.to_string())?;
+        let site: Site = serde_json::from_value(json!({"id": site_id, "server-names": row.domains, "tls": {"mode": "terminate", "skip-verify": skip_verify}, "upstream": plan.upstream, "upstream-connect-timeout": format!("{}ms", plan.connect_timeout.as_millis()), "waf": {"mode": mode_name(mode)}})).map_err(|e| e.to_string())?;
         sites.push(site);
         prepared.push(Prepared {
             start: plan.proxy.start,
@@ -1756,6 +1819,7 @@ pub fn change(
             original,
             injected,
             fixups: plan.fixups.clone(),
+            context_fingerprint: plan_fingerprint(plan),
         });
     }
     // 多段注入从后往前拼接,前面的字节偏移不被破坏。prepared 按文档序
@@ -1789,6 +1853,7 @@ pub fn change(
             .map(|p| JournalSpan {
                 site_id: p.site_id,
                 upstream: p.upstream,
+                context_fingerprint: Some(p.context_fingerprint),
                 original: p.original,
                 injected: p.injected,
                 fixups: p.fixups,
@@ -1802,8 +1867,11 @@ pub fn change(
     let outcome = (|| {
         apply(&state, &raw, &new_raw, &rt)?;
         verify(&state, &site_ids, &listener, mode, &rt)?;
-        if fs::read_to_string(&j.file).map_err(|e| e.to_string())? != source {
-            return Err("Nginx configuration changed; aborted".into());
+        for (path, dumped) in &files {
+            let current = fs::read_to_string(path).map_err(|e| e.to_string())?;
+            if current != *dumped && format!("{current}\n") != *dumped {
+                return Err("Nginx configuration changed; aborted".into());
+            }
         }
         atomic_write(&j.file, changed.as_bytes(), false)?;
         j.instance.reload()?;
@@ -1923,6 +1991,24 @@ fn verify(
         Ok(())
     })
 }
+fn plan_fingerprint(plan: &LocPlan) -> String {
+    hash_content(&json!({
+        "upstream": plan.upstream, "host": plan.proxy_host, "port": plan.proxy_port,
+        "uri": plan.proxy_uri, "location": plan.location_path, "redirect-off": plan.redirect_off,
+        "timeout-ms": plan.connect_timeout.as_millis().to_string(),
+        "own-headers": plan.own_headers,
+        "headers": plan.headers.iter().map(Node::words).collect::<Vec<_>>()
+    }).to_string())
+}
+
+fn spans_match_site(site: &NginxSite, spans: &[JournalSpan]) -> bool {
+    site.locs.len() == spans.len() && site.locs.iter().enumerate().zip(spans).all(|((i, plan), sp)| {
+        plan.site_id(&site.id, i == 0) == sp.site_id
+            && plan.upstream == sp.upstream
+            && sp.context_fingerprint.as_ref().is_none_or(|f| *f == plan_fingerprint(plan))
+    })
+}
+
 fn restore_all(j: &Journal, source: &str) -> String {
     let mut restored = source.to_string();
     for (original, injected) in j.fragments() {
@@ -1935,9 +2021,12 @@ fn restored_site(
     j: &Journal,
     current: &str,
 ) -> Result<Option<NginxSite>> {
-    // Keep include/upstream context and other servers' injections intact.
+    // IDs belong to dump paths, not canonical write targets (sites-enabled is often a symlink).
+    let Some(row) = discover_sites(files)?.into_iter().find(|s| s.id == j.id) else {
+        return Ok(None);
+    };
     let mut restored = files.clone();
-    restored.insert(j.file.clone(), restore_all(j, current));
+    restored.insert(PathBuf::from(row.file), restore_all(j, current));
     Ok(discover_sites(&restored)?.into_iter().find(|s| s.id == j.id))
 }
 fn restore_fragment(j: &Journal) -> Result<()> {
@@ -2056,6 +2145,28 @@ mod tests {
     #[test]
     fn excludes_ambiguous_routing_and_upstreams() {
         for conf in ["server { location / { proxy_pass http://backend; } }", "server { location / { proxy_pass http://$upstream:3000; } }", "server { location / { rewrite ^ /a; proxy_pass http://127.0.0.1:3000; } }", "server { location / { proxy_pass http://127.0.0.1:3000/x?a=1; } }"] { assert!(!rows(conf)[0].supported, "{conf}"); }
+    }
+    #[test]
+    fn server_level_hop_quality_proxy_directives_stay_supported() {
+        let r = rows("server { listen 443 ssl; proxy_connect_timeout 60s; proxy_send_timeout 600s; proxy_read_timeout 600s; proxy_buffering on; proxy_request_buffering off; location / { proxy_pass http://127.0.0.1:3001; } }");
+        assert!(r[0].supported, "{:?}", r[0].reason);
+    }
+    #[test]
+    fn server_level_semantic_directives_decline_with_directive_name() {
+        for (conf, directive) in [
+            ("server { proxy_next_upstream error timeout; location / { proxy_pass http://127.0.0.1:3001; } }", "proxy_next_upstream"),
+            ("server { proxy_intercept_errors on; location / { proxy_pass http://127.0.0.1:3001; } }", "proxy_intercept_errors"),
+            ("server { proxy_redirect http://old.example/ http://new.example/; location / { proxy_pass http://127.0.0.1:3001; } }", "proxy_redirect"),
+            ("server { set $flag 1; location / { proxy_pass http://127.0.0.1:3001; } }", "set"),
+        ] {
+            let r = rows(conf);
+            assert!(!r[0].supported, "{conf}");
+            assert_eq!(
+                r[0].reason.as_deref(),
+                Some(format!("server 级 {directive} 需要手动接入").as_str()),
+                "{conf}"
+            );
+        }
     }
     #[test]
     fn proxy_pass_uri_prefix_is_preserved_on_the_loopback_hop() {
@@ -2246,6 +2357,7 @@ mod tests {
             spans: vec![JournalSpan {
                 site_id: r[0].id.clone(),
                 upstream: r[0].locs[0].upstream.clone(),
+                context_fingerprint: Some(plan_fingerprint(&r[0].locs[0])),
                 original: files[&PathBuf::from("/etc/nginx/sites-enabled/a.conf")][r[0].locs[0].proxy.start..r[0].locs[0].proxy.end].to_string(),
                 injected: inj,
                 fixups: r[0].locs[0].fixups.clone(),
@@ -2351,6 +2463,7 @@ mod tests {
             .map(|(start, end, injected)| JournalSpan {
                 site_id: String::new(),
                 upstream: String::new(),
+                context_fingerprint: None,
                 original: source[start..end].to_string(),
                 injected,
                 fixups: Vec::new(),
@@ -2544,6 +2657,10 @@ fn block_id_of(id: &str) -> &str {
 }
 
 #[cfg(test)]
+#[path = "nginx_tests.rs"]
+mod regression_tests;
+
+#[cfg(test)]
 mod lifecycle_tests {
     use super::*;
     use crate::management::auth::AuthGate;
@@ -2602,9 +2719,12 @@ mod lifecycle_tests {
         });
         let port = free_port();
         let source = format!("# preserved comment\nuser root root; worker_processes 1; pid {}/nginx.pid; error_log {}/error.log; events {{ worker_connections 64; }} http {{ access_log off; proxy_set_header Host $host; proxy_set_header X-Inherited 'kept; value'; proxy_set_header X-Observed-Client $remote_addr; server {{ listen 127.0.0.1:{port}; server_name a.test; location / {{ include {}/proxy_params; proxy_pass http://{upstream}; }} }} server {{ listen 127.0.0.1:{port}; server_name b.test; location / {{ proxy_pass http://{upstream}; }} }} }}\n", dir.display(), dir.display(), dir.display());
-        fs::write(dir.join("proxy_params"), "proxy_set_header Host $host; proxy_set_header X-Inherited 'kept; value'; proxy_set_header X-Observed-Client $remote_addr;\n").unwrap();
+        fs::write(dir.join("proxy_params"), format!("include {}/nested_params;\n", dir.display())).unwrap();
+        fs::write(dir.join("nested_params"), "proxy_set_header Host $host; proxy_set_header X-Inherited 'kept; value'; proxy_set_header X-Observed-Client $remote_addr;\n").unwrap();
         let conf = dir.join("nginx.conf");
-        fs::write(&conf, &source).unwrap();
+        let canonical = dir.join("nginx-real.conf");
+        fs::write(&canonical, &source).unwrap();
+        std::os::unix::fs::symlink(&canonical, &conf).unwrap();
         let nginx = Command::new("/usr/sbin/nginx")
             .args([
                 "-p",
@@ -2902,6 +3022,7 @@ mod lifecycle_tests {
             format!("{source}# external edit retained\n")
         );
         assert!(state.effective().sites.is_empty());
+        assert!(conf.is_symlink());
         state.httpguard.apply(Default::default()).await;
         business.abort();
         drop(fixture);

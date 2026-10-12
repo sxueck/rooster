@@ -748,6 +748,15 @@ pub struct Site {
     /// 80 端口访问本站点时 301 到 https(默认关闭)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect_https: Option<bool>,
+    /// 上游连接超时(TCP 连接 + TLS 握手)。未配置(None)保持 10s 默认;
+    /// nginx 接入的站点由接入方注入 60s 或解析自 `proxy_connect_timeout`
+    /// 的值(如 `"60s"`)。
+    #[serde(
+        default,
+        with = "humantime_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub upstream_connect_timeout: Option<Duration>,
     /// 本站点请求体硬上限(bytes);仅当 `hardening.body-cap` 启用时生效,
     /// 未配置则用全局 `hardening.body-cap.max-size`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
