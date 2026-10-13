@@ -10,7 +10,7 @@ Agent:
 
 - 80/443 reverse proxy — TLS termination (static certs or ACME HTTP-01 with cache/renewal) or TCP passthrough via ClientHello SNI peeking; PROXY protocol v1/v2 toward upstreams; trusted-proxy real-IP resolution.
 - Nginx discovery and WAF onboarding — scan host server blocks from the Sites tab, enable monitor/block for compatible HTTP proxy sites, and restore their original forwarding configuration. See `docs/nginx-waf-onboarding.md`.
-- WAF — ModSecurity SecLang subset with an OWASP CRS v4 PL1 subset (624 rules, 0 skipped; see `rules/`), anomaly scoring, paranoia levels, live rule inventory and explain-where-rules-came-from diagnostics.
+- WAF — ModSecurity SecLang subset with an OWASP CRS v4 PL1 subset (624 rules, 0 skipped; see `rules/`), anomaly scoring, paranoia levels, live rule inventory and explain-where-rules-came-from diagnostics. `application/json` bodies are decomposed into `ARGS_JSON` leaves and inspected per field; a hit that came only from the raw body blob is logged but not scored, which is what keeps LLM/API traffic (chat history carrying SQL snippets, code comments) off the block list.
 - GeoIP country filtering (MaxMind-compatible `.mmdb`), fail-closed with periodic refresh.
 - TCP/UDP port forwarding with per-rule CIDR ACLs, per-IP rate limits, concurrency caps, live stats; DNS forwarding.
 - nftables ban manager over raw netlink, ssh-guard, HTTP brute-force lockout, ban degradation is observable via `/v0/management/stats`.

@@ -14,26 +14,36 @@
 use crate::{LoadReport, RuleSet};
 
 const SQLI: &str = r#"
-# ---- SQL 注入:union select / 永真式 / 注释截断 / 堆叠 ----
-SecRule REQUEST_URI|ARGS|REQUEST_BODY|REQUEST_COOKIES|REQUEST_HEADERS:User-Agent|REQUEST_HEADERS:Referer|REQUEST_HEADERS:X-Forwarded-Host "@rx (?i)(?:union(?:\s|%20|/[\s\S]*?/)+(?:all|distinct)?(?:\s|%20)+select|(?:'|%27)\s*(?:or|and)\b|(?:\b|')\s*(?:or|and)\s*(?:'[^']*'|\"\w+\"|\d+)\s*=\s*|1\s*=\s*1\b|;\s*(?:drop|delete|insert|update|truncate|shutdown|alter)\b|(?:'|%27);|--(?:\s|%20|$|/|\+)|/\*[\s\S]{0,200}?\*/|@@version|sleep\s*\(|benchmark\s*\()" \
-    "id:10001,phase:2,block,log,t:none,t:urlDecodeUni,t:htmlEntityDecode,t:lowercase,msg:'SQL injection: union select / tautology / comment / stacked query',severity:CRITICAL,tag:'attack-sqli',tag:'paranoia-level/1'"
+# ---- SQL 注入:union select / 堆叠查询 / 时间盲注 / 版本探测 ----
+# 不在此签名内做「永真式 / 注释 / 引号+or|and」类形态判断:那些模式在整块
+# JSON 或代码文本里几乎必然误中(`/* … */`、`-- …`、`' or`),由 10002 的
+# 分级启发式(@detectSQLi)承担。
+# 内置签名都额外目标 ARGS_JSON:引擎不把 JSON 叶子并入 ARGS(CRS 几乎全部
+# 规则以 ARGS 为目标,并集会按 600 条规则重扫整块 body),所以 JSON 字段的
+# 攻击特征检测由这里承担 —— 要扩大 JSON 覆盖,在对应规则里显式加 ARGS_JSON。
+SecRule REQUEST_URI|ARGS|ARGS_JSON|REQUEST_BODY|REQUEST_COOKIES|REQUEST_HEADERS:User-Agent|REQUEST_HEADERS:Referer|REQUEST_HEADERS:X-Forwarded-Host "@rx (?i)(?:union[\s\x00-\x2f]{1,40}(?:all|distinct)?[\s\x00-\x2f]{0,40}select|union(?:%20|\s)?/\*[\s\S]{0,80}?\*/(?:%20|\s)?select|;\s*(?:drop|delete|insert|update|truncate|shutdown|alter)\b|@@version|\bsleep\s*\(|\bbenchmark\s*\()" \
+    "id:10001,phase:2,block,log,t:none,t:urlDecodeUni,t:htmlEntityDecode,t:lowercase,msg:'SQL injection: union select / stacked query / time-based / @@version',severity:CRITICAL,tag:'attack-sqli',tag:'paranoia-level/1'"
 
-SecRule ARGS|REQUEST_BODY "@detectSQLi" \
+# 集合同 CRS 942100(再加 REQUEST_BODY 与 JSON 字段):形态启发式负责广集合,
+# 上面的正则签名只负责高置信特征。
+SecRule REQUEST_COOKIES|REQUEST_COOKIES_NAMES|REQUEST_HEADERS:User-Agent|REQUEST_HEADERS:Referer|ARGS_NAMES|ARGS_JSON_NAMES|ARGS|ARGS_JSON|REQUEST_BODY "@detectSQLi" \
     "id:10002,phase:2,block,log,t:none,t:urlDecodeUni,t:htmlEntityDecode,msg:'SQL injection detected via libinjection-equivalent heuristic',severity:CRITICAL,tag:'attack-sqli',tag:'paranoia-level/1'"
 "#;
 
 const XSS: &str = r#"
 # ---- XSS:脚本标签 / js URI / 事件处理器 ----
-SecRule REQUEST_URI|ARGS|REQUEST_BODY|REQUEST_COOKIES|REQUEST_HEADERS:User-Agent|REQUEST_HEADERS:Referer "@rx (?i)(?:<\s*/?\s*(?:script|iframe|object|embed|svg|math|base)\b|javascript\s*:|vbscript\s*:|data\s*:\s*text/html|\bon(?:error|load|click|mouseover|focus|blur|toggle|animationstart|pointerover)\s*=\s*['\"]?|<\s*img[^>]{0,200}?onerror|document\s*\.\s*cookie|\balert\s*\(|\beval\s*\(|string\.fromcharcode|srcdoc\s*=)" \
+# 集合同 CRS 941100 系列;单个 JS API 名(`alert(`/`document.cookie`)不再
+# 进正则签名,只作为 @detectXSS 的中信号类别(需 3 类同时命中)。
+SecRule REQUEST_URI|ARGS|ARGS_JSON|REQUEST_BODY|REQUEST_COOKIES|REQUEST_HEADERS:User-Agent|REQUEST_HEADERS:Referer "@rx (?i)(?:<\s*/?\s*(?:script|iframe|object|embed|svg|math|base)\b|javascript\s*:|vbscript\s*:|data\s*:\s*text/html|\bon(?:error|load|click|mouseover|focus|blur|toggle|animationstart|pointerover)\s*=\s*['\"]?|<\s*img[^>]{0,200}?onerror)" \
     "id:10101,phase:2,block,log,t:none,t:urlDecodeUni,t:htmlEntityDecode,t:lowercase,msg:'XSS: script tag / js URI / event handler',severity:CRITICAL,tag:'attack-xss',tag:'paranoia-level/1'"
 
-SecRule ARGS|REQUEST_URI "@detectXSS" \
+SecRule REQUEST_COOKIES|REQUEST_HEADERS:User-Agent|REQUEST_HEADERS:Referer|ARGS_NAMES|ARGS_JSON_NAMES|ARGS|ARGS_JSON|REQUEST_URI|REQUEST_BODY "@detectXSS" \
     "id:10102,phase:2,block,log,t:none,t:urlDecodeUni,msg:'XSS detected via libinjection-equivalent heuristic',severity:ERROR,tag:'attack-xss',tag:'paranoia-level/1'"
 "#;
 
 const TRAVERSAL: &str = r#"
 # ---- 路径穿越:解码后与原始编码两种形态 ----
-SecRule REQUEST_URI|REQUEST_FILENAME|ARGS|REQUEST_BODY "@rx (?i)(?:\.\./|\.\.\\|(?:^|[/=])\.\.(?:/|\\|$)|(?:^|/)etc/(?:passwd|shadow|hosts|group)\b|boot\.ini|win\.ini)" \
+SecRule REQUEST_URI|REQUEST_FILENAME|ARGS|ARGS_JSON|REQUEST_BODY "@rx (?i)(?:\.\./|\.\.\\|(?:^|[/=])\.\.(?:/|\\|$)|(?:^|/)etc/(?:passwd|shadow|hosts|group)\b|boot\.ini|win\.ini)" \
     "id:10201,phase:2,block,log,t:none,t:urlDecodeUni,t:removeNulls,msg:'Path traversal: ../ or ..\\ or system file access',severity:CRITICAL,tag:'attack-lfi',tag:'paranoia-level/1'"
 
 SecRule REQUEST_URI_RAW|REQUEST_FILENAME "@rx (?i)(?:%2e%2e(?:%2f|%5c|/|\\|$)|%252e%252e|\.\.%2f|\.\.%5c|%c0%ae%c0%ae)" \
@@ -42,7 +52,7 @@ SecRule REQUEST_URI_RAW|REQUEST_FILENAME "@rx (?i)(?:%2e%2e(?:%2f|%5c|/|\\|$)|%2
 
 const RCE: &str = r#"
 # ---- 命令注入:链接符 + 命令、反引号、$() ----
-SecRule REQUEST_URI|ARGS|REQUEST_BODY|REQUEST_COOKIES "@rx (?i)(?:[;|&\r\n]\s*(?:cat|ls|id|whoami|uname|wget|curl|nc|ncat|bash|sh|zsh|dash|ksh|python[23]?|perl|ruby|php|powershell|pwsh|rm|chmod|chown|ping|nslookup|dig|sleep|echo)\b|`[^`]{2,100}`|\$\([^)\s]{1,100}\)|\|\|\s*(?:id|whoami|uname)\b|/bin/(?:ba|z|da)?sh|\beval\s*\(|\bexec\s*\(|&&\s*(?:id|whoami))" \
+SecRule REQUEST_URI|ARGS|ARGS_JSON|REQUEST_BODY|REQUEST_COOKIES "@rx (?i)(?:[;|&\r\n]\s*(?:cat|ls|id|whoami|uname|wget|curl|nc|ncat|bash|sh|zsh|dash|ksh|python[23]?|perl|ruby|php|powershell|pwsh|rm|chmod|chown|ping|nslookup|dig|sleep|echo)\b|`[^`]{2,100}`|\$\([^)\s]{1,100}\)|\|\|\s*(?:id|whoami|uname)\b|/bin/(?:ba|z|da)?sh|\beval\s*\(|\bexec\s*\(|&&\s*(?:id|whoami))" \
     "id:10301,phase:2,block,log,t:none,t:urlDecodeUni,t:htmlEntityDecode,t:lowercase,msg:'Command injection: shell metacharacter + command / backtick / $()',severity:CRITICAL,tag:'attack-rce',tag:'paranoia-level/1'"
 "#;
 

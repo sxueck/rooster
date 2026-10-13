@@ -38,12 +38,16 @@ struct EvalState<'a> {
     ctx: Ctx<'a>,
     hits: Vec<Hit>,
     score: u32,
+    /// 上一次 `eval_cond` 的命中是否只来自 raw body blob
+    blob_only: bool,
 }
 
 struct Ctx<'a> {
     req: &'a Request<'a>,
     /// 查询串 + urlencoded body 解析出的参数
     args: Vec<(String, String)>,
+    /// JSON body 解析出的叶子参数(等价 ModSecurity 的 `ARGS_JSON`)
+    json_args: Vec<(String, String)>,
     body_str: String,
     /// uri 中 `?` 之前的部分(原始,未解码)
     path: String,
@@ -51,6 +55,9 @@ struct Ctx<'a> {
     query: String,
     tx: HashMap<String, String>,
     body_is_urlencoded: bool,
+    /// body 已被完整拆成 `json_args`:此时「只有 raw body blob 命中」的
+    /// 规则不再计分(仍然记录),因为同样的内容已按字段逐个检过。
+    body_is_structured: bool,
     /// 最近一次命中的值与变量名(供 `%{MATCHED_VAR}` / `MATCHED_VARS`)
     last_matched: Option<String>,
     last_matched_name: Option<String>,
@@ -67,6 +74,7 @@ pub(crate) fn evaluate(
         ctx: Ctx::build(req, paranoia),
         hits: Vec::new(),
         score: 0,
+        blob_only: false,
     };
 
     for phase in [1u8, 2u8] {
@@ -115,6 +123,11 @@ impl<'a> Ctx<'a> {
         if body_is_urlencoded {
             parse_query(&body_str, &mut args);
         }
+        // JSON 整坨送进检测时,结构性字符(`"` `,` `:`)会把自然语言和代码
+        // 粘成「看起来像注入」的串;拆成逐字段值后同一载荷的信号密度完全不同。
+        let mut json_args = Vec::new();
+        let body_is_structured =
+            body_is_json(&content_type) && parse_json_leaves(&body_str, &mut json_args);
         let path = req
             .uri
             .split_once('?')
@@ -133,11 +146,13 @@ impl<'a> Ctx<'a> {
         Ctx {
             req,
             args,
+            json_args,
             body_str,
             path,
             query,
             tx,
             body_is_urlencoded,
+            body_is_structured,
             last_matched: None,
             last_matched_name: None,
         }
@@ -147,6 +162,10 @@ impl<'a> Ctx<'a> {
     /// 标量变量恒有一个值(可能为空串)。
     fn collect(&self, var: &str, selector: Option<&Selector>) -> Vec<(String, String)> {
         match var {
+            // ModSecurity 的 `ARGS` 含 ARGS_JSON,本引擎故意不含:CRS 几乎所有规则
+            // 都以 ARGS 为目标,把 JSON 叶子塞进 ARGS 会让整块 body 被 600 条规则
+            // 逐字段重扫(实测 8 KB JSON 从 1.2 ms 涨到 15 ms/请求)。需要 JSON 字段
+            // 的规则显式列出 `ARGS_JSON`(内置签名 1000x/1010x/10201/10301 已接入)。
             "ARGS" => self
                 .args
                 .iter()
@@ -155,6 +174,18 @@ impl<'a> Ctx<'a> {
                 .collect(),
             "ARGS_NAMES" => self
                 .args
+                .iter()
+                .filter(|(n, _)| selector.map_or(true, |s| s.matches(n)))
+                .map(|(n, _)| (n.clone(), n.clone()))
+                .collect(),
+            "ARGS_JSON" => self
+                .json_args
+                .iter()
+                .filter(|(n, _)| selector.map_or(true, |s| s.matches(n)))
+                .map(|(n, v)| (n.clone(), v.clone()))
+                .collect(),
+            "ARGS_JSON_NAMES" => self
+                .json_args
                 .iter()
                 .filter(|(n, _)| selector.map_or(true, |s| s.matches(n)))
                 .map(|(n, _)| (n.clone(), n.clone()))
@@ -252,6 +283,8 @@ impl<'a> Ctx<'a> {
 /// 变量的规则虽然能解析、计入 loaded,但运行时恒收到空集合。
 const MODELLED_VARS: &[&str] = &[
     "ARGS",
+    "ARGS_JSON",
+    "ARGS_JSON_NAMES",
     "ARGS_NAMES",
     "MATCHED_VARS",
     "QUERY_STRING",
@@ -306,15 +339,90 @@ fn parse_query(q: &str, out: &mut Vec<(String, String)>) {
     }
 }
 
+/// 结构化 JSON 请求体的 Content-Type 判定(含 `+json` 后缀类型)。
+fn body_is_json(content_type: &str) -> bool {
+    content_type.contains("application/json") || content_type.contains("+json")
+}
+
+/// JSON body 拆成 ModSecurity `ARGS_JSON` 风格的叶子参数(`/a/0/b` → 标量值)。
+///
+/// 只在能完整拆解时返回 true;解析失败、顶层标量、超出深度/叶子上限
+/// 均返回 false 并丢弃已收集合 —— 调用方据此让 raw body 继续计分,
+/// 不把「拆不了」变成「不检」。
+fn parse_json_leaves(body: &str, out: &mut Vec<(String, String)>) -> bool {
+    /// 深嵌套/超多字段的 body 不应把检测成本抬成 DDoS 面。
+    const MAX_DEPTH: usize = 12;
+    const MAX_LEAVES: usize = 256;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    if !value.is_object() && !value.is_array() {
+        return false;
+    }
+    let mut leaves = Vec::new();
+    if !walk_json(&value, String::new(), &mut leaves, 0, MAX_DEPTH, MAX_LEAVES) {
+        return false;
+    }
+    *out = leaves;
+    true
+}
+
+fn walk_json(
+    value: &serde_json::Value,
+    path: String,
+    out: &mut Vec<(String, String)>,
+    depth: usize,
+    max_depth: usize,
+    max_leaves: usize,
+) -> bool {
+    if depth > max_depth || out.len() >= max_leaves {
+        return false;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let child = format!("{path}/{k}");
+                if !walk_json(v, child, out, depth + 1, max_depth, max_leaves) {
+                    return false;
+                }
+            }
+            true
+        }
+        serde_json::Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                let child = format!("{path}/{i}");
+                if !walk_json(v, child, out, depth + 1, max_depth, max_leaves) {
+                    return false;
+                }
+            }
+            true
+        }
+        // null 无内容可检;其余标量按字符串入集
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => {
+            out.push((path, s.clone()));
+            true
+        }
+        other => {
+            out.push((path, other.to_string()));
+            true
+        }
+    }
+}
+
 /// 逐链接求值。ModSecurity 语义:每个链接命中时**立即**执行自己的
 /// `setvar`(头部命中即写 `tx.*`),后续成员才能在 `TX:` 目标里看到它。
 /// 头部命中后还会按 `capture` 写入 `tx.0..tx.9`。
 /// 任何链接不命中则整条链不产生 Hit(已执行的 setvar 副作用保留,与
 /// ModSecurity 一致)。
 fn eval_rule(rule: &RawRule, st: &mut EvalState) {
+    let mut first_blob_only = false;
     for (idx, cond) in rule.conditions.iter().enumerate() {
         if !eval_cond(cond, st) {
             return;
+        }
+        if idx == 0 {
+            first_blob_only = st.blob_only;
         }
         if idx == 0 && rule.capture {
             if let Some(value) = st.ctx.last_matched.clone() {
@@ -339,18 +447,23 @@ fn eval_rule(rule: &RawRule, st: &mut EvalState) {
             rule_id: rule.id,
             msg,
             severity: rule.severity,
-            score: sev,
+            score: if first_blob_only { 0 } else { sev },
+            blob_only: first_blob_only,
         });
-        st.score = st.score.saturating_add(sev);
+        if !first_blob_only {
+            st.score = st.score.saturating_add(sev);
+        }
     }
 }
 
 fn eval_cond(cond: &RawCondition, st: &mut EvalState) -> bool {
+    st.blob_only = false;
     // 无目标变量(SecAction / @unconditionalMatch):恒真,不看值集合。
     if cond.targets.is_empty() {
         return !cond.op.negate();
     }
-    let mut entries: Vec<(String, String, String)> = Vec::new(); // (var, name, value)
+    // (var, name, value, 是否为 `&var` 计数项)
+    let mut entries: Vec<(String, String, String, bool)> = Vec::new();
     let mut neg_terms: Vec<&TargetTerm> = Vec::new();
     for term in &cond.targets {
         if term.negate {
@@ -359,16 +472,16 @@ fn eval_cond(cond: &RawCondition, st: &mut EvalState) -> bool {
         }
         let resolved = st.ctx.collect(&term.var, term.selector.as_ref());
         if term.count {
-            entries.push((term.var.clone(), String::new(), resolved.len().to_string()));
+            entries.push((term.var.clone(), String::new(), resolved.len().to_string(), true));
         } else {
             for (n, v) in resolved {
-                entries.push((term.var.clone(), n, v));
+                entries.push((term.var.clone(), n, v, false));
             }
         }
     }
     // `!` 排除项后置处理:从并集中剔除同变量、选择器命中的元素
     for term in neg_terms {
-        entries.retain(|(v, n, _)| {
+        entries.retain(|(v, n, _, _)| {
             !(v.eq_ignore_ascii_case(&term.var)
                 && term.selector.as_ref().map_or(true, |s| s.matches(n)))
         });
@@ -377,20 +490,37 @@ fn eval_cond(cond: &RawCondition, st: &mut EvalState) -> bool {
     let mut any_match = false;
     let mut matched_value: Option<String> = None;
     let mut matched_name: Option<String> = None;
-    for (var, name, raw) in &entries {
+    // body 已拆成逐字段时,raw blob 命中先当候选,继续找字段级命中;
+    // 只有没有任何字段命中时才按 blob-only 记录(不计入异常分)。
+    let mut blob_fallback: Option<(String, String)> = None;
+    for (var, name, raw, counted) in &entries {
         let value = apply_all(&cond.transforms, raw);
-        if cond.op.matches(&value, &|m| {
-            expand_macros(m, st)
-        }) {
+        if !cond.op.matches(&value, &|m| expand_macros(m, st)) {
+            continue;
+        }
+        // MATCHED_VARS 取 `VAR:selector` 形式的全名。
+        let full_name = if name.is_empty() {
+            var.clone()
+        } else {
+            format!("{var}:{name}")
+        };
+        if !counted && var.eq_ignore_ascii_case("REQUEST_BODY") && st.ctx.body_is_structured {
+            if blob_fallback.is_none() {
+                blob_fallback = Some((value, full_name));
+            }
+            continue;
+        }
+        any_match = true;
+        matched_value = Some(value);
+        matched_name = Some(full_name);
+        break;
+    }
+    if !any_match {
+        if let Some((value, full_name)) = blob_fallback {
             any_match = true;
+            st.blob_only = true;
             matched_value = Some(value);
-            // ModSecurity 的 MATCHED_VARS 取 `VAR:selector` 形式的全名。
-            matched_name = Some(if name.is_empty() {
-                var.clone()
-            } else {
-                format!("{var}:{name}")
-            });
-            break;
+            matched_name = Some(full_name);
         }
     }
     // 无候选值时不命中(取反操作符同样如此);`&` 计数项恒产生一个值

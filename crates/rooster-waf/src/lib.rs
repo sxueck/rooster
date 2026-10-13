@@ -19,7 +19,8 @@
 //!
 //! - 指令:`SecRule`、`SecAction`;其余指令(Include、SecMarker、
 //!   SecRuleUpdateTargetById 等)一律跳过并记录 `directive:<名称>` 告警;
-//! - 变量:`ARGS`、`ARGS_NAMES`、`REQUEST_URI`、`REQUEST_HEADERS(:Name)`、
+//! - 变量:`ARGS`、`ARGS_NAMES`、`ARGS_JSON`(`ARGS_JSON_NAMES`)、
+//!   `REQUEST_URI`、`REQUEST_HEADERS(:Name)`、
 //!   `REQUEST_COOKIES(:Name)`、`REQUEST_BODY`、`REQUEST_METHOD`、`FILES_NAMES`,
 //!   支持 `|` 并集、`!` 排除、`&` 计数;`REQUEST_URI_RAW` 是 `REQUEST_URI`
 //!   的别名(本引擎不做原始/解码区分,属有意简化);CRS 依赖的
@@ -62,6 +63,16 @@
 //! 5. 环视/反向引用等 PCRE 特性:rust `regex` 不支持,加载时做最小净化
 //!    (分支复用组、占有量词、`\Q..\E`),仍失败则跳过该规则
 //!    (`rule:regex-compile` 告警)。
+//! 6. **JSON body 逐字段检测**:`application/json`(含 `+json`)请求体会被
+//!    拆成 `ARGS_JSON` 叶子。拆解成功时,「只有 raw body blob 命中」的规则
+//!    仍记录但 `score = 0`,不参与阈值判定 —— 整块 JSON 里结构性字符、自然
+//!    语言和代码粘在一起,是 LLM/API 流量被判 SQLi 的主要来源。body 不是
+//!    JSON、解析失败或超出深度/叶子上限时,raw blob 照常计分(不把「拆不了」
+//!    变成「不检」)。与 ModSecurity 不同的是,这里**不把 `ARGS_JSON` 并入
+//!    `ARGS`**:CRS 几乎全部规则以 `ARGS` 为目标,并集会让整块 body 被 600 条
+//!    规则逐字段重扫(实测 8 KB JSON 从 1.2 ms 涨到 15 ms/请求)。需要 JSON
+//!    字段的规则显式列出 `ARGS_JSON`(内置签名 10001/10002/10101/10102/10201/
+//!    10301 已接入;CRS 94x 正则族仍只看表单/query)。
 
 mod builtin;
 mod detect;
@@ -84,13 +95,17 @@ pub struct Request<'a> {
     pub body: &'a [u8],
 }
 
-/// 单条规则命中。`score` 即严重度权重(5/4/3/2)。
+/// 单条规则命中。`score` 即严重度权重(5/4/3/2);`blob_only = true` 时
+/// `score` 恒为 0:命中只来自 raw 请求体 blob,而该 body 已被拆成逐字段
+/// 检过,所以只记录、不参与阈值判定。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
     pub rule_id: u32,
     pub msg: String,
     pub severity: u8,
     pub score: u32,
+    #[serde(default)]
+    pub blob_only: bool,
 }
 
 /// 求值结果:`score >= threshold` 时 `blocked`。
