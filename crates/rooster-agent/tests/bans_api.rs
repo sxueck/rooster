@@ -372,6 +372,9 @@ async fn stats_shape() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["forwards"].is_array());
+    // 面板按数组读取每个站点 / 规则的计数,http 不能退化成 map
+    // (键名契约: forward.rs::stats_of 与 httpguard.rs::stats)。
+    assert!(body["http"].is_array());
     assert_eq!(body["bans"], 0);
 
     // 发生过封禁后计数变化

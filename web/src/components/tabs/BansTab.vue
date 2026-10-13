@@ -179,6 +179,7 @@ onMounted(async () => {
         :columns="cols"
         :rows="bans"
         :row-key="(r: BanEntry) => r.ip"
+        :page-size="20"
         empty-text="NO BANS · 暂无封禁"
       />
     </RPanel>
@@ -188,6 +189,7 @@ onMounted(async () => {
         :columns="historyCols"
         :rows="history"
         :row-key="(r: BanHistoryRow) => r.id"
+        :page-size="20"
         empty-text="暂无已解除封禁记录"
       />
     </RPanel>
@@ -197,6 +199,7 @@ onMounted(async () => {
         :columns="honeypotCols"
         :rows="honeypotHits"
         :row-key="(r: (typeof honeypotHits)[number]) => r.id"
+        :page-size="20"
         empty-text="暂无高置信诱捕端口命中；仅保存来源 IP、目标端口、协议和时间，不记录原始流量（每节点保留最近 1000 条）"
       />
     </RPanel>

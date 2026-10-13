@@ -11,6 +11,7 @@
  */
 import { computed, ref, watch, type VNode } from 'vue'
 import type { RColumn } from './types'
+import RPager from './RPager.vue'
 import RSpinner from './RSpinner.vue'
 
 const props = withDefaults(
@@ -67,13 +68,6 @@ const visible = computed(() => {
   if (props.pageSize <= 0) return sorted.value
   const start = (page.value - 1) * props.pageSize
   return sorted.value.slice(start, start + props.pageSize)
-})
-const rangeText = computed(() => {
-  const n = sorted.value.length
-  if (props.pageSize <= 0 || n === 0) return `${n}`
-  const start = (page.value - 1) * props.pageSize + 1
-  const end = Math.min(n, page.value * props.pageSize)
-  return `${start}–${end} / ${n}`
 })
 
 // ---- selection ----
@@ -156,11 +150,12 @@ const Cell = (cellProps: { v: VNode | string }) =>
       </tbody>
     </table>
     <div v-if="loading" class="rt-loading"><RSpinner /></div>
-    <div v-if="pageSize > 0 && sorted.length > pageSize" class="rt-pager">
-      <button class="rt-pg" :disabled="page <= 1" @click="page -= 1">‹</button>
-      <span class="rt-pg-text num">{{ rangeText }}</span>
-      <button class="rt-pg" :disabled="page >= pageCount" @click="page += 1">›</button>
-    </div>
+    <RPager
+      v-model:page="page"
+      :page-count="pageCount"
+      :page-size="pageSize"
+      :total="sorted.length"
+    />
   </div>
 </template>
 
@@ -227,29 +222,5 @@ const Cell = (cellProps: { v: VNode | string }) =>
   justify-content: center;
   padding-top: 40px;
   background: rgba(255, 255, 255, 0.6);
-}
-.rt-pager {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 7px 10px;
-  border-top: 1px solid var(--line);
-}
-.rt-pg {
-  width: 22px;
-  height: 22px;
-  border: 1px solid var(--line-strong);
-  border-radius: 3px;
-  background: var(--panel);
-  cursor: pointer;
-  line-height: 1;
-  color: var(--sub);
-}
-.rt-pg:hover:not(:disabled) { background: var(--tint); }
-.rt-pg:disabled { opacity: 0.4; cursor: not-allowed; }
-.rt-pg-text {
-  font-size: 11.5px;
-  color: var(--faint);
 }
 </style>

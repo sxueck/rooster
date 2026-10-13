@@ -1,9 +1,36 @@
 <script setup lang="ts">
 import { computed, h, onMounted, ref } from 'vue'
-import { RButton, RInput, RModal, RPanel, RTable, RTag, useMessage, type RColumn } from '../../ui'
+import {
+  RButton,
+  RField,
+  RInput,
+  RModal,
+  RPanel,
+  RSelect,
+  RSwitch,
+  RTable,
+  RTag,
+  useMessage,
+  type RColumn,
+} from '../../ui'
 import { deleteSite, getSites, putSite, getNginxSites, setNginxWaf } from '../../api/client'
 import type { Site, NginxSite } from '../../api/client'
 import type { WafMode } from '../../api/types'
+import {
+  ON_EXCEED_OPTIONS,
+  PROXY_PROTOCOL_OPTIONS,
+  TLS_MODE_OPTIONS,
+  WAF_MODE_OPTIONS,
+  draftToSite,
+  emptyDraft,
+  normalizeRuleIds,
+  siteToDraft,
+  validateDraft,
+  type OnExceed,
+  type ProxyProtocol,
+  type SiteDraft,
+  type TlsMode,
+} from '../../utils/siteForm'
 import { errMsg } from '../../utils/format'
 
 const props = defineProps<{ nodeId: string }>()
@@ -13,7 +40,12 @@ const sites = ref<Site[]>([])
 const editShow = ref(false)
 /** path id of the site being edited; empty = creating a new one */
 const editId = ref('')
-const editText = ref('')
+const draft = ref<SiteDraft>(emptyDraft())
+/** 编辑中的原站点:用于保留面板尚未建模的键。 */
+const baseSite = ref<Site | null>(null)
+const rawMode = ref(false)
+const rawText = ref('')
+const saving = ref(false)
 const nginxSites = ref<NginxSite[]>([])
 
 /** 发现层按 server 块出 行，同域名的 80 跳转块无转发不可接入，折叠进主行避免占屏。 */
@@ -119,6 +151,8 @@ interface SiteRow {
   upstream: string
   waf: string
   wafTone: 'muted' | 'warn' | 'ok'
+  /** 误报加白的规则条数 */
+  excl: number
   index: number
 }
 
@@ -142,8 +176,12 @@ const cols: RColumn<SiteRow>[] = [
   {
     title: 'WAF',
     key: 'waf',
-    width: 100,
-    render: (r) => hTag(r.wafTone, r.waf),
+    width: 110,
+    render: (r) =>
+      h('div', [
+        hTag(r.wafTone, r.waf),
+        r.excl > 0 ? h('small', { class: 'muted', style: 'display:block' }, `加白 ${r.excl} 条`) : null,
+      ]),
   },
   {
     title: 'ACTIONS',
@@ -153,7 +191,7 @@ const cols: RColumn<SiteRow>[] = [
       h('span', { class: 'row-tight' }, [
         ...(isNginxManaged(r.id) ? [h('small', { class: 'muted' }, '由 Nginx 接入管理')] : [
           hBtn(sites.value[r.index]?.waf?.mode === 'block' ? '切换监控' : '开启阻断', () => changeSiteMode(r.index)),
-          hBtn('JSON 编辑', () => openEdit(r.index)), hBtn('删除', () => removeSite(r.index), 'danger'),
+          hBtn('编辑', () => openEdit(r.index)), hBtn('删除', () => removeSite(r.index), 'danger'),
         ]),
       ]),
   },
@@ -185,6 +223,7 @@ function rebuildRows() {
       upstream: String(s.upstream ?? ''),
       waf: waf.label,
       wafTone: waf.tone,
+      excl: normalizeRuleIds(s.waf?.exclusions).length,
       index: i,
     }
   })
@@ -206,35 +245,74 @@ async function changeSiteMode(i: number) {
   catch (e) { message.error(errMsg(e)) }
 }
 function openEdit(i: number) {
-  editId.value = sites.value[i].id
-  editText.value = JSON.stringify(sites.value[i], null, 2)
+  const site = sites.value[i]
+  if (!site) return
+  editId.value = site.id
+  baseSite.value = site
+  draft.value = siteToDraft(site)
+  rawMode.value = false
+  rawText.value = ''
   editShow.value = true
 }
 
 function addSite() {
-  const draft: Site = {
-    id: `site-${sites.value.length + 1}`,
-    'server-names': [],
-    upstream: '127.0.0.1:80',
-  }
+  const d = emptyDraft()
+  d.id = `site-${sites.value.length + 1}`
   editId.value = ''
-  editText.value = JSON.stringify(draft, null, 2)
+  baseSite.value = null
+  draft.value = d
+  rawMode.value = false
+  rawText.value = ''
   editShow.value = true
+}
+
+/** 表单 <-> JSON 双向同步:进入 JSON 时序列化当前表单,回到表单时解析回去。 */
+function setRawMode(toJson: boolean) {
+  if (toJson === rawMode.value) return
+  if (toJson) {
+    rawText.value = JSON.stringify(draftToSite(draft.value, baseSite.value), null, 2)
+    rawMode.value = true
+    return
+  }
+  try {
+    draft.value = siteToDraft(JSON.parse(rawText.value) as Site)
+    rawMode.value = false
+  } catch (e) {
+    message.error('JSON 解析失败，无法回到表单：' + errMsg(e))
+  }
+}
+
+function addRateRow() {
+  draft.value.rateLimit.push({ key: 'ip', rate: '5/second', burst: '', onExceed: 'reject', banAfter: '' })
+}
+
+function removeRateRow(i: number) {
+  draft.value.rateLimit.splice(i, 1)
 }
 
 async function saveEdit() {
   let obj: Site
-  try {
-    obj = JSON.parse(editText.value) as Site
-  } catch (e) {
-    message.error('JSON 解析失败：' + errMsg(e))
-    return
+  if (rawMode.value) {
+    try {
+      obj = JSON.parse(rawText.value) as Site
+    } catch (e) {
+      message.error('JSON 解析失败：' + errMsg(e))
+      return
+    }
+  } else {
+    const errors = validateDraft(draft.value)
+    if (errors.length > 0) {
+      message.error(errors.map((e) => `${e.field}：${e.message}`).join('；'))
+      return
+    }
+    obj = draftToSite(draft.value, baseSite.value)
   }
   const siteId = String(obj.id ?? editId.value ?? '').trim()
   if (siteId === '') {
     message.error('站点缺少 id（PUT /sites/{id} 以路径 id 为准）')
     return
   }
+  saving.value = true
   try {
     await putSite(props.nodeId, siteId, obj)
     editShow.value = false
@@ -242,6 +320,8 @@ async function saveEdit() {
     await load()
   } catch (e) {
     message.error(errMsg(e))
+  } finally {
+    saving.value = false
   }
 }
 
@@ -289,23 +369,150 @@ onMounted(() => { void load(); void scanNginx() })
 
     <RModal
       v-model:show="editShow"
-      kicker="SITE · JSON"
-      :title="editId ? '站点 JSON 编辑' : '新增站点（JSON）'"
-      :width="560"
+      kicker="SITE · 配置"
+      :title="editId ? '编辑站点' : '新增站点'"
+      :width="720"
     >
-      <RInput v-model="editText" type="textarea" :auto-rows="[12, 22]" mono />
-      <p class="muted" style="margin: 8px 0 0; font-size: 12px">
-        保存时以 JSON 中的 id 作为 PUT /sites/{id} 的路径 id。waf.mode 取值：off / detect / block。
-      </p>
+      <div class="row-tight" style="margin-bottom: 14px">
+        <RButton size="sm" :tone="rawMode ? 'default' : 'primary'" @click="setRawMode(false)">表单</RButton>
+        <RButton size="sm" :tone="rawMode ? 'primary' : 'default'" @click="setRawMode(true)">高级 JSON</RButton>
+        <span class="muted mode-hint">站点字段已全部表单化；JSON 视图用于核对将要下发的内容。</span>
+      </div>
+
+      <RInput v-if="rawMode" v-model="rawText" type="textarea" :auto-rows="[14, 24]" mono />
+
+      <div v-else class="form">
+        <div class="cols-2">
+          <RField inline :label-width="120" label="ID">
+            <RInput v-model="draft.id" :disabled="editId !== ''" mono />
+          </RField>
+          <RField inline :label-width="100" label="UPSTREAM">
+            <RInput v-model="draft.upstream" mono placeholder="127.0.0.1:8080" />
+          </RField>
+        </div>
+        <RField inline :label-width="120" label="DOMAINS" hint="逗号或空格分隔；留空即默认站点">
+          <RInput v-model="draft.names" />
+        </RField>
+
+        <p class="micro sec">TLS</p>
+        <RField inline :label-width="120" label="MODE">
+          <RSelect
+            :model-value="draft.tlsMode"
+            :options="TLS_MODE_OPTIONS"
+            :width="240"
+            @update:model-value="(v: string | null) => { if (v !== null) draft.tlsMode = v as TlsMode }"
+          />
+        </RField>
+        <template v-if="draft.tlsMode === 'terminate'">
+          <RField inline :label-width="120" label="CERT" hint="与 KEY 同时填写则优先于 ACME">
+            <RInput v-model="draft.cert" mono placeholder="/etc/ssl/fullchain.pem" />
+          </RField>
+          <RField inline :label-width="120" label="KEY">
+            <RInput v-model="draft.key" mono placeholder="/etc/ssl/privkey.pem" />
+          </RField>
+          <RField inline :label-width="120" label="ACME" hint="未填本地证书时用 HTTP-01 自动签发">
+            <RSwitch v-model="draft.acme" />
+          </RField>
+        </template>
+
+        <p class="micro sec">WAF</p>
+        <RField inline :label-width="120" label="MODE">
+          <RSelect
+            :model-value="draft.wafMode"
+            :options="WAF_MODE_OPTIONS"
+            :width="300"
+            @update:model-value="(v: string | null) => { if (v !== null) draft.wafMode = v as WafMode }"
+          />
+        </RField>
+        <RField inline :label-width="120" label="EXCLUSIONS" hint="误报加白的规则 id，逗号分隔；事件页「加白」也写这里">
+          <RInput v-model="draft.exclusions" mono placeholder="942100, 942130" />
+        </RField>
+
+        <p class="micro sec">请求控制</p>
+        <div class="cols-2">
+          <RField inline :label-width="120" label="CONNECT TO" hint="形如 60s">
+            <RInput v-model="draft.connectTimeout" mono placeholder="10s" />
+          </RField>
+          <RField inline :label-width="110" label="MAX BODY" hint="字节；仅 hardening.body-cap 启用时生效">
+            <RInput v-model="draft.maxBodySize" mono placeholder="131072" />
+          </RField>
+          <RField inline :label-width="120" label="PROXY PROTOCOL">
+            <RSelect
+              :model-value="draft.proxyProtocol"
+              :options="PROXY_PROTOCOL_OPTIONS"
+              :width="180"
+              @update:model-value="(v: string | null) => { if (v !== null) draft.proxyProtocol = v as ProxyProtocol }"
+            />
+          </RField>
+          <RField inline :label-width="110" label="REDIRECT HTTPS" hint="80 端口访问本站点时 301 到 https">
+            <RSwitch v-model="draft.redirectHttps" />
+          </RField>
+        </div>
+
+        <p class="micro sec">限速</p>
+        <div v-for="(r, i) in draft.rateLimit" :key="i" class="rl-row">
+          <RInput v-model="r.key" mono :width="110" placeholder="ip" />
+          <RInput v-model="r.rate" mono :width="120" placeholder="5/second" />
+          <RInput v-model="r.burst" mono :width="74" placeholder="burst" />
+          <RSelect
+            :model-value="r.onExceed"
+            :options="ON_EXCEED_OPTIONS"
+            :width="120"
+            size="sm"
+            @update:model-value="(v: string | null) => { if (v !== null) r.onExceed = v as OnExceed }"
+          />
+          <RInput v-model="r.banAfter" mono :width="96" placeholder="ban-after" />
+          <RButton size="sm" variant="link" tone="danger" @click="removeRateRow(i)">删除</RButton>
+        </div>
+        <div>
+          <RButton size="sm" variant="link" @click="addRateRow">添加限速规则</RButton>
+          <span class="muted mode-hint">key 取 ip / ip+path / header:&lt;名&gt;；rate 形如 5/second。</span>
+        </div>
+
+        <p class="micro sec">GeoIP / JA4</p>
+        <div class="cols-2">
+          <RField inline :label-width="120" label="GEO DENY" hint="逗号分隔的国家码">
+            <RInput v-model="draft.geoDeny" mono placeholder="RU, CN" />
+          </RField>
+          <RField inline :label-width="110" label="GEO ALLOW" hint="只允许这些国家码">
+            <RInput v-model="draft.geoAllow" mono />
+          </RField>
+        </div>
+        <RField inline :label-width="120" label="JA4 DENY" hint="逗号分隔的 JA4 指纹">
+          <RInput v-model="draft.ja4Deny" mono />
+        </RField>
+      </div>
+
       <template #footer>
         <RButton variant="ghost" @click="editShow = false">取消</RButton>
-        <RButton tone="primary" @click="saveEdit">保存</RButton>
+        <RButton tone="primary" :loading="saving" @click="saveEdit">保存</RButton>
       </template>
     </RModal>
   </div>
 </template>
 
 <style scoped>
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sec {
+  margin: 10px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--faint);
+}
+.mode-hint {
+  font-size: 12px;
+}
+.rl-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
 .status-reason {
   display: block;
   max-width: 260px;

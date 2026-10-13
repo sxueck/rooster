@@ -178,10 +178,39 @@ export interface BanEngineStatus {
   available: boolean
   reason: string | null
 }
+/**
+ * One entry of `GET /stats` → `forwards`: per L4 forward rule counters.
+ * type alias (not interface) so the array stays assignable to RTable's
+ * `Record<string, unknown>` rows prop.
+ */
+export type ForwardStat = {
+  id: string
+  proto: 'tcp' | 'udp' | 'tcp+udp'
+  /** false = bind 失败（端口被占用/地址不可用），规则存活但不下流量 */
+  listening: boolean
+  conns_total: number
+  conns_active: number
+  udp_sessions: number
+  bytes_in: number
+  bytes_out: number
+}
+/** One entry of `GET /stats` → `http`: per-site L7 counters (WAF / 反代 / 透传). */
+export type SiteHttpStat = {
+  id: string
+  requests: number
+  blocked: number
+  conns_passthrough: number
+  bytes_in: number
+  bytes_out: number
+  listening_http: boolean
+  listening_https: boolean
+}
 export interface NodeStats {
-  forwards: Record<string, number>
-  http: Record<string, number>
-  bans: number
+  /** agent 返回的是数组（每项一条规则），不是 id→数字的 map */
+  forwards: ForwardStat[]
+  http: SiteHttpStat[]
+  /** 封禁引擎降级时为 null */
+  bans: number | null
   /** 旧节点可能不返回该字段 */
   ban_engine?: BanEngineStatus
 }
@@ -209,12 +238,16 @@ export interface Site {
   'server-names': string[]
   upstream: string
   tls?: Record<string, unknown>
-  waf?: { mode?: WafMode; exclusions?: string[] } | null
-  'rate-limit'?: Record<string, unknown>
+  /** exclusions 为规则 id;旧面板类型曾写 string[],线格式是数字。 */
+  waf?: { mode?: WafMode; exclusions?: (number | string)[] } | null
+  'rate-limit'?: Record<string, unknown>[]
   geo?: Record<string, unknown>
-  'proxy-protocol'?: boolean
+  /** 旧配置可能为布尔(true=v1);当前线格式是 none/v1/v2。 */
+  'proxy-protocol'?: 'none' | 'v1' | 'v2' | boolean
   'ja4-deny'?: string[]
   'redirect-https'?: boolean
+  'upstream-connect-timeout'?: string
+  'max-body-size'?: number
   [k: string]: unknown
 }
 /** Skipped rule entry of the WAF load report. */

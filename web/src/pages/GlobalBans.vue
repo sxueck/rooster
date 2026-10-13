@@ -144,7 +144,7 @@ async function savePolicies() {
     </RPanel>
 
     <RPanel class="mb" kicker="ACTIVE BANS" flush>
-      <RTable :columns="banCols" :rows="bans" :row-key="(r: GlobalBan) => r.ip" />
+      <RTable :columns="banCols" :rows="bans" :row-key="(r: GlobalBan) => r.ip" :page-size="20" />
     </RPanel>
 
     <RPanel kicker="POLICIES" title="联动策略（满足条件时自动全局封禁）">

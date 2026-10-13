@@ -24,9 +24,20 @@ Hub:
 - Cluster-wide bans: manual plus policy engine (min-nodes or threshold+window), broadcast and full re-sync on reconnect.
 - Remote upgrades: Ed25519-signed binaries, staged rollout with observation window, automatic rollback on failure.
 - Vue 3 panel, audit log, `backup`/`restore` subcommands.
+- Sites are edited as a form (server names, upstream, TLS/ACME, WAF mode, rule-id exclusions, rate limit, GeoIP, PROXY protocol, timeouts, body cap) rather than as raw JSON; CRS knobs stay in `config.yaml`.
+- Every `block` event has a one-click allowlist action (加白) that writes the hit rule ids into that site's `waf.exclusions` — the false-positive loop closes in the panel, no YAML round-trip.
 - Panel unbans persist a ban snapshot before deleting it on the agent. Failed snapshot reads/writes stop deletion; interrupted or failed remote operations remain visible as unconfirmed records. Old agents without start timestamps display an unknown ban start time. Automatic expiry is not archived.
 
 WASM plugins: wasmtime host (no WASI, memory cap, epoch timeout, fail-open/fail-closed per plugin) with a guest SDK and an example plugin (`crates/rooster-plugin-sdk/`).
+
+## Traffic accounting
+
+The node **Overview** tab reads `GET /v0/management/stats`, which answers two different questions and must not be mixed:
+
+- **FORWARD · TRAFFIC** — per-rule counters of Rooster's own userspace L4 forwarders (`forwards:`). Rooster binds a listen socket and proxies; it never installs iptables/nftables DNAT rules, so traffic the kernel redirects on its own is invisible here by design. A rule showing `LISTEN=DOWN` failed to bind (port already held by `sshd`, `nginx`, …) and therefore carries nothing — that, not a missing kernel hook, is why a newly added forward reads 0.
+- **HTTP · STATS** — per-site L7 counters of the 80/443 guard. Nginx-onboarded WAF traffic (`client → Nginx → 127.0.0.1 Rooster → origin`, see `docs/nginx-waf-onboarding.md`) lands here, not in the forward table. An empty table means the node has no configured sites, not that WAF traffic went to zero.
+
+Both fields are arrays (one entry per rule / per site); cluster interface byte totals come from a separate `GET /v0/management/network`.
 
 ## Layout
 

@@ -51,6 +51,12 @@ Never import `naive-ui` — it is being removed.
 | `useMessage()/useDialog()` from naive | same names from `'../ui'` | identical call API (`dialog.warning({title,content,positiveText,negativeText,onPositiveClick})`) |
 | `zhCN/dateZhCN` | delete | no locale provider anymore |
 
+## Long lists
+
+Tables page internally: `RTable :page-size="20"`. Non-table lists (event rows, see
+`EventsTab`) reuse the same strip: `RPager v-model:page="p" :page-count="pagesOf(n)"
+:page-size="PAGE_SIZE" :total="n"`. Never render a whole feed — panel lists are paged.
+
 ## RTable column shape
 
 ```ts

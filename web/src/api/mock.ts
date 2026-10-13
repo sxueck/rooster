@@ -109,7 +109,7 @@ interface MockNodeState {
 // ---------------- config yaml ----------------
 const RULE_IDS = ['920-100', '913-110', '942-100', '930-120', '911-100'] as const
 const REASONS = ['WAF 高危命中', '端口扫描', '暴力破解', 'CC 攻击', 'GeoIP 黑名单'] as const
-const SITE_NAMES = ['portal.example.com', 'api.example.com', 'cdn.example.com'] as const
+const SITE_IDS = ['portal', 'api', 'static'] as const
 
 function buildConfig(subnet: string, threshold: number, extraAllow = ''): string {
   return `server:
@@ -375,8 +375,9 @@ function randEvent(): RoosterEvent {
     return {
       kind: 'block',
       ip,
-      rule_id: ruleId,
-      site: pick(SITE_NAMES),
+      // 真实 agent 的 rule_id 是数字串(最严一条),site 是站点 id 而非域名
+      rule_id: String(hits[0]),
+      site: pick(SITE_IDS),
       path: Math.random() < 0.8 ? pick(BLOCK_PATHS) : null,
       hits,
       score: Math.random() < 0.85 ? 5 + rand(45) : null,
@@ -460,6 +461,28 @@ function buildNode(d: {
     { name: 'config-2025-09-01T1400.yaml', raw: buildConfig(d.subnet, d.threshold - 10) },
     { name: 'config-2025-08-15T0910.yaml', raw: buildConfig(d.subnet, d.threshold) },
   ]
+  const sites: Site[] = [
+    {
+      id: 'portal',
+      'server-names': ['portal.example.com', 'www.example.com'],
+      upstream: `${d.subnet}.10:8080`,
+      waf: { mode: 'block' },
+    },
+    {
+      id: 'api',
+      'server-names': ['api.example.com'],
+      upstream: `${d.subnet}.11:9000`,
+      waf: { mode: 'detect' },
+    },
+    {
+      id: 'static',
+      'server-names': ['cdn.example.com'],
+      upstream: `${d.subnet}.12:8000`,
+      waf: { mode: 'off' },
+    },
+  ]
+  // http-guard 未启用的节点：监听不在，计数器全 0。
+  const listening = d.httpGuard
   return {
     info: {
       id: d.id,
@@ -483,40 +506,54 @@ function buildNode(d: {
     events,
     banEngine: d.banEngine ?? { available: true, reason: null },
     stats: {
-      forwards: {
-        web: 90_000 + rand(200_000),
-        'web-tls': 40_000 + rand(120_000),
-        dns: 200_000 + rand(500_000),
-      },
-      http: {
-        '2xx': 100_000 + rand(400_000),
-        '4xx': 1_000 + rand(20_000),
-        '5xx': rand(400),
-        blocked: 500 + rand(9_000),
-      },
+      // GET /stats 返回的是数组（每条规则 / 每个站点一项），不是 id→数字的 map。
+      forwards: [
+        {
+          // 0.0.0.0:80 与 http-guard 的监听冲突 → bind 失败，规则存活但不下流量
+          id: 'web',
+          proto: 'tcp',
+          listening: false,
+          conns_total: 0,
+          conns_active: 0,
+          udp_sessions: 0,
+          bytes_in: 0,
+          bytes_out: 0,
+        },
+        {
+          id: 'web-tls',
+          proto: 'tcp',
+          listening: true,
+          conns_total: 40_000 + rand(120_000),
+          conns_active: rand(120),
+          udp_sessions: 0,
+          bytes_in: 12_000_000 + rand(9_000_000),
+          bytes_out: 80_000_000 + rand(40_000_000),
+        },
+        {
+          id: 'dns',
+          proto: 'udp',
+          listening: true,
+          conns_total: 200_000 + rand(500_000),
+          conns_active: 0,
+          udp_sessions: 3 + rand(20),
+          bytes_in: 4_000_000 + rand(2_000_000),
+          bytes_out: 9_000_000 + rand(5_000_000),
+        },
+      ],
+      http: sites.map((s, i) => ({
+        id: s.id,
+        requests: [120_000, 48_000, 210_000][i] + rand(20_000),
+        blocked: s.waf?.mode === 'off' ? 0 : i === 0 ? 500 + rand(9_000) : rand(300),
+        conns_passthrough: rand(40),
+        bytes_in: 3_000_000 * (i + 1) + rand(2_000_000),
+        bytes_out: 24_000_000 * (i + 1) + rand(9_000_000),
+        listening_http: listening,
+        listening_https: listening,
+      })),
       bans: bans.length,
       ban_engine: d.banEngine ?? { available: true, reason: null },
     },
-    sites: [
-      {
-        id: 'portal',
-        'server-names': ['portal.example.com', 'www.example.com'],
-        upstream: `${d.subnet}.10:8080`,
-        waf: { mode: 'block' },
-      },
-      {
-        id: 'api',
-        'server-names': ['api.example.com'],
-        upstream: `${d.subnet}.11:9000`,
-        waf: { mode: 'detect' },
-      },
-      {
-        id: 'static',
-        'server-names': ['cdn.example.com'],
-        upstream: `${d.subnet}.12:8000`,
-        waf: { mode: 'off' },
-      },
-    ],
+    sites,
     waf: d.httpGuard
       ? buildWafReport(d.threshold, d.crs ?? CRS_BUILTIN)
       : { report: null, threshold: d.threshold },
