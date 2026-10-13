@@ -150,8 +150,35 @@ async function request<T>(path: string, opts: ReqOpts = {}): Promise<T> {
 
 // ---------------- auth ----------------
 export async function login(hub: string, secretKey: string): Promise<LoginResp> {
-  setHub(hub.trim().replace(/\/+$/, ''))
-  return request<LoginResp>('/auth/login', { method: 'POST', body: { secret_key: secretKey } })
+  const value = hub.trim()
+  let origin = ''
+  if (value !== '') {
+    let url: URL
+    try {
+      url = new URL(value)
+    } catch {
+      throw new ApiError(0, 'Hub 地址必须是 HTTP(S) origin，例如 https://hub.example.com；也可留空')
+    }
+    if (
+      !/^https?:\/\/[^/\\?#@\s]+\/?$/i.test(value) ||
+      (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+      url.username !== '' || url.password !== '' || url.pathname !== '/'
+    ) {
+      throw new ApiError(0, 'Hub 地址只能包含协议、主机和端口，不能包含路径、查询参数或账号信息')
+    }
+    origin = url.origin
+  }
+  setHub(origin)
+  const resp = await request<unknown>('/auth/login', { method: 'POST', body: { secret_key: secretKey } })
+  if (
+    !resp || typeof resp !== 'object' ||
+    !('token' in resp) || typeof resp.token !== 'string' || resp.token.trim() === '' ||
+    !('expires_at' in resp) || typeof resp.expires_at !== 'number' ||
+    !Number.isSafeInteger(resp.expires_at) || resp.expires_at <= Math.floor(Date.now() / 1000)
+  ) {
+    throw new ApiError(0, 'Hub 登录响应无效：缺少有效 token 或会话有效期，请检查 Hub 地址及代理配置')
+  }
+  return { token: resp.token, expires_at: resp.expires_at }
 }
 
 /**

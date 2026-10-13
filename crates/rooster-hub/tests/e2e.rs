@@ -149,6 +149,44 @@ async fn login(hub: &HubServer) -> String {
         .to_string()
 }
 
+#[tokio::test]
+async fn panel_fallback_only_accepts_read_methods() {
+    let hub = start_hub("panel-methods").await;
+    let panel = &hub._state.cfg.panel_dir;
+    std::fs::create_dir_all(panel).unwrap();
+    std::fs::write(panel.join("index.html"), "<!doctype html><title>panel</title>").unwrap();
+    let http = client();
+    let url = format!("{}/login/v0/auth/login", hub.base);
+
+    let resp = http.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(resp.text().await.unwrap().contains("<!doctype html>"));
+    let resp = http.head(&url).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(resp.bytes().await.unwrap().is_empty());
+
+    for method in [
+        reqwest::Method::POST,
+        reqwest::Method::PUT,
+        reqwest::Method::PATCH,
+        reqwest::Method::DELETE,
+    ] {
+        let resp = http.request(method, &url).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp.headers().get("allow").unwrap(), "GET, HEAD");
+        assert!(!resp.text().await.unwrap().contains("<!doctype html>"));
+    }
+
+    let resp = http
+        .post(format!("{}/v0/auth/login", hub.base))
+        .json(&serde_json::json!({"secret_key": "wrong-secret"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(!login(&hub).await.is_empty());
+}
+
 /// 生成一个合法 CSR(测试须能走到 consume_token,而不是先被“无法解析 CSR”拦下)。
 fn csr_pem(node: &str) -> String {
     let key = rcgen::KeyPair::generate().unwrap();

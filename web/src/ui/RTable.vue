@@ -206,6 +206,8 @@ const Cell = (cellProps: { v: VNode | string }) =>
 .rt-mono {
   font-family: var(--mono);
   font-size: 12px;
+  /* 长路径/上游地址可断行，避免 auto layout 被撑爆后挤瘪相邻列。 */
+  overflow-wrap: anywhere;
 }
 .rt-check { width: 30px; text-align: center !important; }
 .rt-check input { accent-color: var(--ink); }

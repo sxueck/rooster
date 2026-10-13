@@ -1804,7 +1804,16 @@ async fn install_script(State(state): State<Arc<HubState>>, headers: HeaderMap) 
 async fn static_handler(
     State(state): State<Arc<HubState>>,
     uri: axum::http::Uri,
+    method: Method,
 ) -> Response {
+    if method != Method::GET && method != Method::HEAD {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, "GET, HEAD")],
+            "method not allowed",
+        )
+            .into_response();
+    }
     if uri.path().starts_with("/v0") || uri.path().starts_with("/agent") {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }

@@ -66,13 +66,13 @@ const nginxCols: RColumn<NginxGroupRow>[] = [
   { title: 'DOMAINS / LISTEN', key: 'domains', render: (r) => h('div', [
     h('div', r.main.domains.join(', ') || '默认站点'),
     h('small', { class: 'muted' }, r.main.listen.join(', ')),
-    ...r.folded.map((f) => h('small', { class: 'muted', style: 'display:block' }, `+ ${f.listen.join(', ') || '—'} · 无转发（跳转/ACME）`)),
+    ...r.folded.map((f) => h('small', { class: 'muted', style: 'display:block' }, `+ ${f.listen.join(', ') || '—'} · 跳转/ACME`)),
   ]) },
   { title: 'CONFIG', key: 'file', mono: true, render: (r) => r.main.file },
   { title: 'UPSTREAM', key: 'upstream', mono: true, render: (r) => h('div', [
     h('div', r.main.upstream ?? ''),
     ...(r.main.extra_locations ?? []).map((x) => h('small', { class: 'muted', style: 'display:block' }, `${x.location} → ${x.upstream}`)),
-    r.main.bypassed_locations ? h('small', { class: 'muted', style: 'display:block' }, `另有 ${r.main.bypassed_locations} 个非代理 location 留在 Nginx（不经 WAF）`) : null,
+    r.main.bypassed_locations ? h('small', { class: 'muted', style: 'display:block' }, `另有 ${r.main.bypassed_locations} 个 location 不经 WAF`) : null,
   ]) },
   { title: 'STATUS', key: 'status', width: 150, render: (r) => statusCell(r) },
   { title: 'ACTIONS', key: 'actions', render: (r) => { const m = r.main; return h('span', { class: 'row-tight' }, m.status === 'attached' ? [
@@ -83,7 +83,6 @@ const nginxCols: RColumn<NginxGroupRow>[] = [
       {
         variant: 'link',
         disabled: !attachable(m) || busy.value !== '',
-        title: attachable(m) ? undefined : m.reason ?? '',
         onClick: () => { attachSite.value = m; attachShow.value = true },
       },
       { default: () => '启用 WAF' },
